@@ -1,0 +1,47 @@
+name: Clean up workflow runs
+
+# Deletes every completed workflow run older than 24 hours, so the Actions
+# tab only holds the last day. Runs still in progress are left alone.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *" # every six hours, at :41 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+
+jobs:
+  delete-old-runs:
+    name: delete runs older than 24 hours
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Delete completed runs created more than 24 hours ago
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting completed runs created before $cutoff"
+          deleted=0
+          failed=0
+          # Collect the ids first: deleting while paginating shifts the pages.
+          ids=$(gh api --paginate \
+            "repos/$REPO/actions/runs?per_page=100&status=completed&created=<$cutoff" \
+            --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if gh api -X DELETE "repos/$REPO/actions/runs/$id" --silent; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+              echo "::warning::could not delete run $id"
+            fi
+          done
+          echo "Deleted $deleted runs, $failed failed"
+          [ "$failed" -eq 0 ]
