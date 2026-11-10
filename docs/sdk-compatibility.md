@@ -300,8 +300,8 @@ and GLM-account real-process smoke tests also passed against the release binary.
 The regular Arkiv Chain Indexer (`Arkiv-Network/arkiv-chain-indexer`, the UDC
 indexer, v0.6.x) is exercised by `scripts/full-indexer-smoke.py` through that
 checkout's own, unmodified `docker-compose.yml`. Run it with Docker Compose, Bun,
-the release `arkiv-proposer` and a UDC SDK checkout that
-`scripts/udc-sdk-smoke.py` supports:
+the release `arkiv-proposer` and an SDK 1.0.x checkout (what
+`scripts/udc-sdk-smoke.py` supports):
 
 ```sh
 cargo build --release -p arkiv-node --bin arkiv-proposer
@@ -337,13 +337,14 @@ keys and a randomly named compose project are used, and its containers,
 volumes and built images are removed afterwards; deployed chains are not
 modified.
 
-Validated on 2026-11-17 against arkiv-chain-indexer `9f424c6` (v0.6.2) with SDK
-commit `3526519`: every check passed in about 100 seconds (170 blocks, 18
-transactions, 16 decoded operations, 3 genesis entities imported). The current
-SDK `develop` (`d464c8d`, 1.0.1-dev.0) cannot drive the exercise: it reads
-entities with `arkiv_getEntity` and pages with `offset`/`select.count` instead
-of `atBlock`/`cursor`, which this node does not implement yet (`-32601`), so
-`ARKIV_SDK_DIR` must point at a checkout from before SDK commit `fde2411`.
+Validated on 2026-11-17 against arkiv-chain-indexer `9f424c6` (v0.6.2) with
+`@arkiv-network/sdk` 1.0.1 (the `develop` checkout `d464c8d`, the same code as
+`main` `e9fa8dd` and the npm release): every check passed in about 70 seconds
+with cached images (76 blocks, 22 transactions, 20 decoded operations, a
+delete among them, 3 genesis entities imported). `scripts/udc-sdk-smoke.py`
+passed against the same checkout through its exercise, three-role restart and
+follower stages. Earlier runs used SDK commit `3526519`, the last pre-1.0 `udc`
+revision, which this smoke no longer supports.
 
 An earlier version of this smoke targeted the experimental indexer's
 `compose.signed-chain.yml` (released v0.5.20 images, payload-era
