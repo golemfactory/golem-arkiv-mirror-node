@@ -1206,6 +1206,33 @@ impl Snapshot {
         read_query(state, &self.state.nodes, &state.pricing, &request, budget)
     }
 
+    /// A cursor of this snapshot that continues `query` with `projection`
+    /// after record `after`, as if a page had ended there.
+    ///
+    /// A cursor is a position, never a count, so any record id is a valid
+    /// one: the next page starts at the first match with a larger id. This
+    /// lets a reader that walked the matches with a cheaper projection (ids
+    /// only, say) read on from where it stopped with the one it returns.
+    /// Unmetered: it reads no state.
+    pub fn cursor_after(
+        &self,
+        namespace: NamespaceId,
+        query: &Query,
+        projection: &Projection,
+        after: RecordId,
+    ) -> Cursor {
+        Cursor {
+            context: CursorContext::Snapshot {
+                instance: self.state.instance,
+                id: self.state.id,
+            },
+            namespace,
+            query: Arc::new(query.clone()),
+            projection: Arc::new(projection.clone()),
+            after,
+        }
+    }
+
     /// Returns `namespace`'s entries starting with `prefix`, in key order,
     /// metered as a read. An empty prefix scans the whole namespace.
     /// Prefixes longer than [`Limits::MAX_RAW_KEY_LEN`] fail admission.

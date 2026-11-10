@@ -2319,3 +2319,104 @@ fn host_resolves_an_omitted_block_once_and_pages_that_snapshot() {
         .expect("bound to the pinned snapshot");
     assert_eq!(again.value.rows, pages[1].rows);
 }
+
+#[test]
+fn a_cursor_after_any_record_continues_like_an_issued_one() {
+    let Fixture {
+        engine,
+        walk_ns,
+        model,
+        ..
+    } = fixture();
+    let pinned = engine.head_snapshot();
+    let query = books();
+    let ids = model.evaluate(&query, &Projection::ID_ONLY);
+    let reference = model.evaluate(&query, &Projection::KEY_ONLY);
+
+    // Skip ten matches by id, then read on with the projection the page
+    // returns: the same rows as an issued KEY_ONLY cursor after them.
+    let skipped = pinned
+        .query(
+            walk_ns,
+            &query,
+            &Projection::ID_ONLY,
+            10,
+            None,
+            Budget::unlimited(),
+        )
+        .expect("the namespace exists")
+        .value;
+    assert_eq!(skipped.rows, ids[..10]);
+    let after = skipped.rows[9].id;
+    let made = pinned.cursor_after(walk_ns, &query, &Projection::KEY_ONLY, after);
+    assert_eq!(made.after(), after);
+    assert_eq!(made.snapshot(), Some(pinned.id()));
+    let issued = pinned
+        .query(
+            walk_ns,
+            &query,
+            &Projection::KEY_ONLY,
+            10,
+            None,
+            Budget::unlimited(),
+        )
+        .expect("the namespace exists")
+        .value
+        .next
+        .expect("40 books remain");
+    assert_eq!(made, issued);
+    let rest = pinned
+        .query(
+            walk_ns,
+            &query,
+            &Projection::KEY_ONLY,
+            MAX_PAGE,
+            Some(&made),
+            Budget::unlimited(),
+        )
+        .expect("a made cursor is bound to its snapshot");
+    assert_eq!(rest.value.rows, reference[10..]);
+
+    // Any id is a position, a non-matching or absent one included: the page
+    // starts at the first match above it.
+    let gap = (10..ids.len() - 1)
+        .find(|&k| ids[k + 1].id.ordinal() > ids[k].id.ordinal() + 1)
+        .expect("pens and lamps sit between books");
+    let between = rid(ids[gap].id.ordinal() + 1);
+    assert!(!ids.iter().any(|row| row.id == between));
+    let from_gap = pinned
+        .query(
+            walk_ns,
+            &query,
+            &Projection::ID_ONLY,
+            1,
+            Some(&pinned.cursor_after(walk_ns, &query, &Projection::ID_ONLY, between)),
+            Budget::unlimited(),
+        )
+        .expect("bound");
+    assert_eq!(from_gap.value.rows, ids[gap + 1..gap + 2]);
+    let past = pinned
+        .query(
+            walk_ns,
+            &query,
+            &Projection::ID_ONLY,
+            1,
+            Some(&pinned.cursor_after(walk_ns, &query, &Projection::ID_ONLY, rid(1_000))),
+            Budget::unlimited(),
+        )
+        .expect("bound");
+    assert_eq!((past.value.rows.len(), past.value.next), (0, None));
+
+    // It is bound like an issued cursor: another projection is a mismatch.
+    assert_mismatch(
+        pinned.query(
+            walk_ns,
+            &query,
+            &Projection::ALL,
+            1,
+            Some(&made),
+            Budget::unlimited(),
+        ),
+        "a made cursor under another projection",
+    );
+}
