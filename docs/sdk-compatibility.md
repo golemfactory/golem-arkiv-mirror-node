@@ -93,10 +93,12 @@ receipt cumulative gas includes user transactions only. `eth_subscribe` supports
 attributes, equality, ranges on every indexable type (numeric order for
 `i32`, `u64`, `u256` and `dec`, `false < true`, unsigned bytes for `str`,
 `bytes32`, `addr` and `key`), inclusive `BETWEEN`, string prefixes, Boolean
-expressions, `EXISTS` and `TYPEOF`, and SDK 1.0's paging: `limit`, `offset`
-and `select.count` (the hex size of the whole match set, on every page; alone,
-the whole answer). Matches come in creation order: by block, transaction and
-operation (record id). `arkiv_getEntity` (`[key]` or `[key, block]`) returns
+expressions, `EXISTS` and `TYPEOF`, and SDK 1.0's paging and sorting:
+`limit`, `offset`, `select.count` (the hex size of the whole match set, on
+every page; alone, the whole answer) and `ORDER BY name:type [ASC|DESC]`
+(`select(...).orderBy(asc(...))`/`desc(...)`, indexed and unindexed
+attributes alike). Without `ORDER BY`, matches come in creation order: by
+block, transaction and operation (record id). `arkiv_getEntity` (`[key]` or `[key, block]`) returns
 one entity with every field except `attributeSchema`, or `null`; it is the
 one-row `$key` query. `arkiv_getEntityCount` and `arkiv_getBlockTiming` use
 retained native state. These JSON-RPC query responses are ordinary
@@ -117,7 +119,9 @@ pinned to one block partition its matches and repeat one count however the
 head moves, as long as the height stays retained (`--state-retention`). A
 cursor carries its own position, so it continues past an offset page and an
 `offset` beside it is ignored. An offset at or past the end is an empty page
-without a cursor.
+without a cursor. `ORDER BY` pages are offset windows only: they carry no
+cursor and refuse one (`-32005`), so pin `atBlock` to page a sorted result
+consistently.
 
 An offset is a walk: the node reads the skipped matches' ids (one engine page
 at a time) and then reads on after the last of them, all charged to the
@@ -126,13 +130,18 @@ sizes where they decide it), charged to the same budget. A deep offset is
 refused as `-32004` (`limits`) rather than scanned for free. A query beyond
 the group and literal bounds (an untyped `EXISTS(x)` is nine groups) takes
 the scan fallback for its page, its offset and its `select.count` alike;
-`arkiv_getEntityCount` still refuses it.
+`arkiv_getEntityCount` still refuses it. `ORDER BY` is upstream's
+fetch-and-sort: every page reads the key and sort cell of every match, keeps
+the first `offset + limit` in order and reads only that window's rows, so its
+cost grows with the match set, not the page, and a match set too large to
+sort within the budget is refused as `limits`.
 
-Upstream orders matches by creating transaction, then by entity key among
-the entities one transaction creates; this node orders by record id, which
-agrees except inside a transaction that creates several entities (operation
-order here, key order upstream). Record ids are committed state, so this is
-left as it is.
+Upstream orders matches, and `ORDER BY` ties, by creating transaction, then
+by entity key among the entities one transaction creates; this node orders
+by record id, which agrees except inside a transaction that creates several
+entities (operation order here, key order upstream). Record ids are committed
+state, so this is left as it is. Open questions, divergences and follow-ups
+are listed in [SDK 1.0 compatibility: open items](sdk-1.0-compatibility-todo.md).
 
 ### Supersets of the network
 
@@ -339,11 +348,11 @@ modified.
 
 Validated on 2026-11-17 against arkiv-chain-indexer `9f424c6` (v0.6.2) with
 `@arkiv-network/sdk` 1.0.1 (the `develop` checkout `d464c8d`, the same code as
-`main` `e9fa8dd` and the npm release): every check passed in about 70 seconds
-with cached images (76 blocks, 22 transactions, 20 decoded operations, a
-delete among them, 3 genesis entities imported). `scripts/udc-sdk-smoke.py`
-passed against the same checkout through its exercise, three-role restart and
-follower stages. Earlier runs used SDK commit `3526519`, the last pre-1.0 `udc`
+`main` `e9fa8dd` and the npm release): every check passed in 50 to 70 seconds
+with cached images (about 75 blocks, 22 transactions, 20 decoded operations,
+a delete among them, 3 genesis entities imported), before and after `ORDER BY`
+joined the exercise. `scripts/udc-sdk-smoke.py` passed against the same
+checkout through its exercise, three-role restart and follower stages. Earlier runs used SDK commit `3526519`, the last pre-1.0 `udc`
 revision, which this smoke no longer supports.
 
 An earlier version of this smoke targeted the experimental indexer's

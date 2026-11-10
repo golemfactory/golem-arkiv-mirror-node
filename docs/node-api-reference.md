@@ -110,6 +110,24 @@ cursor. `offset` and `select.count` compose with `atBlock`: pinning page
 one's `blockNumber` keeps every offset page on that snapshot. A `cursor`
 carries its own position, so an `offset` beside one is ignored.
 
+A query may end with `ORDER BY name:type [ASC|DESC]` (`ASC` by default):
+one attribute, read as one type, indexed or not. A user attribute names its
+type (`ORDER BY rank` alone is a type error); `$key` (`key`), `$owner` and
+`$creator` (`addr`), `$expiresAt` and `$createdAt` (`u64`) carry their own,
+which a `:` may repeat but not contradict; `bytes` and other system
+attributes are type errors. An entity without the attribute, or holding
+another type there, sorts below every value (first `ASC`, last `DESC`), and
+ties come in record-id order in either direction. `ORDER BY`, `BY`, `ASC`
+and `DESC` are words only where the clause stands. A sorted page is a
+fetch-and-sort, as upstream's: the node reads the key and sort cell of every
+match at the pinned snapshot, keeps the first `offset + limit` in order and
+reads that window's rows, all charged to the read budget, so a match set too
+large to sort within it answers `-32004`. Sorted pages carry no cursor and
+page by `offset` (pin `atBlock` for a stable order); a `cursor` beside
+`ORDER BY` is `-32005`, and a sorted window past the 8 MiB response cap is
+`-32004` (lower the limit) rather than shortened. `select.count` and
+`arkiv_getEntityCount` read the clause and ignore it.
+
 Before the entity namespace exists (a chain without a prefill, at height 0,
 before the proposer's bootstrap in block 1) `arkiv_query` answers an empty
 page and `arkiv_getEntityCount` answers `0`. A page whose entities would
@@ -235,10 +253,10 @@ table (`src/query/errors.ts`), with a message naming the kind:
 | Code | Kind | Meaning |
 | --- | --- | --- |
 | `-32001` | `parse` | The query does not parse. `data` is `{position, expected, got}`: the UTF-8 byte offset, what the parser expected, and the source text there (`end of query` at the end). |
-| `-32002` | `type` | A predicate is ill-typed: `STARTSWITH` on a type other than `str`, `BETWEEN` bounds of two types, an unknown or unindexable type tag (`TYPEOF(x) = bytes`), a system attribute compared against the wrong type, `EXISTS($owner)`, or an unknown system attribute such as `$payload` or `$contentType`. `data` is `{position, got}`. |
+| `-32002` | `type` | A predicate or sort is ill-typed: `STARTSWITH` on a type other than `str`, `BETWEEN` bounds of two types, an `ORDER BY` on a user attribute without its type, on `bytes` or on an unsortable system attribute, an unknown or unindexable type tag (`TYPEOF(x) = bytes`), a system attribute compared against the wrong type, `EXISTS($owner)`, or an unknown system attribute such as `$payload` or `$contentType`. `data` is `{position, got}`. |
 | `-32003` | `literal` | A literal fails validation: an `i32` out of range, a bad checksum, more than 18 decimal places. `data` is `{position, got}`. |
 | `-32004` | `limits` | A node budget is exceeded: more than 8192 bytes, 64 predicates or 32 levels of nesting, a Boolean expansion beyond 64 groups or 256 literals, an `arkiv_getEntityCount` beyond the read's group/literal bounds, an exhausted read budget (an `offset` walk and `select.count` included), a scan fallback past 4,096 rows, or a single entity whose JSON alone exceeds the 8 MiB response cap. |
-| `-32005` | `cursor` | The cursor expired, is malformed, or belongs to another query, block or selection (cursors also need an explicit `atBlock`). |
+| `-32005` | `cursor` | The cursor expired, is malformed, or belongs to another query, block or selection (cursors also need an explicit `atBlock`), or it was sent with `ORDER BY`, whose pages have none. |
 | `-32006` | `block` | The requested height is above the head or below the state floor (`HistoryPruned`, with `data.requested`/`data.floor`). |
 
 An engine refusal that is not the query's fault answers `-32000`

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict"
 import { readFileSync, writeFileSync } from "node:fs"
 import { createPublicClient, createWalletClient, ExpirationTime, MAX_LIFETIME } from "@arkiv-network/sdk"
-import { and, between, eq, gt } from "@arkiv-network/sdk/query"
+import { and, asc, between, desc, eq, gt } from "@arkiv-network/sdk/query"
 import { addr, bytes, dec, defineSchema, str, u64 } from "@arkiv-network/sdk/schema"
 import { bytesToHex, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
@@ -47,7 +47,7 @@ const step = (name: string) => console.log("ok:", name)
 const report = process.env.SDK_REPORT_FILE!
 const stage = process.argv[2] ?? "exercise"
 
-// The five `q` posts the paging steps read, in creation order.
+// The five `q` posts the paging steps read, in creation order or sorted.
 const pages = (size: number, offset: number) =>
   read
     .select({ $key: true, views: true })
@@ -57,6 +57,19 @@ const pages = (size: number, offset: number) =>
     .limit(size)
     .offset(offset)
     .fetch()
+// biome-ignore lint/suspicious/noExplicitAny: an asc() or desc() key, checked by the SDK
+const sortedBy = async (order: any) => {
+  const keys: string[] = []
+  for (let offset = 0; offset < 6; offset += 2) {
+    const window = await qPosts().orderBy(order).withCount().limit(2).offset(offset).fetch()
+    assert.equal(window.count, 5n)
+    keys.push(...window.entities.map((e) => e.$key))
+  }
+  return keys
+}
+function qPosts() {
+  return read.select({ $key: true, views: true, title: true }).from(Posts).where(eq("category", "q"))
+}
 
 if (stage !== "exercise") {
   // After a three-role restart (reopen) and through the replicated full node (follower).
@@ -84,6 +97,8 @@ if (stage !== "exercise") {
   }
   assert.deepEqual(walked, qKeys)
   assert.equal(await read.count().from(Posts).where(eq("category", "q")).fetch(), 5n)
+  // Views 1, 4, 1, 5, 3 by then: DESC, ties in creation order.
+  assert.deepEqual(await sortedBy(desc("views")), [3, 1, 4, 0, 2].map((i) => qKeys[i]))
   console.log(`UDC SMOKE ${stage.toUpperCase()} PASSED`)
   process.exit(0)
 }
@@ -393,6 +408,18 @@ const counted = await rpc(`arkiv.schema = str('posts')`, { select: { count: true
 assert.deepEqual(counted.data, [])
 assert.equal(counted.cursor, undefined)
 step(`client.count(), BETWEEN and a str range; count alone reads no rows (${counted.count} posts)`)
+
+// ORDER BY through the schema: offset windows of the whole sorted match set.
+// Views 3, 1, 4, 1, 5: DESC puts the 1s last, in creation order.
+assert.deepEqual(await sortedBy(desc("views")), [4, 2, 0, 1, 3].map((i) => qKeys[i]))
+assert.deepEqual(await sortedBy(asc("$key")), [...qKeys].sort())
+// title is not indexed: a sort reads it all the same.
+assert.deepEqual(await sortedBy(asc("title")), [1, 3, 0, 2, 4].map((i) => qKeys[i]))
+await assert.rejects(
+  rpc(`category = str('q') ORDER BY views`, {}),
+  (e: any) => /query rejected \(type\)/.test(describe(e)) || assert.fail(describe(e)),
+)
+step("orderBy(desc/asc) sorts the whole match set, unindexed columns too, paged by offset")
 
 // The SDK pages at the head, so a write between two requests shifts the
 // windows. Pinning page one's blockNumber with atBlock (beyond the SDK) keeps

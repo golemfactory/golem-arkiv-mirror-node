@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### `arkiv_query`: `ORDER BY`
+
+- A query may end with `ORDER BY name:type [ASC|DESC]`, as SDK 1.0's
+  `orderBy(asc(...))`/`desc(...)` sends it: one attribute read as one type,
+  indexed or not (`$key`, `$owner`, `$creator`, `$expiresAt` and
+  `$createdAt` carry their own). A match without a value of that type sorts
+  below every value; ties come in record-id order in either direction.
+- It is upstream's fetch-and-sort: every page reads the key and sort cell of
+  every match at the pinned snapshot, keeps the first `offset + limit` in a
+  bounded heap and reads that window's rows by key, all charged to the read
+  budget (`-32004` when the match set is too large to sort). Sorted pages
+  page by `offset` (with `atBlock` and `select.count`) and carry no cursor; a
+  `cursor` beside `ORDER BY` answers `-32005`, and a sorted window past the
+  8 MiB cap answers `-32004` instead of being shortened. `select.count` and
+  `arkiv_getEntityCount` ignore the clause.
+- The UDC SDK smoke sorts through the schema (`desc("views")`,
+  `asc("$key")`, and `asc("title")` on an unindexed column), paged by offset.
+- Open items are listed in `docs/sdk-1.0-compatibility-todo.md`.
+
 ### `arkiv_query`: SDK 1.0 paging, counts and ranges
 
 - `offset` (hex or number) skips that many matches before the page, in

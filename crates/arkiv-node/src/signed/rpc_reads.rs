@@ -23,17 +23,26 @@
 //! matches an indexed one ([`arkiv_db::CellKind::Attribute`]). Refused
 //! queries answer with the SDK's code table ([`QueryErrorKind`]).
 //!
-//! # Offset and count
+//! # Order, offset and count
 //!
-//! A page lists its matches in record-id order, which is creation order: by
-//! block, then transaction, then operation. An `offset` first walks past that
-//! many matches reading ids only, then reads on from the last of them
-//! ([`Snapshot::cursor_after`]); the walk is metered against the read budget
-//! like any other read, so a deep offset is refused as `limits` when it does
-//! not fit. `select.count` adds the match set's size from the planned count
-//! path (the bounded scan for a query beyond the read bounds), charged to the
-//! same budget. Both compose with `atBlock`: pinning page one's block keeps
-//! every offset page on one snapshot.
+//! Without `ORDER BY` a page lists its matches in record-id order, which is
+//! creation order: by block, then transaction, then operation. An `offset`
+//! first walks past that many matches reading ids only, then reads on from
+//! the last of them ([`Snapshot::cursor_after`]); it costs the walk, metered
+//! against the read budget like any other read.
+//!
+//! `ORDER BY name:type [ASC|DESC]` sorts by one attribute, read as one type
+//! whether or not it is indexed; an entity without it, or holding another
+//! type there, sorts below every value, and ties come in record-id order in
+//! either direction. A sorted page is a fetch-and-sort, as upstream's: it
+//! reads the sort cell (and the key) of every match at the pinned snapshot,
+//! keeps the first `offset + limit` in order in a bounded heap, then reads the
+//! `[offset, offset + limit)` window's rows in full. The walk is charged to the
+//! read budget, so a match set too large to sort within it is refused as
+//! `limits`. Sorted pages have no cursor: they page by `offset`, pinned with
+//! `atBlock` for a consistent order, and a `cursor` beside `ORDER BY` is
+//! refused. `select.count` adds the match set's size from the planned count
+//! path.
 use super::{Error, Result, host::Host, reads::ReadLimits};
 use crate::{
     arkiv,
@@ -49,12 +58,13 @@ use crate::{
 };
 use alloy_primitives::{U256, keccak256};
 use arkiv_db::{
-    Budget, CellName, Cursor, Limits, Literal, Projection, Query, QueryLimits, QueryPage, Row,
-    Snapshot, Term, TypeTag, Value,
+    Budget, CellName, Cursor, Limits, Literal, Projection, Query, QueryLimits, QueryPage, RecordId,
+    RecordKey, Row, Snapshot, Term, TypeTag, Value,
 };
 use serde_json::{Value as Json, json};
 use std::{
-    collections::BTreeMap,
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap},
     ops::Bound,
     sync::{Mutex, OnceLock},
 };
@@ -212,6 +222,48 @@ fn unknown_block(height: u64, head: u64) -> ReadError {
     .into()
 }
 
+/// A query's `ORDER BY`: one attribute, read as one type.
+#[derive(Clone, Debug, PartialEq)]
+struct Order {
+    name: CellName,
+    tag: TypeTag,
+    descending: bool,
+}
+impl Order {
+    /// The value `row` sorts by: its cell of that name, indexed or not, when
+    /// it holds the sort's type.
+    fn value(&self, row: &Row) -> Option<Value> {
+        row.cells
+            .iter()
+            .find(|(name, _)| name == &self.name)
+            .map(|(_, cell)| &cell.value)
+            .filter(|value| value.tag() == self.tag)
+            .cloned()
+    }
+    /// The order of two matches: by value, a missing one below every value
+    /// and the whole comparison reversed by `DESC`, then by record id
+    /// ascending in either direction, which makes the order total.
+    fn cmp(&self, a: (Option<&Value>, RecordId), b: (Option<&Value>, RecordId)) -> Ordering {
+        let by_value = match (a.0, b.0) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp_ordered(y).unwrap_or(Ordering::Equal),
+        };
+        let by_value = if self.descending {
+            by_value.reverse()
+        } else {
+            by_value
+        };
+        by_value.then(a.1.cmp(&b.1))
+    }
+}
+/// A parsed `arkiv_query` string: the filter and its optional order.
+#[derive(Clone, Debug, PartialEq)]
+struct Statement {
+    query: Query,
+    order: Option<Order>,
+}
 #[derive(Clone)]
 struct CachedCursor {
     binding: [u8; 32],
@@ -253,6 +305,7 @@ pub enum Planned {
 pub struct PageRead {
     snapshot: Snapshot,
     query: Query,
+    order: Option<Order>,
     limits: Limits,
     bounds: QueryLimits,
     limit: usize,
@@ -411,8 +464,10 @@ fn plan_count(host: &Host, params: &Json, bounds: QueryLimits) -> Read<Planned> 
     if height > host.head.height {
         return Err(unknown_block(height, host.head.height));
     }
+    // A count has no order: an `ORDER BY` is read and set aside, so the
+    // query string of a page counts as it is.
     let query = match options.get("query").filter(|v| !v.is_null()) {
-        Some(value) => parse_query(value.as_str().ok_or(Error("InvalidParams"))?)?,
+        Some(value) => parse_query(value.as_str().ok_or(Error("InvalidParams"))?)?.query,
         None => Query::match_all(),
     };
     Ok(Planned::Count {
@@ -579,7 +634,7 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
         .filter(|p| !p.is_empty() && p.len() <= 2)
         .ok_or(Error("InvalidParams"))?;
     let source = args[0].as_str().ok_or(Error("InvalidParams"))?;
-    let query = parse_query(source)?;
+    let Statement { query, order } = parse_query(source)?;
     let empty = json!({});
     let options = args
         .get(1)
@@ -628,6 +683,15 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
     )
     .into();
     let cursor = if let Some(token) = options.get("cursor") {
+        // A sorted page is an offset window and never issues a cursor.
+        if order.is_some() {
+            return Err(QueryError::new(
+                QueryErrorKind::Cursor,
+                "ORDER BY pages have no cursor: page them with offset, pinned to one block \
+                 with atBlock",
+            )
+            .into());
+        }
         if !options.contains_key("atBlock") {
             return Err(cursor_mismatch());
         }
@@ -651,6 +715,7 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
     Ok(PageRead {
         snapshot: host.state(height)?,
         query,
+        order,
         limits: host.genesis.genesis.limits,
         bounds,
         limit: limit as usize,
@@ -671,6 +736,7 @@ impl PageRead {
         let Self {
             snapshot,
             query,
+            order,
             limits,
             bounds,
             limit,
@@ -700,8 +766,14 @@ impl PageRead {
             offset,
         };
         // `next`: where the page after this one starts, present only when
-        // a further match exists.
-        let QueryPage { rows, mut next } = read_page(&window, cursor, &mut budget)?;
+        // a further match exists. A sorted page has none.
+        let (rows, mut next) = match &order {
+            None => {
+                let page = read_page(&window, cursor, &mut budget)?;
+                (page.rows, page.next)
+            }
+            Some(order) => (sorted_page(&window, order, &mut budget)?, None),
+        };
         let mut data = rows
             .iter()
             .map(|row| project(row, &selection.fields))
@@ -710,6 +782,14 @@ impl PageRead {
         if fit < data.len() {
             if fit == 0 {
                 return Err(self::limits("one entity alone exceeds the 8 MiB response cap").into());
+            }
+            // A sorted page has no cursor to carry the cut rows: its
+            // window must fit whole.
+            if order.is_some() {
+                return Err(self::limits(
+                    "the sorted page exceeds the 8 MiB response cap; lower the limit",
+                )
+                .into());
             }
             // A shorter page, whose cut rows are still to come: the next
             // page starts after its last row.
@@ -900,19 +980,25 @@ fn read_page(window: &Window<'_>, mut cursor: Option<Cursor>, budget: &mut u64) 
     Err(exhausted())
 }
 /// What the scan fallback reads of each row to evaluate `query`: the cells
-/// its literals name, or every cell when they are more than a projection
-/// may name.
-fn scan_projection(query: &Query, limits: &Limits) -> Projection {
+/// its literals name, plus `extra`, and the key when `key`; every cell when
+/// they are more than a projection may name.
+fn scan_projection(
+    query: &Query,
+    limits: &Limits,
+    key: bool,
+    extra: Option<&CellName>,
+) -> Projection {
     let names: std::collections::BTreeSet<CellName> = query
         .groups
         .iter()
         .flatten()
         .map(|literal| literal.term.name().clone())
+        .chain(extra.cloned())
         .collect();
     if names.len() > limits.max_cells {
         Projection::ALL
     } else {
-        Projection::named(false, names)
+        Projection::named(key, names)
     }
 }
 /// `select.count` for a query beyond the read bounds: the matches among at
@@ -925,7 +1011,7 @@ fn scan_count(
     budget: &mut u64,
 ) -> Read<u64> {
     let all = Query::match_all();
-    let projection = scan_projection(query, limits);
+    let projection = scan_projection(query, limits, false, None);
     let (mut count, mut scanned, mut cursor) = (0u64, 0usize, None);
     loop {
         let Some(page) = native_page(
@@ -954,6 +1040,119 @@ fn scan_count(
             return Ok(count);
         }
     }
+}
+/// One match of a sorted walk: its sort value, id and key.
+struct Ranked<'o> {
+    order: &'o Order,
+    value: Option<Value>,
+    id: RecordId,
+    key: RecordKey,
+}
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Ranked<'_> {}
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order.cmp(
+            (self.value.as_ref(), self.id),
+            (other.value.as_ref(), other.id),
+        )
+    }
+}
+/// An `ORDER BY` page: the `[offset, offset + limit)` window of the matches
+/// in `order`, upstream's fetch-and-sort.
+///
+/// Every match is visited, reading only its key and sort cell (whatever its
+/// kind: the sort reads unindexed attributes too), and the first
+/// `offset + limit` in order are kept in a bounded heap; then the window's
+/// rows are read in full by key. The walk is charged to `budget`, so a match
+/// set too large to sort within the read budget is refused as `limits`. The
+/// scan fallback reads only the cells it needs and stops at [`SCAN_ROWS`]
+/// like a page.
+fn sorted_page(window: &Window<'_>, order: &Order, budget: &mut u64) -> Read<Vec<Row>> {
+    let &Window {
+        snapshot,
+        query,
+        limits,
+        bounds,
+        limit,
+        offset,
+    } = window;
+    let scan = scans(query, bounds);
+    let native = native_query(query, bounds);
+    let projection = if scan {
+        scan_projection(query, limits, true, Some(&order.name))
+    } else {
+        Projection::named(true, [order.name.clone()])
+    };
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let keep = start.saturating_add(limit);
+    let mut kept: BinaryHeap<Ranked<'_>> = BinaryHeap::new();
+    let mut cursor: Option<Cursor> = None;
+    let mut scanned = 0usize;
+    loop {
+        let Some(page) = native_page(
+            snapshot,
+            &native,
+            &projection,
+            limits.max_page,
+            cursor.as_ref(),
+            bounds,
+            budget,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        for row in page.rows {
+            if scan {
+                scanned += 1;
+                if scanned > SCAN_ROWS {
+                    return Err(exhausted());
+                }
+                if !matches_query(query, &row) {
+                    continue;
+                }
+            }
+            let ranked = Ranked {
+                order,
+                value: order.value(&row),
+                id: row.id,
+                key: row.key.clone().ok_or(Error("StorageCorrupt"))?,
+            };
+            kept.push(ranked);
+            if kept.len() > keep {
+                kept.pop();
+            }
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let sorted = kept.into_sorted_vec();
+    let mut rows = Vec::new();
+    for ranked in sorted.iter().skip(start).take(limit) {
+        let read = snapshot
+            .try_get_record(
+                arkiv::entity_namespace(),
+                &ranked.key,
+                &Projection::ALL,
+                read_budget(*budget, bounds),
+            )
+            .map_err(Error::from)?
+            .map_err(read_error)?;
+        charge(budget, &read.receipt)?;
+        rows.push(read.value.ok_or(Error("StorageCorrupt"))?);
+    }
+    Ok(rows)
 }
 /// The scan fallback's evaluation of `query` on one row. Like the index, it
 /// only sees indexed cells: an unindexed field never matches a predicate.
@@ -1271,8 +1470,9 @@ fn source_error(error: ParseError, source: &str, offset: usize) -> QueryError {
         None => QueryError::new(kind, error.message),
     }
 }
-/// Parses an `arkiv_query` string: `*`, or a Boolean expression.
-fn parse_query(source: &str) -> std::result::Result<Query, QueryError> {
+/// Parses an `arkiv_query` string: `*` or a Boolean expression, then an
+/// optional `ORDER BY` clause, which ends it.
+fn parse_query(source: &str) -> std::result::Result<Statement, QueryError> {
     if source.len() > QUERY_BYTES {
         return Err(limits("the query is longer than 8192 bytes"));
     }
@@ -1284,17 +1484,27 @@ fn parse_query(source: &str) -> std::result::Result<Query, QueryError> {
         depth: 0,
         predicates: 0,
     };
-    // `*` is the whole query.
-    let all = p.take(Token::Star);
-    let query = if all { Query::match_all() } else { p.or()? };
+    // `*` is the whole filter: only an `ORDER BY` may follow it.
+    let query = if p.take(Token::Star) {
+        Query::match_all()
+    } else {
+        p.or()?
+    };
+    // After a filter only AND or OR may follow, so a name here can only
+    // open the clause: its words are not reserved anywhere else.
+    let order = if p.word("order") {
+        Some(p.order_by()?)
+    } else {
+        None
+    };
     if p.at != p.tokens.len() {
-        return Err(p.parse_error(if all {
-            "the end of the query: * stands alone"
+        return Err(p.parse_error(if order.is_some() {
+            "the end of the query: ORDER BY ends it and sorts by one attribute"
         } else {
-            "AND, OR or the end of the query"
+            "AND, OR, ORDER BY or the end of the query"
         }));
     }
-    Ok(query)
+    Ok(Statement { query, order })
 }
 impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
@@ -1321,6 +1531,120 @@ impl Parser<'_> {
         } else {
             false
         }
+    }
+    /// Whether the next token is the name `word`, in any case.
+    fn word(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Name(n)) if n.eq_ignore_ascii_case(word))
+    }
+    /// `ORDER BY attrRef [':' typeTag] [ASC | DESC]`, from its `ORDER`. A
+    /// user attribute names the type it sorts as; a system attribute holds
+    /// one, which a `:` may repeat but not contradict. `bytes` is never
+    /// sorted on.
+    fn order_by(&mut self) -> std::result::Result<Order, QueryError> {
+        self.at += 1;
+        if !self.word("by") {
+            return Err(self.parse_error("BY: the clause is ORDER BY name:type"));
+        }
+        self.at += 1;
+        let key_at = self.position();
+        let (name, held) = match self.peek().cloned() {
+            Some(Token::Name(n)) if arkiv::sdk_safe_name(&n) => (n, None),
+            Some(Token::SysName(n)) => {
+                let tag = match n.as_str() {
+                    "key" => TypeTag::Key,
+                    "owner" | "creator" => TypeTag::Addr,
+                    "expiresAt" | "createdAt" => TypeTag::U64,
+                    _ => {
+                        return Err(QueryError::at(
+                            QueryErrorKind::Type,
+                            self.source,
+                            key_at,
+                            "a sortable system attribute: $key, $owner, $creator, $expiresAt \
+                             or $createdAt",
+                        ));
+                    }
+                };
+                (format!("${n}"), Some(tag))
+            }
+            _ => return Err(self.parse_error("an attribute to sort by")),
+        };
+        self.at += 1;
+        let name = CellName::new(&name).map_err(|_| {
+            QueryError::at(
+                QueryErrorKind::Parse,
+                self.source,
+                key_at,
+                "an attribute name",
+            )
+        })?;
+        let named = if self.take(Token::Colon) {
+            let tag_at = self.position();
+            let tag = match self.peek().cloned() {
+                Some(Token::Name(tag)) => TAGS
+                    .iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&tag))
+                    .map(|(_, t)| *t)
+                    .ok_or_else(|| {
+                        QueryError::at(
+                            QueryErrorKind::Type,
+                            self.source,
+                            tag_at,
+                            "a sortable type tag: bool, i32, u64, u256, dec, bytes32, str, \
+                             addr or key (bytes is never sorted on)",
+                        )
+                    })?,
+                Some(Token::Tagged { .. }) => {
+                    return Err(QueryError::at(
+                        QueryErrorKind::Type,
+                        self.source,
+                        tag_at,
+                        "a bare type tag, as in ORDER BY name:str",
+                    ));
+                }
+                _ => return Err(self.parse_error("a type tag")),
+            };
+            self.at += 1;
+            Some((tag, tag_at))
+        } else {
+            None
+        };
+        let tag = match (held, named) {
+            (Some(held), Some((tag, tag_at))) if tag != held => {
+                return Err(QueryError::at(
+                    QueryErrorKind::Type,
+                    self.source,
+                    tag_at,
+                    format!("{name} holds {held}, so it sorts as one, not as {tag}"),
+                ));
+            }
+            (Some(held), _) => held,
+            (None, Some((tag, _))) => tag,
+            (None, None) => {
+                return Err(QueryError::at(
+                    QueryErrorKind::Type,
+                    self.source,
+                    key_at,
+                    format!(
+                        "{name} can hold any type, so ORDER BY names the one to sort it as: \
+                         ORDER BY {name}:str, or another tag"
+                    ),
+                ));
+            }
+        };
+        let descending = if self.word("desc") {
+            self.at += 1;
+            true
+        } else {
+            if self.word("asc") {
+                self.at += 1;
+            }
+            false
+        };
+        Ok(Order {
+            name,
+            tag,
+            descending,
+        })
     }
     fn expect(&mut self, t: Token, expected: &str) -> std::result::Result<(), QueryError> {
         if self.take(t) {
@@ -1500,9 +1824,9 @@ mod tests {
             assert!(parse_query(s).is_ok(), "{s}");
         }
         let q = parse_query("n != u64(7)").unwrap();
-        assert!(matches!(q.groups[0][0].term, Term::NotEq { .. }));
+        assert!(matches!(q.query.groups[0][0].term, Term::NotEq { .. }));
         assert_eq!(
-            parse_query("NOT EXISTS(name)").unwrap().groups[0].len(),
+            parse_query("NOT EXISTS(name)").unwrap().query.groups[0].len(),
             TAGS.len()
         );
         assert!(parse_query("TYPEOF(n) = bytes").is_err());
@@ -2195,6 +2519,18 @@ mod tests {
         }
         let distinct: std::collections::BTreeSet<_> = keys.iter().map(|k| k.to_string()).collect();
         assert_eq!((keys.len(), distinct.len()), (BIG as usize, BIG as usize));
+        // A sorted page has no cursor to carry cut rows: past the cap it is
+        // refused, and a window that fits is served whole.
+        let sorted = |limit: u64| {
+            query(
+                &host,
+                &json!(["big = true ORDER BY $key", {"atBlock": at, "limit": limit, "select": sdk_select(json!(true))}]),
+            )
+        };
+        assert_eq!(kind(sorted(200)), QueryErrorKind::Limits);
+        let window = sorted(20).unwrap();
+        assert_eq!(window["data"].as_array().unwrap().len(), 20);
+        assert!(window.get("cursor").is_none());
         // A row that cannot fit even alone keeps the error.
         assert_eq!(rows_within(&[json!("x".repeat(64))], 16).unwrap(), 0);
         assert_eq!(rows_within(&[json!(1), json!(2)], 5).unwrap(), 2);
@@ -2247,7 +2583,7 @@ mod tests {
     fn delete(key: &Json) -> arkiv::ArkivOperation {
         let bytes = crate::simulator::wire::unhex(key.as_str().unwrap(), 32).unwrap();
         arkiv::ArkivOperation::Delete {
-            key: arkiv_db::RecordKey::new(&bytes).unwrap(),
+            key: RecordKey::new(&bytes).unwrap(),
         }
     }
     /// The keys of a page.
@@ -2401,6 +2737,19 @@ mod tests {
             query(&host, &json!(["n = u64(7)", {"select": {"count": true}}])).unwrap()["count"],
             "0x1"
         );
+        // A count reads ORDER BY and ignores it, here and in getEntityCount.
+        assert_eq!(
+            query(
+                &host,
+                &json!(["EXISTS(n) ORDER BY n:u64 DESC", {"select": {"count": true}}])
+            )
+            .unwrap()["count"],
+            "0x3"
+        );
+        assert_eq!(
+            entity_count(&host, &json!([{"query": "TYPEOF(n) = u64 ORDER BY n:u64"}])).unwrap(),
+            json!(2)
+        );
         // `count` must be a boolean; a chain without entities counts zero.
         assert!(selection(Some(&json!({"count": 1}))).is_err());
         assert_eq!(
@@ -2428,6 +2777,145 @@ mod tests {
             .unwrap()["count"],
             "0x1"
         );
+    }
+    #[test]
+    fn order_by_sorts_by_value_with_missing_values_below_and_ties_in_creation_order() {
+        let host = fixture();
+        let every = keys(&query(&host, &json!(["*", {"limit": 10}])).unwrap());
+        let sorted = |source: &str| keys(&query(&host, &json!([source, {"limit": 10}])).unwrap());
+        let rows = |ids: &[usize]| ids.iter().map(|&i| every[i].clone()).collect::<Vec<_>>();
+        // n: row 0 holds 7, row 1 holds 8, row 2 a str, row 3 an unindexed 7.
+        // The sort reads row 3's 7 though no predicate can; row 2 has no
+        // u64 and sorts below every value: first ASC, last DESC. The two 7s
+        // tie and come in creation order either way.
+        assert_eq!(sorted("* ORDER BY n:u64"), rows(&[2, 0, 3, 1]));
+        assert_eq!(sorted("* ORDER BY n:u64 ASC"), rows(&[2, 0, 3, 1]));
+        assert_eq!(sorted("* order by n : U64 asc"), rows(&[2, 0, 3, 1]));
+        assert_eq!(sorted("* ORDER BY n:u64 DESC"), rows(&[1, 0, 3, 2]));
+        assert_eq!(sorted("* ORDER BY n:str DESC"), rows(&[2, 0, 1, 3]));
+        assert_eq!(sorted("EXISTS(n) ORDER BY n:u64 DESC"), rows(&[1, 0, 2]));
+        assert_eq!(sorted("* ORDER BY missing:i32 DESC"), every);
+        // System attributes have their type; $createdAt ties everywhere here.
+        let mut by_key = every.clone();
+        by_key.sort_by_key(|k| k.as_str().unwrap().to_owned());
+        assert_eq!(sorted("* ORDER BY $key"), by_key);
+        assert_eq!(sorted("* ORDER BY $key:key ASC"), by_key);
+        by_key.reverse();
+        assert_eq!(sorted("* ORDER BY $key DESC"), by_key);
+        assert_eq!(sorted("* ORDER BY $createdAt DESC"), every);
+        assert_eq!(sorted("* ORDER BY $owner:addr"), every);
+        assert_eq!(sorted("* ORDER BY $expiresAt:u64"), every);
+        // Its words are read where the clause stands, nowhere else.
+        assert_eq!(
+            sorted("n = u64(8) OR desc = u64(1) ORDER BY desc:u64 DESC"),
+            rows(&[1])
+        );
+        // Every window of the order, in both directions: a sorted page is an
+        // offset window and carries no cursor, whatever follows it.
+        for (source, order) in [
+            ("* ORDER BY n:u64", [2, 0, 3, 1]),
+            ("* ORDER BY n:u64 DESC", [1, 0, 3, 2]),
+        ] {
+            for offset in 0..5usize {
+                for limit in 1..4usize {
+                    let page =
+                        query(&host, &json!([source, {"limit": limit, "offset": offset}])).unwrap();
+                    let from = offset.min(4);
+                    let to = (from + limit).min(4);
+                    assert_eq!(keys(&page), rows(&order[from..to]), "{source} {offset}");
+                    assert!(page.get("cursor").is_none());
+                }
+            }
+            // Offset windows at a pinned block, with the count, partition
+            // the order.
+            let mut walked = Vec::new();
+            for offset in (0..6).step_by(2) {
+                let page = query(
+                    &host,
+                    &json!([source, {"limit": 2, "offset": offset, "atBlock": "0x0", "select": {"key": true, "count": true}}]),
+                )
+                .unwrap();
+                assert_eq!(page["count"], "0x4");
+                walked.extend(keys(&page));
+            }
+            assert_eq!(walked, rows(&order), "{source}");
+            // The sorted page is the full entity, projected as selected.
+            let page = query(
+                &host,
+                &json!([source, {"limit": 1, "select": sdk_select(json!(true)), "offset": 3}]),
+            )
+            .unwrap();
+            let expected = query(
+                &host,
+                &json!([format!("$key = key({})", every[order[3]].as_str().unwrap()), {"select": sdk_select(json!(true))}]),
+            )
+            .unwrap();
+            assert_eq!(page["data"], expected["data"]);
+        }
+        // The scan fallback sorts its matches the same way.
+        let nine = std::iter::repeat_n("$createdAt = u64(0)", 8)
+            .chain(["EXISTS(n)"])
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let scanned = format!("{nine} ORDER BY n:u64 DESC");
+        assert_eq!(sorted(&scanned), rows(&[1, 0, 2]));
+        assert_eq!(
+            keys(&query(&host, &json!([scanned, {"limit": 1, "offset": 2}])).unwrap()),
+            rows(&[2])
+        );
+        // ORDER BY takes no cursor: not one of an unsorted page, nor a made-up
+        // one, nor anything else.
+        let first = query(&host, &json!(["*", {"limit": 1}])).unwrap();
+        for cursor in [first["cursor"].clone(), json!("0x00"), json!(7)] {
+            let error = match query(
+                &host,
+                &json!(["* ORDER BY n:u64", {"limit": 1, "atBlock": "0x0", "cursor": cursor}]),
+            ) {
+                Err(ReadError::Query(q)) => q,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(error.kind, QueryErrorKind::Cursor);
+            assert!(error.message.contains("offset"), "{}", error.message);
+        }
+    }
+    #[test]
+    fn order_by_errors_use_the_sdk_code_table() {
+        let host = fixture();
+        for (source, expected) in [
+            ("* ORDER BY n", QueryErrorKind::Type),
+            ("* ORDER BY n:bytes", QueryErrorKind::Type),
+            ("* ORDER BY n:nope", QueryErrorKind::Type),
+            ("* ORDER BY n:str('x')", QueryErrorKind::Type),
+            ("* ORDER BY $owner:u64", QueryErrorKind::Type),
+            ("* ORDER BY $updatedAt", QueryErrorKind::Type),
+            ("* ORDER BY $payload", QueryErrorKind::Type),
+            ("* ORDER", QueryErrorKind::Parse),
+            ("* ORDER n:u64", QueryErrorKind::Parse),
+            ("* ORDER BY", QueryErrorKind::Parse),
+            ("* ORDER BY 5:i32", QueryErrorKind::Parse),
+            ("* ORDER BY n:", QueryErrorKind::Parse),
+            ("* ORDER BY n::u64", QueryErrorKind::Parse),
+            ("* ORDER BY n:u64 sideways", QueryErrorKind::Parse),
+            ("* ORDER BY n:u64 DESC n", QueryErrorKind::Parse),
+            ("* ORDER BY n:u64 AND a = 1", QueryErrorKind::Parse),
+            ("* ORDER BY n:u64 ORDER BY n:u64", QueryErrorKind::Parse),
+            ("(n = u64(1) ORDER BY n:u64)", QueryErrorKind::Parse),
+            ("* AND n = u64(1)", QueryErrorKind::Parse),
+            ("n = u64(1) n = u64(2)", QueryErrorKind::Parse),
+        ] {
+            assert_eq!(kind(query(&host, &json!([source]))), expected, "{source}");
+        }
+        let error = match query(&host, &json!(["* ORDER BY rank"])) {
+            Err(ReadError::Query(q)) => q,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            error.message.contains("ORDER BY rank:str"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.to_json()["data"]["position"], "* ORDER BY ".len());
+        assert_eq!(error.to_json()["code"], -32002);
     }
     #[test]
     fn between_and_ranges_take_every_indexable_type() {
@@ -2462,7 +2950,7 @@ mod tests {
         assert_eq!(count("$expiresAt BETWEEN u64(10) AND u64(10)"), 4);
     }
     #[test]
-    fn offset_walks_and_counts_are_charged_to_the_read_budget() {
+    fn offset_sort_and_count_walks_are_charged_to_the_read_budget() {
         let mut host = fixture();
         let mut nonce = 0;
         for i in 0..40u64 {
@@ -2481,8 +2969,8 @@ mod tests {
                 .and_then(|page| page.run_within(budget))
         };
         // The least budget each read is served under: a walk past 39
-        // matches, or a count beside the page, costs more than a page of one,
-        // and the walk is refused as `limits` under that page's budget.
+        // matches, or through all 40 to sort them, costs more than a page of
+        // one, and is refused as `limits` under that page's budget.
         let least = |source: &str, options: Json| {
             let (mut low, mut high) = (1, READ_BUDGET);
             assert!(run(source, options.clone(), high).is_ok());
@@ -2501,17 +2989,21 @@ mod tests {
         let typed = "TYPEOF(w) = u64";
         let page = least(typed, json!({"limit": 1}));
         let skip = least(typed, json!({"limit": 1, "offset": 39}));
+        let sort = least("TYPEOF(w) = u64 ORDER BY w:u64", json!({"limit": 1}));
         let count = least(
             typed,
             json!({"limit": 1, "select": {"key": true, "count": true}}),
         );
         assert!(skip > page + 39, "{skip} {page}");
+        assert!(sort > page + 40 * 3, "{sort} {page}");
         assert!(count > page, "{count} {page}");
-        assert_eq!(
-            kind(run(typed, json!({"limit": 1, "offset": 39}), page)),
-            QueryErrorKind::Limits
-        );
-        // Under the real budget the offset page agrees with a full walk.
+        for (source, options) in [
+            (typed, json!({"limit": 1, "offset": 39})),
+            ("TYPEOF(w) = u64 ORDER BY w:u64", json!({"limit": 1})),
+        ] {
+            assert_eq!(kind(run(source, options, page)), QueryErrorKind::Limits);
+        }
+        // Under the real budget both answer, and agree with a full walk.
         let every = keys(&run("TYPEOF(w) = u64", json!({"limit": 40}), READ_BUDGET).unwrap());
         assert_eq!(
             keys(
@@ -2523,6 +3015,23 @@ mod tests {
                 .unwrap()
             ),
             every[39..]
+        );
+        let sorted = keys(
+            &run(
+                "TYPEOF(w) = u64 ORDER BY w:u64 DESC",
+                json!({"limit": 40}),
+                READ_BUDGET,
+            )
+            .unwrap(),
+        );
+        let mut expected: Vec<(u64, usize)> = (0..40).map(|i| (i % 7, i as usize)).collect();
+        expected.sort_by_key(|&(w, i)| (std::cmp::Reverse(w), i));
+        assert_eq!(
+            sorted,
+            expected
+                .iter()
+                .map(|&(_, i)| every[i].clone())
+                .collect::<Vec<_>>()
         );
     }
     #[test]
@@ -2559,9 +3068,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        // The indexed path, and the scan fallback (EXISTS without a type is
-        // nine groups).
-        let sources = ["TYPEOF(p) = u64", "EXISTS(p)"];
+        // The indexed path, the scan fallback (EXISTS without a type is
+        // nine groups) and a sorted walk.
+        let sources = [
+            "TYPEOF(p) = u64",
+            "EXISTS(p)",
+            "TYPEOF(p) = u64 ORDER BY p:u64 DESC",
+        ];
         let before: Vec<_> = sources
             .iter()
             .map(|source| pages(&host, source, Some(&pinned)))
@@ -2574,8 +3087,8 @@ mod tests {
             assert!(pages.iter().all(|p| p["count"] == "0xc"));
             assert!(pages.iter().all(|p| p["blockNumber"] == pinned.as_str()));
         }
-        // Between the pages the head moves on: an entity is created and one
-        // from the first page is deleted.
+        // Between the pages the head moves on: an entity (sorting first) is
+        // created and one from the first page is deleted.
         let doomed = keys(&before[0][0])[0].clone();
         submit(
             &mut host,
@@ -2602,9 +3115,9 @@ mod tests {
                 "{source}"
             );
         }
-        // An offset page at the pinned block continues by cursor, from the
-        // same snapshot, past later writes.
-        for source in sources {
+        // An unsorted offset page at the pinned block also continues by
+        // cursor, from the same snapshot, past later writes.
+        for source in &sources[..2] {
             let first = query(
                 &host,
                 &json!([source, {"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)}]),
@@ -2616,7 +3129,7 @@ mod tests {
                 json!({"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)}),
             );
             assert_eq!(keys(&first), rest[..4]);
-            let reference: Vec<_> = before[sources.iter().position(|s| *s == source).unwrap()]
+            let reference: Vec<_> = before[sources.iter().position(|s| s == source).unwrap()]
                 .iter()
                 .flat_map(keys)
                 .collect();

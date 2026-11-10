@@ -390,12 +390,12 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     assert_eq!(read["result"], expected, "{read}");
     let missing = call("arkiv_getEntity", json!([format!("0x{}", "00".repeat(32))])).await;
     assert_eq!(missing["result"], Json::Null, "{missing}");
-    // SDK 1.0.1's query shapes: `withCount()` with `limit` and `offset`
-    // (every select key explicit, `count` added, hex quantities), and
-    // `client.count()`, which selects `count` alone.
+    // SDK 1.0.1's query shapes: `withCount()` with `orderBy`, `limit` and
+    // `offset` (every select key explicit, `count` added, hex quantities),
+    // and `client.count()`, which selects `count` alone.
     let mut counted = select.clone();
     counted["count"] = json!(true);
-    let source = format!("$key = key({key_hex})");
+    let source = format!("$key = key({key_hex}) ORDER BY $expiresAt:u64 DESC");
     let page = call(
         "arkiv_query",
         json!([source, {"select": counted, "limit": "0x14", "offset": "0x0"}]),
@@ -427,6 +427,8 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     )
     .await;
     assert_eq!(bad["error"]["code"], -32002, "{bad}");
+    let unsorted = call("arkiv_query", json!(["* ORDER BY score", {}])).await;
+    assert_eq!(unsorted["error"]["code"], -32002, "{unsorted}");
     // The receipt's EntityCreated log carries the sentinel as its first word.
     let tx_hash = arkiv_node::simulator::wire::hex(permanent.hash().as_slice());
     let receipt = call("eth_getTransactionReceipt", json!([tx_hash])).await;

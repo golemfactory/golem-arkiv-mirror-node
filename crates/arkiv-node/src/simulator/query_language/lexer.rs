@@ -3,11 +3,14 @@
 //! Hand-rolled lexer for the Arkiv query language.
 //!
 //! Tokens:
-//! - grouping and comparison: `(` `)` `=` `!=` `<` `<=` `>` `>=`
+//! - grouping and comparison: `(` `)` `=` `!=` `<` `<=` `>` `>=`, and the `:`
+//!   that joins an `ORDER BY` attribute to its type
 //! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `BETWEEN`
 //!   `STARTSWITH` `EXISTS` `TYPEOF`. The last two are **reserved but
 //!   unimplemented** here — they lex so the parser can reject them by name
-//!   instead of mistaking them for an attribute.
+//!   instead of mistaking them for an attribute. `ORDER`, `BY`, `ASC` and
+//!   `DESC` are not keywords: they are names, read as the clause only where
+//!   it stands.
 //! - typed literals: a [`TypeTag`] immediately followed by `(`, whose body is
 //!   captured **raw** and validated later by [`literal`](super::literal). Keeping
 //!   the body raw is what lets one lexer handle bodies as different as `-5`,
@@ -99,6 +102,8 @@ pub(crate) enum Token {
     Lte,
     Gt,
     Gte,
+    /// `:` — joins an `ORDER BY` attribute to the type it sorts as.
+    Colon,
     /// `*` — matches every live entity.
     Star,
     True,
@@ -238,6 +243,10 @@ impl<'a> Lexer<'a> {
             '*' => {
                 self.read_char();
                 Token::Star
+            }
+            ':' => {
+                self.read_char();
+                Token::Colon
             }
             '=' => {
                 self.read_char();
