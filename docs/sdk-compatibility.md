@@ -8,10 +8,12 @@
 > [node API reference](node-api-reference.md#entities-user-defined-columns).
 > The transport, gas and account behaviour below is unchanged.
 >
-> The current-SDK smoke is `scripts/udc-sdk-smoke.{py,ts}`: it runs the
-> `udc/*` SDK branches (built with `bun run build`; point `ARKIV_SDK_DIR` at
-> that checkout) against disposable producer/full/light nodes, through a
-> three-role restart and follower reads.
+> The current-SDK smoke is `scripts/udc-sdk-smoke.{py,ts}`: it runs
+> `@arkiv-network/sdk` 1.0.x (a checkout of its `main` or `develop` with
+> dependencies installed; point `ARKIV_SDK_DIR` at it) against disposable
+> producer/full/light nodes, through a three-role restart and follower reads.
+> It no longer supports the pre-1.0 `udc/*` branches: 1.0 removed
+> `ExpirationTime.permanent()`, cursors and `atBlock`.
 
 The signed node exposes Ethereum/Arkiv JSON-RPC at `/` on its existing public
 listener, over HTTP POST and WebSocket. Native status exposes the structured
@@ -88,13 +90,58 @@ transactions emit no entity logs. Block gas usage includes native expiry work;
 receipt cumulative gas includes user transactions only. `eth_subscribe` supports `newHeads` and `logs`.
 
 `arkiv_query` supports the SDK's typed scalar JSON, selected fields and
-attributes, historical block selection, pagination, equality and inequality,
-ranges, string prefixes, Boolean expressions, `EXISTS` and `TYPEOF`.
-`arkiv_getEntity` (`[key]` or `[key, block]`) returns one entity with every
-field except `attributeSchema`, or `null`; it is the one-row `$key` query.
-`arkiv_getEntityCount` and `arkiv_getBlockTiming` use retained native state.
-These JSON-RPC query responses are ordinary **unverified reads**. The native
-proof API continues to prove its documented equality subset separately.
+attributes, equality, ranges on every indexable type (numeric order for
+`i32`, `u64`, `u256` and `dec`, `false < true`, unsigned bytes for `str`,
+`bytes32`, `addr` and `key`), inclusive `BETWEEN`, string prefixes, Boolean
+expressions, `EXISTS` and `TYPEOF`, and SDK 1.0's paging: `limit`, `offset`
+and `select.count` (the hex size of the whole match set, on every page; alone,
+the whole answer). Matches come in creation order: by block, transaction and
+operation (record id). `arkiv_getEntity` (`[key]` or `[key, block]`) returns
+one entity with every field except `attributeSchema`, or `null`; it is the
+one-row `$key` query. `arkiv_getEntityCount` and `arkiv_getBlockTiming` use
+retained native state. These JSON-RPC query responses are ordinary
+**unverified reads**. The native proof API continues to prove its documented
+equality subset separately.
+
+### Paging: `atBlock`, cursors and `offset`
+
+SDK 1.0 pages with `limit` and `offset` and sends no `atBlock`, so each page
+is read at the head: an entity created or deleted between two requests shifts
+the matches after it, and a row repeats or is missed. That is SDK 1.0
+compatibility, not consistent paging. The consistent modes need a pinned
+block: follow the `cursor` with page one's `blockNumber` as `atBlock` (the
+primary mode; cursors are snapshot-bound, process-local and expire after
+restart or eviction), or send that `blockNumber` as `atBlock` with every
+`offset`. `offset` composes with `atBlock` and `select.count`, so offset pages
+pinned to one block partition its matches and repeat one count however the
+head moves, as long as the height stays retained (`--state-retention`). A
+cursor carries its own position, so it continues past an offset page and an
+`offset` beside it is ignored. An offset at or past the end is an empty page
+without a cursor.
+
+An offset is a walk: the node reads the skipped matches' ids (one engine page
+at a time) and then reads on after the last of them, all charged to the
+request's read budget; `select.count` is the planned count (stored posting
+sizes where they decide it), charged to the same budget. A deep offset is
+refused as `-32004` (`limits`) rather than scanned for free. A query beyond
+the group and literal bounds (an untyped `EXISTS(x)` is nine groups) takes
+the scan fallback for its page, its offset and its `select.count` alike;
+`arkiv_getEntityCount` still refuses it.
+
+Upstream orders matches by creating transaction, then by entity key among
+the entities one transaction creates; this node orders by record id, which
+agrees except inside a transaction that creates several entities (operation
+order here, key order upstream). Record ids are committed state, so this is
+left as it is.
+
+### Supersets of the network
+
+SDK 1.0 removed `ne()`/`!=`, `not()`/`NOT`, `atBlock`, cursors and
+`getEntityCount()`, because the Arkiv network it targets answers at the head
+only and has no negation. This node keeps them: typed `!=`, `NOT` (the
+complement over live entities), `atBlock` on every read, cursors,
+`arkiv_getEntityCount`, and predicates on `$createdAt`. Clients that rely on
+them will not work against the real network.
 
 A full follower reads its own state and forwards raw submissions to its peer.
 A light node forwards JSON-RPC requests to its peer; this does not turn those
@@ -149,7 +196,8 @@ JSON responses are capped at 8 MiB. WebSocket sessions and subscriptions have
 additional bounded limits and disconnect rather than silently skip blocks if
 they fall too far behind.
 
-Queries have a shared 25-million-unit read budget. Larger Boolean expressions
+Queries have a shared 25-million-unit read budget: a request's count, offset
+walk and rows all draw on it. Larger Boolean expressions
 can use a bounded scan of at most 4,096 rows when the native index query limit
 cannot represent them. Pagination caches at most 1,024 native cursors; cursors
 expire after restart or eviction and bind to the chain, snapshot, query and

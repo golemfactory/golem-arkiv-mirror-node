@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run the user-defined-columns SDK against disposable producer/full/light nodes.
+"""Run @arkiv-network/sdk 1.0.x against disposable producer/full/light nodes.
 
-Requires Bun, an arkiv-sdk-js checkout of the udc/* branches with dependencies
-installed and `bun run build` done, and a built arkiv-proposer. Only public
-disposable fixture keys are used. Set ARKIV_SDK_DIR and ARKIV_PROPOSER_BIN to
-override locations. Stages: exercise (writes, typed reads, queries, limits),
-then reopen after a three-role restart, then follower reads via the full node.
+Requires Bun, an arkiv-sdk-js 1.0.x checkout (main or develop) with
+dependencies installed, and a built arkiv-proposer. Bun runs the SDK from its
+sources, so no build is needed. Only public disposable fixture keys are used.
+Set ARKIV_SDK_DIR and ARKIV_PROPOSER_BIN to override locations. Stages:
+exercise (writes, typed reads, offset/count queries, limits), then reopen
+after a three-role restart, then follower reads via the full node.
 """
 
 import importlib.util

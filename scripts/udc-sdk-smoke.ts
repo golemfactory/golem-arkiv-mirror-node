@@ -1,10 +1,10 @@
-/** Runs the user-defined-columns SDK (arkiv-sdk-js udc/*) against an isolated native chain. */
+/** Runs SDK 1.0.x (@arkiv-network/sdk, user-defined columns) against an isolated native chain. */
 import assert from "node:assert/strict"
 import { readFileSync, writeFileSync } from "node:fs"
-import { createPublicClient, createWalletClient, ExpirationTime } from "@arkiv-network/sdk"
-import { and, eq, gt } from "@arkiv-network/sdk/query"
+import { createPublicClient, createWalletClient, ExpirationTime, MAX_LIFETIME } from "@arkiv-network/sdk"
+import { and, between, eq, gt } from "@arkiv-network/sdk/query"
 import { addr, bytes, dec, defineSchema, str, u64 } from "@arkiv-network/sdk/schema"
-import { bytesToHex, http, toFunctionSelector } from "viem"
+import { bytesToHex, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 
 const url = process.env.SDK_RPC_URL!
@@ -39,7 +39,6 @@ const Probe = defineSchema("probe", {
 // One bytes column at the 128 KiB per-entity cap.
 const Blob = defineSchema("blob", { body: bytes() })
 const maxBody = new Uint8Array(128 * 1024).map((_, i) => (i * 7) % 256)
-const PERMANENT = 2n ** 64n - 1n
 const GLM = 10n ** 18n
 
 const rpc = (q: string, opts: Record<string, unknown>) =>
@@ -48,13 +47,22 @@ const step = (name: string) => console.log("ok:", name)
 const report = process.env.SDK_REPORT_FILE!
 const stage = process.argv[2] ?? "exercise"
 
+// The five `q` posts the paging steps read, in creation order.
+const pages = (size: number, offset: number) =>
+  read
+    .select({ $key: true, views: true })
+    .from(Posts)
+    .where(eq("category", "q"))
+    .withCount()
+    .limit(size)
+    .offset(offset)
+    .fetch()
+
 if (stage !== "exercise") {
   // After a three-role restart (reopen) and through the replicated full node (follower).
-  const { entityKey, bigKey, permanentKey, extendedKey, maxKey } = JSON.parse(
-    readFileSync(report, "utf8"),
-  )
-  for (const key of [permanentKey, extendedKey, maxKey]) {
-    assert.equal((await read.getEntity(key)).$expiresAt, PERMANENT)
+  const { entityKey, bigKey, longKeys, maxKey, qKeys } = JSON.parse(readFileSync(report, "utf8"))
+  for (const [key, expiresAt] of Object.entries(longKeys as Record<string, string>)) {
+    assert.equal((await read.getEntity(key as `0x${string}`)).$expiresAt, BigInt(expiresAt))
   }
   assert.equal((await read.getEntity(maxKey, Blob)).body.value, bytesToHex(maxBody))
   const row = await read.getEntity(entityKey, Posts)
@@ -68,6 +76,14 @@ if (stage !== "exercise") {
     page.entities.map((e) => e.$key),
     [entityKey],
   )
+  const walked = []
+  for (let offset = 0; offset < 6; offset += 2) {
+    const window = await pages(2, offset)
+    assert.equal(window.count, 5n)
+    walked.push(...window.entities.map((e) => e.$key))
+  }
+  assert.deepEqual(walked, qKeys)
+  assert.equal(await read.count().from(Posts).where(eq("category", "q")).fetch(), 5n)
   console.log(`UDC SMOKE ${stage.toUpperCase()} PASSED`)
   process.exit(0)
 }
@@ -179,50 +195,35 @@ const untyped = await read.getEntity(entityKey)
 assert.equal((untyped.$attributes as any)["arkiv.schema"]?.value, "posts")
 step("untyped getEntity returns every attribute")
 
-// Permanence: ExpirationTime.permanent() is expiresAt = 2^64 - 1, as in the
-// SDK's network-health test. The node charges it the capped rent, in GLM.
-const permanent = await write.createEntity(
-  Probe,
-  { purpose: "permanent_test", body: new Uint8Array() },
-  { expiration: ExpirationTime.permanent() },
-)
-assert.equal(permanent.expiresAt, PERMANENT)
-assert.equal((await read.getEntity(permanent.entityKey)).$expiresAt, PERMANENT)
-step("permanent create: receipt and getEntity report expiresAt 2^64 - 1")
+// The longest lifetime SDK 1.0.x sends: ExpirationTime.max(), MAX_LIFETIME
+// blocks from the landing block. The SDK no longer writes permanent entities.
+const head = async () => BigInt(await read.getBlockNumber())
+const long = await write.createEntity(Probe, { purpose: "max_lifetime" }, { expiration: ExpirationTime.max() })
+const longReceipt = await read.getTransactionReceipt({ hash: long.txHash })
+assert.equal(long.expiresAt, longReceipt.blockNumber + MAX_LIFETIME)
+assert.equal((await read.getEntity(long.entityKey)).$expiresAt, long.expiresAt)
+step(`ExpirationTime.max(): expiresAt is the landing block + ${MAX_LIFETIME}`)
 
-const again = await write.extendEntity({
-  entityKey: permanent.entityKey,
-  expiration: ExpirationTime.permanent(),
-})
-assert.equal(again.expiresAt, PERMANENT)
-await assert.rejects(
-  write.extendEntity({ entityKey: permanent.entityKey, expiration: ExpirationTime.fromBlocks(10) }),
-)
-step("extending a permanent entity to permanent succeeds; a finite expiry is refused")
+await assert.rejects(write.extendEntity({ entityKey: long.entityKey, expiration: ExpirationTime.fromBlocks(10) }))
+const again = await write.extendEntity({ entityKey: long.entityKey, expiration: ExpirationTime.max() })
+assert.ok(again.expiresAt > long.expiresAt)
+assert.equal((await read.getEntity(long.entityKey)).$expiresAt, again.expiresAt)
+step("extending with max() pushes the expiry out again; a shorter one is refused")
 
-const finite = await write.createEntity(Probe, { purpose: "extend_to_permanent" }, { expiration })
-const extended = await write.extendEntity({
-  entityKey: finite.entityKey,
-  expiration: ExpirationTime.permanent(),
-})
-assert.equal(extended.expiresAt, PERMANENT)
-assert.equal((await read.getEntity(finite.entityKey)).$expiresAt, PERMANENT)
-step("a finite entity extends to permanent")
-
-// Rent is GLM outside the gas budget: a 128 KiB permanent create is one SDK
-// call whose gas is execution only; the receipt's rentFee is the year of rent.
+// Rent is GLM outside the gas budget: a 128 KiB create for MAX_LIFETIME blocks is one
+// SDK call whose gas is execution only; the receipt's rentFee is its rent.
 const call = (method: string, params: unknown[]) =>
   read.request({ method, params } as any) as Promise<any>
 const balanceOf = async (who: string) => BigInt(await call("eth_getBalance", [who, "latest"]))
 const nonceOf = async (who: string) => BigInt(await call("eth_getTransactionCount", [who, "latest"]))
 const aliceBefore = await balanceOf(alice.address)
-const max = await write.createEntity(Blob, { body: maxBody }, { expiration: ExpirationTime.permanent() })
-assert.equal(max.expiresAt, PERMANENT)
+const max = await write.createEntity(Blob, { body: maxBody }, { expiration: ExpirationTime.max() })
 const maxReceipt = (await read.getTransactionReceipt({ hash: max.txHash })) as any
+assert.equal(max.expiresAt, maxReceipt.blockNumber + MAX_LIFETIME)
 const rentFee = BigInt(maxReceipt.rentFee)
-assert.ok(rentFee > (9n * GLM) / 10n && rentFee < GLM, `rent ${rentFee}`)
-// A year of whole storage units at 20 gwei a day.
-assert.equal(rentFee % 7_300_000_000_000n, 0n)
+// MAX_LIFETIME blocks of 500 ms are 45.625 days: an eighth of the year of
+// rent a full 128 KiB entity costs (0.9 to 1 GLM).
+assert.ok(rentFee > (9n * GLM) / 80n && rentFee < GLM / 8n, `rent ${rentFee}`)
 assert.ok(maxReceipt.gasUsed < 1_000_000n, `gas ${maxReceipt.gasUsed}`)
 assert.equal(
   aliceBefore - (await balanceOf(alice.address)),
@@ -230,7 +231,7 @@ assert.equal(
 )
 assert.equal((await read.getEntity(max.entityKey, Blob)).body.value, bytesToHex(maxBody))
 step(
-  `128 KiB permanent create in one call: ${maxReceipt.gasUsed} gas, rentFee ${rentFee} wei, both debited`,
+  `128 KiB create for MAX_LIFETIME blocks in one call: ${maxReceipt.gasUsed} gas, rentFee ${rentFee} wei, both debited`,
 )
 
 // A sender holding the gas but not the rent is refused at admission, cleanly:
@@ -246,7 +247,7 @@ await fund(GLM / 100n)
 const carolWrite = createWalletClient({ chain, transport, account: carol, pollingInterval: 100 })
 let refusal = ""
 await assert.rejects(
-  carolWrite.createEntity(Blob, { body: maxBody }, { expiration: ExpirationTime.permanent() }),
+  carolWrite.createEntity(Blob, { body: maxBody }, { expiration: ExpirationTime.max() }),
   (e: any) => {
     refusal = describe(e)
     return /insufficient funds for gas \* price \+ value \+ rent/.test(refusal) || assert.fail(refusal)
@@ -261,19 +262,21 @@ await fund(GLM)
 const carols = await carolWrite.createEntity(
   Blob,
   { body: maxBody },
-  { expiration: ExpirationTime.permanent() },
+  { expiration: ExpirationTime.max() },
 )
-assert.equal(carols.expiresAt, PERMANENT)
+assert.ok(carols.expiresAt > (await head()))
 assert.equal(await nonceOf(carol.address), 1n)
 step("topped up with gas plus rent, the same call commits")
 
 const status = (await (await fetch(`${url}/signed/v1/status`)).json()) as any
 const gas = status.capabilities.gas
 
-// A permissionless-extension entity takes anyone's extension up to one rent
-// cap ahead; further, permanence included, is its owner's alone.
+// A permissionless-extension entity takes anyone's extension, here up to the
+// SDK's own MAX_LIFETIME, below this chain's one-year rent cap. Extending past
+// that cap, or to permanence, is its owner's alone (PermanenceOwnerOnly), but
+// SDK 1.0.x cannot ask for either: the Rust tests cover them.
 const cap = BigInt(gas.maxRentLifetimeBlocks)
-const permanenceOwnerOnly = toFunctionSelector("PermanenceOwnerOnly(bytes32,uint64,uint64)")
+assert.ok(MAX_LIFETIME < cap)
 const open = await write.createEntity(
   Probe,
   { purpose: "permissionless" },
@@ -284,29 +287,13 @@ const farther = await carolWrite.extendEntity({
   expiration: ExpirationTime.fromBlocks(20_000),
 })
 assert.ok(farther.expiresAt > open.expiresAt)
-const atCap = await carolWrite.extendEntity({
+const longest = await carolWrite.extendEntity({
   entityKey: open.entityKey,
-  expiration: ExpirationTime.fromBlocks(Number(cap)),
+  expiration: ExpirationTime.max(),
 })
-assert.ok(atCap.expiresAt > farther.expiresAt)
-for (const expiration of [
-  ExpirationTime.fromBlocks(Number(cap) + 100),
-  ExpirationTime.permanent(),
-]) {
-  await assert.rejects(
-    carolWrite.extendEntity({ entityKey: open.entityKey, expiration }),
-    (e: any) => describe(e).toLowerCase().includes(permanenceOwnerOnly) || assert.fail(describe(e)),
-  )
-}
-assert.equal((await read.getEntity(open.entityKey)).$expiresAt, atCap.expiresAt)
-const owned = await write.extendEntity({
-  entityKey: open.entityKey,
-  expiration: ExpirationTime.permanent(),
-})
-assert.equal(owned.expiresAt, PERMANENT)
-step(
-  `anyone extends a permissionless entity up to ${cap} blocks ahead; further and permanence are the owner's (${permanenceOwnerOnly})`,
-)
+assert.ok(longest.expiresAt > farther.expiresAt)
+assert.equal((await read.getEntity(open.entityKey)).$expiresAt, longest.expiresAt)
+step(`anyone extends a permissionless entity, up to max(): ${longest.expiresAt}`)
 
 // The per-block storage cap (200,000 units here): two full 128 KiB entities
 // submitted together land in consecutive blocks, the second deferred, not
@@ -366,14 +353,97 @@ step(
   `status: rent ${gas.rentWeiPerStorageUnitDay} wei/unit/day outside gas, capped at ${gas.maxRentLifetimeSeconds} s`,
 )
 
+// SDK 1.0.x reads: limit/offset windows, withCount(), client.count(),
+// BETWEEN and a range on a str column, through the schema.
+const qKeys: string[] = []
+for (const views of [3n, 1n, 4n, 1n, 5n]) {
+  const created = await write.createEntity(
+    Posts,
+    {
+      author: addr(alice.address),
+      category: "q",
+      score: dec("2"),
+      views: u64(views),
+      title: `views ${views}`,
+      body: new Uint8Array([Number(views)]),
+    },
+    { expiration },
+  )
+  qKeys.push(created.entityKey)
+}
+const windows = []
+for (let offset = 0; offset < 6; offset += 2) windows.push(await pages(2, offset))
+assert.deepEqual(
+  windows.map((w) => w.entities.length),
+  [2, 2, 1],
+)
+assert.ok(windows.every((w) => w.count === 5n))
+assert.deepEqual(
+  windows.flatMap((w) => w.entities.map((e) => e.$key)),
+  qKeys,
+)
+assert.equal((await pages(2, 5)).entities.length, 0)
+assert.equal((await pages(2, 500)).count, 5n)
+step("limit/offset windows walk the matches in creation order; withCount() counts them all")
+
+assert.equal(await read.count().from(Posts).where(eq("category", "q")).fetch(), 5n)
+assert.equal(await read.count().from(Posts).where(between("views", u64(1n), u64(3n))).fetch(), 3n)
+assert.equal(await read.count().from(Posts).where(gt("category", "p")).fetch(), 5n)
+const counted = await rpc(`arkiv.schema = str('posts')`, { select: { count: true } })
+assert.deepEqual(counted.data, [])
+assert.equal(counted.cursor, undefined)
+step(`client.count(), BETWEEN and a str range; count alone reads no rows (${counted.count} posts)`)
+
+// The SDK pages at the head, so a write between two requests shifts the
+// windows. Pinning page one's blockNumber with atBlock (beyond the SDK) keeps
+// every offset page on that snapshot.
+const counting = { key: true, count: true }
+const pageOne = await rpc(`category = str('q')`, { select: counting, limit: "0x2", offset: "0x0" })
+await write.deleteEntity({ entityKey: qKeys[0] as `0x${string}` })
+const atHead = await rpc(`category = str('q')`, { select: counting, limit: "0x2", offset: "0x2" })
+const pinned = await rpc(`category = str('q')`, {
+  select: counting,
+  limit: "0x2",
+  offset: "0x2",
+  atBlock: pageOne.blockNumber,
+})
+assert.equal(atHead.count, "0x4")
+assert.deepEqual(
+  atHead.data.map((e: any) => e.key),
+  qKeys.slice(3, 5),
+)
+assert.equal(pinned.count, "0x5")
+assert.deepEqual(
+  pinned.data.map((e: any) => e.key),
+  qKeys.slice(2, 4),
+)
+const recreated = await write.createEntity(
+  Posts,
+  {
+    author: addr(alice.address),
+    category: "q",
+    score: dec("2"),
+    views: u64(3n),
+    title: "views 3",
+    body: new Uint8Array([3]),
+  },
+  { expiration },
+)
+qKeys.shift()
+qKeys.push(recreated.entityKey)
+step("offset pages at a pinned atBlock stay on its snapshot; at the head a delete shifts them")
+
 writeFileSync(
   report,
   JSON.stringify({
     entityKey,
     bigKey: big.entityKey,
-    permanentKey: permanent.entityKey,
-    extendedKey: finite.entityKey,
+    longKeys: {
+      [long.entityKey]: again.expiresAt.toString(),
+      [open.entityKey]: longest.expiresAt.toString(),
+    },
     maxKey: max.entityKey,
+    qKeys,
   }),
 )
 console.log("UDC SMOKE PASSED")

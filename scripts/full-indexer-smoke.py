@@ -10,8 +10,8 @@ stored and projects. Configuration goes through the environment and an empty
 env file in a temporary directory; nothing in the indexer checkout is written.
 
 Requires Docker Compose, Bun, a release arkiv-proposer, and an arkiv-sdk-js
-checkout that scripts/udc-sdk-smoke.py supports (dependencies installed,
-`bun run build` done). Environment:
+checkout that scripts/udc-sdk-smoke.py supports (1.0.x, dependencies
+installed). Environment:
 
   ARKIV_INDEXER_DIR   arkiv-chain-indexer checkout
                       (default ../../arkiv-network/arkiv-chain-indexer)
