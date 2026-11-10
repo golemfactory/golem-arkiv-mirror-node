@@ -6,7 +6,7 @@
 > (no feature flags) and `glm-v2`-only signed chains.
 
 A coordinated review by three agents and the main reviewer covered the experimental
-node in `arkiv-db-pure-astra`, plus its dedicated panels in `arkiv-chain-indexer`.
+node in this repository, plus its dedicated panels in `arkiv-chain-indexer`.
 Reviewed baselines: node `7f80db66bd68d3be135e1bd387ca4979e5387743`; frontend
 `88fb07b`. The source changes and reports in this review are intentionally small;
 there is no new consensus mechanism, state format, fee rule or genesis.

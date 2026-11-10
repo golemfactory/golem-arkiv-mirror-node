@@ -2,7 +2,7 @@
 
 ## Decision and scope
 
-This document specifies the namespace design for `arkiv-db-pure-astra`.
+This document specifies the namespace design for this repository.
 The upstream source of truth remains a reference; these local decisions do
 not require a change to that repository.
 

@@ -2,7 +2,7 @@
 
 ## Scope and decision
 
-This is the implementation contract for `arkiv-db-pure-astra`. It records
+This is the implementation contract for this repository. It records
 decisions for this repository and does not imply that the upstream
 source-of-truth repository has adopted them.
 
