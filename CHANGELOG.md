@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### `arkiv_query`: SDK 1.0 paging, counts and ranges
+
+- `offset` (hex or number) skips that many matches before the page, in
+  record-id (creation) order. The node walks the skipped matches by id, one
+  engine page at a time, then reads on after the last of them
+  (`Snapshot::cursor_after`); the walk is charged to the request's read
+  budget, so a deep offset answers `-32004` (`limits`) instead of scanning
+  for free. An offset at or past the end is an empty page without a cursor. A
+  cursor carries its own position: it continues past an offset page, and an
+  `offset` beside it is ignored.
+- `select.count` adds `count`, the hex size of the whole match set at the
+  block, independent of `limit`, `offset` and the cursor and repeated on every
+  page; selected with no entity field (SDK `client.count()` sends
+  `{count: true}`), it is the whole answer, with `data: []` and no cursor. It
+  is the planned count, charged to the same budget; a query beyond the group
+  and literal bounds counts by the bounded scan, as its page reads.
+- Both compose with `atBlock`: offset pages pinned to page one's
+  `blockNumber` stay on that snapshot while the head moves. SDK 1.0 sends no
+  `atBlock`, so its offset pages read the head and shift when entities are
+  written between them (see `docs/sdk-compatibility.md`).
+- Comparisons (`<`, `<=`, `>`, `>=`) take every indexable type, in index
+  order, and `a BETWEEN lo AND hi` is an inclusive range whose bounds share a
+  type (`lo > hi` matches nothing), as the reference grammar and SDK 1.0 have
+  them. `n > str('x')` used to be a type error; `between` is now a reserved
+  word in queries.
+- `Snapshot::cursor_after` builds a cursor of a snapshot that resumes a query
+  after any record id, as if a page had ended there; a page cut to fit the
+  8 MiB response cap now continues from one instead of re-reading the
+  snapshot with the shorter limit.
+- `scripts/udc-sdk-smoke.{py,ts}` target SDK 1.0.x: `getEntity` over
+  `arkiv_getEntity`, `limit`/`offset` windows with `withCount()`,
+  `client.count()`, `between` and a `str` range through a schema, offset pages
+  pinned with `atBlock`, and `ExpirationTime.max()` where it used the removed
+  `permanent()`.
+
 ### `arkiv_getEntity` for SDK 1.x
 
 - JSON-RPC `arkiv_getEntity` (`[key]` at the head or `[key, block]` at a

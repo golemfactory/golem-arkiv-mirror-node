@@ -2067,7 +2067,7 @@ mod tests {
         };
         for (params, code) in [
             (json!(["n ="]), -32001),
-            (json!(["n > str('x')"]), -32002),
+            (json!(["n STARTSWITH u64(1)"]), -32002),
             (json!(["n = i32(2147483648)"]), -32003),
             (json!([format!("{}a = true", "NOT ".repeat(40))]), -32004),
             (

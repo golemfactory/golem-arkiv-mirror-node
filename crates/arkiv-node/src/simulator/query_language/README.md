@@ -10,7 +10,9 @@ its license terms are retained here (see LICENSE).
 Local adaptations replace crate imports with a minimal local AST and `std`,
 remove SDK RPC-code mapping, and expose classification via the sibling
 `query_language.rs`. Grammar, literal rules, limits and upstream tests are
-preserved. A test that compared internal index bytes now compares distinct
+preserved, except that the grammar follows two later reference changes that
+SDK 1.0 relies on: `BETWEEN` (an inclusive range, both bounds of one type)
+and ranges on every indexable type, not only the numeric ones. A test that compared internal index bytes now compares distinct
 values, since this module does not implement the source index encoding.
 
 Source grammar limits: 8192 UTF-8 bytes, 64 predicates, depth 32, attribute

@@ -17,8 +17,9 @@ pub enum ParseErrorKind {
     /// Malformed input: an unexpected token, an unclosed group, trailing junk.
     MalformedInputError,
 
-    /// Well-formed but not well-typed: a range operator on an equality-only type,
-    /// an unknown type tag, a value whose type doesn't fit the attribute.
+    /// Well-formed but not well-typed: `STARTSWITH` on a non-`str` value,
+    /// `BETWEEN` bounds of two types, an unknown type tag, a value whose type
+    /// doesn't fit the attribute.
     TypeError,
 
     /// A literal that doesn't fit its tag: `i32` out of range, a bad EIP-55

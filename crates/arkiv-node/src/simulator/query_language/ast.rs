@@ -15,6 +15,13 @@ pub enum Query {
     Lt { key: AnnotKey, value: AnnotVal },
     /// Matches entities whose `key` is less than or equal to `value`.
     Lte { key: AnnotKey, value: AnnotVal },
+    /// Matches entities whose `key` lies between `low` and `high`, both
+    /// included: `key BETWEEN low AND high`. Both bounds have one type.
+    Between {
+        key: AnnotKey,
+        low: AnnotVal,
+        high: AnnotVal,
+    },
     /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
     /// operator, a raw UTF-8 byte prefix with no normalization.
     StartsWith { key: AnnotKey, value: AnnotVal },

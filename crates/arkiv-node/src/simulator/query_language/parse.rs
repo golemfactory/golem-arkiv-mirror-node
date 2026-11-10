@@ -8,17 +8,20 @@
 //! andExpr    → unary { AND unary }
 //! unary      → NOT unary | primary
 //! primary    → '(' expr ')' | predicate
-//! predicate  → attrRef compOp value | attrRef STARTSWITH strValue
+//! predicate  → attrRef compOp value | attrRef BETWEEN value AND value
+//!            | attrRef STARTSWITH strValue
 //! ```
 //!
-//! Precedence, tightest first: `NOT`, `AND`, `OR`.
+//! Precedence, tightest first: `NOT`, `AND`, `OR`. The `AND` inside a
+//! `BETWEEN` is the predicate's own: `a BETWEEN 1 AND 5 AND b = 2` is
+//! `(a BETWEEN 1 AND 5) AND b = 2`.
 //!
 //! Two jobs beyond shape. First, **typing**: a value carries its own type, and
 //! this is where a value is checked against the attribute it is compared to
-//! (`$owner` takes an address) and against its operator (only the numeric types
-//! are ordered). A range operator on an equality-only type is an error here, not
-//! an empty result later — the spec is explicit that the two must not be
-//! confused. Second, **limits**: length, predicate count and nesting depth are
+//! (`$owner` takes an address), a `BETWEEN`'s two bounds against each other,
+//! and `STARTSWITH` against its `str` operand. Every indexable type is ordered
+//! (as the reference grammar now has it), so the range operators take any of
+//! them. Second, **limits**: length, predicate count and nesting depth are
 //! bounded, because `parse` runs on unauthenticated RPC input.
 
 use std::boxed::Box;
@@ -199,16 +202,17 @@ impl Parser {
         let Some(operator) = self.advance() else {
             return Err(ParseError::syntax(
                 self.end,
-                "expected a comparison operator (= < <= > >= STARTSWITH) after the attribute",
+                "expected a comparison operator (= < <= > >= BETWEEN STARTSWITH) after the \
+                 attribute",
             ));
         };
 
         match operator.token {
             Token::Eq | Token::Lt | Token::Lte | Token::Gt | Token::Gte => {
-                let (value, position) = self.parse_value(&key)?;
-                check_operator(&operator.token, &value, position)?;
+                let (value, _) = self.parse_value(&key)?;
                 Ok(comparison(&operator.token, key, value))
             }
+            Token::Between => self.parse_between(key),
             Token::StartsWith => {
                 let (value, position) = self.parse_value(&key)?;
                 if !matches!(value, AttributeValue::Str(_)) {
@@ -225,9 +229,39 @@ impl Parser {
             )),
             _ => Err(ParseError::syntax(
                 operator.start,
-                "expected a comparison operator (= < <= > >= STARTSWITH)",
+                "expected a comparison operator (= < <= > >= BETWEEN STARTSWITH)",
             )),
         }
+    }
+
+    /// `attrRef BETWEEN value AND value`, after the `BETWEEN`: an inclusive
+    /// range. The `AND` is taken here, as the predicate's own. A low bound
+    /// above the high one is a query that matches nothing, not an error.
+    fn parse_between(&mut self, key: AnnotKey) -> Result<Query, ParseError> {
+        let (low, _) = self.parse_value(&key)?;
+        match self.advance() {
+            Some(SpannedToken {
+                token: Token::And, ..
+            }) => {}
+            other => {
+                return Err(ParseError::syntax(
+                    other.map_or(self.end, |spanned| spanned.start),
+                    "BETWEEN joins its two bounds with AND — a BETWEEN lo AND hi",
+                ));
+            }
+        }
+        let (high, position) = self.parse_value(&key)?;
+        if low.attr_type() != high.attr_type() {
+            return Err(ParseError::type_error(
+                position,
+                std::format!(
+                    "BETWEEN bounds must be of one type, but they are {} and {}",
+                    low.attr_type().name(),
+                    high.attr_type().name(),
+                ),
+            ));
+        }
+        Ok(Query::Between { key, low, high })
     }
 
     fn parse_attr_ref(&mut self) -> Result<AnnotKey, ParseError> {
@@ -253,6 +287,7 @@ impl Parser {
             | Token::Not
             | Token::True
             | Token::False
+            | Token::Between
             | Token::StartsWith => Err(ParseError::syntax(
                 spanned.start,
                 "a reserved word cannot be used as an attribute name",
@@ -419,30 +454,6 @@ fn check_value_type(key: &AnnotKey, value: &AnnotVal, position: usize) -> Result
             value.attr_type().name(),
         ),
     ))
-}
-
-/// The operator × type matrix: only the numeric types are ordered.
-///
-/// This is the reference Arkiv query grammar's rule, kept as is: the parser
-/// is pinned to that grammar (docs/query-language-classification.md) and
-/// also serves the SDK's `arkiv_query`. The engine itself orders every
-/// indexed type; its native range API is not limited by this matrix.
-fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result<(), ParseError> {
-    let ordered = matches!(
-        value.attr_type(),
-        AttributeType::Int | AttributeType::U64 | AttributeType::U256 | AttributeType::Decimal
-    );
-    let is_range = matches!(operator, Token::Lt | Token::Lte | Token::Gt | Token::Gte);
-    if is_range && !ordered {
-        return Err(ParseError::type_error(
-            position,
-            std::format!(
-                "{} values have no ordering — only i32, u64, u256 and dec support < <= > >=",
-                value.attr_type().name(),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// User attribute names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, and never
@@ -678,32 +689,74 @@ mod tests {
     // ── the operator × type matrix ──────────────────────────────────────
 
     #[test]
-    fn ranges_are_allowed_on_the_numeric_types() {
-        for query in [
-            "level > i32(1)",
-            "level >= i32(1)",
-            "level < i32(1)",
-            "level <= i32(1)",
-            "balance > u256(1)",
-            "score >= dec(3.5)",
-        ] {
-            assert!(parse(query).is_ok(), "{query}");
-        }
-    }
-
-    #[test]
-    fn ranges_are_rejected_on_the_unordered_types() {
-        let unordered = [
-            "flagged > true".to_string(),
+    fn ranges_are_allowed_on_every_indexable_type() {
+        let ordered = [
+            "level > i32(1)".to_string(),
+            "level >= i32(1)".to_string(),
+            "level < i32(1)".to_string(),
+            "level <= i32(1)".to_string(),
+            "balance > u256(1)".to_string(),
+            "score >= dec(3.5)".to_string(),
+            "flagged > false".to_string(),
             "name > str('a')".to_string(),
             format!("who > addr({})", addr_hex("ab")),
             format!("parent > key({})", word_hex("ab")),
             format!("hash > bytes32({})", word_hex("ab")),
+            format!("$key >= key({})", word_hex("ab")),
+            format!("$owner < addr({})", addr_hex("ab")),
         ];
-        for query in unordered {
-            let err = parse(&query).unwrap_err();
-            assert_eq!(err.kind, ParseErrorKind::TypeError, "{query}");
-            assert!(err.message.contains("no ordering"), "{query}: {err}");
+        for query in ordered {
+            assert!(parse(&query).is_ok(), "{query}");
+        }
+    }
+
+    #[test]
+    fn between_takes_two_bounds_of_one_type_and_owns_its_and() {
+        assert_eq!(
+            parse("level BETWEEN 1 AND 5").unwrap(),
+            Query::Between {
+                key: user("level"),
+                low: AttributeValue::Int(1),
+                high: AttributeValue::Int(5),
+            }
+        );
+        // Inverted bounds parse: they match nothing.
+        assert!(parse("level between i32(5) and i32(1)").is_ok());
+        for query in [
+            "s BETWEEN str('a') AND str('b')".to_string(),
+            "f BETWEEN false AND true".to_string(),
+            format!(
+                "$key BETWEEN key({}) AND key({})",
+                word_hex("01"),
+                word_hex("ab")
+            ),
+            "$expiresAt BETWEEN u64(1) AND u64(9)".to_string(),
+        ] {
+            assert!(parse(&query).is_ok(), "{query}");
+        }
+        assert!(matches!(
+            parse("a BETWEEN 1 AND 5 AND b = true").unwrap(),
+            Query::And(left, _) if matches!(*left, Query::Between { .. })
+        ));
+        assert!(matches!(
+            parse("NOT a BETWEEN 1 AND 5").unwrap(),
+            Query::Not(inner) if matches!(*inner, Query::Between { .. })
+        ));
+        assert_eq!(
+            kind_of("a BETWEEN i32(1) AND u64(5)"),
+            ParseErrorKind::TypeError
+        );
+        for query in [
+            "a BETWEEN 1",
+            "a BETWEEN 1 OR 5",
+            "a BETWEEN 1 AND",
+            "between = 1",
+        ] {
+            assert_eq!(
+                kind_of(query),
+                ParseErrorKind::MalformedInputError,
+                "{query}"
+            );
         }
     }
 

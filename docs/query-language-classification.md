@@ -15,22 +15,23 @@ and light nodes. Its result separates:
   eligible, subject to runtime limits; it never means verified.
 - `selection`: the exact typed Eq request when eligible, plus shape and notes.
 
-The grammar includes typed literals, `AND`, `OR`, `NOT`, numeric comparisons,
-`STARTSWITH`, parentheses, comments and standalone `*`. Untagged numbers mean
+The grammar includes typed literals, `AND`, `OR`, `NOT`, comparisons,
+inclusive `BETWEEN`, `STARTSWITH`, parentheses, comments and standalone `*`. Untagged numbers mean
 `i32`, not `u64`. Therefore the demo's group query is `group = u64(1)`.
 Boolean keywords are case-insensitive; attribute names are case-sensitive.
 `NOT` is the complement of the entire predicate, including missing attributes
 and different types. No DNF conversion is performed.
 
-Comparisons (`<`, `<=`, `>`, `>=`) are accepted on numeric values only
-(`i32`, `u64`, `u256`, `dec`): that is the reference Arkiv grammar's rule,
-and this parser stays pinned to it, so `name > str('a')` is a type error
-here and in the SDK's `arkiv_query`. The engine underneath orders every
-indexed type (`bool`, `str`, `bytes32`, `addr`, `key` and the rest, in
-golem-db's byte order), and the native range proof API
-(`/signed/v1/query/range/*`, `docs/range-proofs.md`) accepts all of them.
-Widening the text grammar would be an SDK-facing change, made in the
-reference grammar first.
+Comparisons (`<`, `<=`, `>`, `>=`) and `a BETWEEN lo AND hi` (inclusive,
+both bounds of one type; `lo > hi` matches nothing) are accepted on every
+indexable type, as the reference Arkiv grammar now has it and SDK 1.0 sends
+them: numeric order for `i32`, `u64`, `u256` and `dec`, `false < true` for
+`bool`, and unsigned byte order for `str`, `bytes32`, `addr` and `key`. The
+engine orders every indexed type the same way, and the native range proof
+API (`/signed/v1/query/range/*`, `docs/range-proofs.md`) accepts all of
+them. `STARTSWITH` on another type than `str` and `BETWEEN` bounds of two
+types are type errors. `BETWEEN` is a reserved word; the `AND` inside it
+belongs to it.
 
 For this release, only one equality predicate (with optional grouping) executes
 through the text API and fits the existing Eq page proof. Valid range, prefix,

@@ -128,7 +128,11 @@ pub fn classify(input: &str) -> Classification {
             "all",
             "The all-entity selector is valid, but this node exposes no complete all-entity query endpoint or proof.",
         ),
-        Query::Gt { .. } | Query::Gte { .. } | Query::Lt { .. } | Query::Lte { .. } => (
+        Query::Gt { .. }
+        | Query::Gte { .. }
+        | Query::Lt { .. }
+        | Query::Lte { .. }
+        | Query::Between { .. } => (
             "range",
             "Ranges are valid Arkiv queries, but this node exposes execution and proofs only for a single equality.",
         ),
@@ -234,6 +238,8 @@ mod tests {
         for (input, shape) in [
             ("*", "all"),
             ("score >= dec(1.25)", "range"),
+            ("name > str('a')", "range"),
+            ("level BETWEEN 1 AND 5", "range"),
             ("name STARTSWITH str('é')", "prefix"),
             ("a = 1 AND b = 2", "and"),
             ("a = 1 OR b = 2", "or"),
@@ -253,7 +259,8 @@ mod tests {
         for (input, code, position) in [
             ("a =", "MalformedInput", 3),
             ("a = i32(2147483648)", "LiteralError", 8),
-            ("a > str('x')", "TypeError", 4),
+            ("a STARTSWITH i32(1)", "TypeError", 13),
+            ("a BETWEEN i32(1) AND u64(2)", "TypeError", 21),
             ("$updatedAt = u64(1)", "TypeError", 0),
             ("a IN (1)", "MalformedInput", 2),
             ("!a = 1", "MalformedInput", 0),

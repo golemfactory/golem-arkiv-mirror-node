@@ -22,6 +22,18 @@
 //! returned, indexed or not, but a predicate on a user name only ever
 //! matches an indexed one ([`arkiv_db::CellKind::Attribute`]). Refused
 //! queries answer with the SDK's code table ([`QueryErrorKind`]).
+//!
+//! # Offset and count
+//!
+//! A page lists its matches in record-id order, which is creation order: by
+//! block, then transaction, then operation. An `offset` first walks past that
+//! many matches reading ids only, then reads on from the last of them
+//! ([`Snapshot::cursor_after`]); the walk is metered against the read budget
+//! like any other read, so a deep offset is refused as `limits` when it does
+//! not fit. `select.count` adds the match set's size from the planned count
+//! path (the bounded scan for a query beyond the read bounds), charged to the
+//! same budget. Both compose with `atBlock`: pinning page one's block keeps
+//! every offset page on one snapshot.
 use super::{Error, Result, host::Host, reads::ReadLimits};
 use crate::{
     arkiv,
@@ -37,8 +49,8 @@ use crate::{
 };
 use alloy_primitives::{U256, keccak256};
 use arkiv_db::{
-    Budget, CellName, Cursor, Limits, Literal, Projection, Query, QueryLimits, Row, Snapshot, Term,
-    TypeTag, Value,
+    Budget, CellName, Cursor, Limits, Literal, Projection, Query, QueryLimits, QueryPage, Row,
+    Snapshot, Term, TypeTag, Value,
 };
 use serde_json::{Value as Json, json};
 use std::{
@@ -58,6 +70,8 @@ const LITERAL_CAP: usize = 256;
 const QUERY_BYTES: usize = 8192;
 const MAX_DEPTH: usize = 32;
 const MAX_PREDICATES: usize = 64;
+/// The most rows the scan fallback examines for one request.
+const SCAN_ROWS: usize = 4096;
 /// The `select` keys, in response order. Matches the SDK's `RpcSelect`.
 const FIELDS: &[&str] = &[
     "key",
@@ -77,8 +91,8 @@ const FIELDS: &[&str] = &[
 pub enum QueryErrorKind {
     /// The query string does not parse (`-32001`).
     Parse,
-    /// A well-formed predicate is ill-typed: a range operator on an
-    /// equality-only type, an unknown tag (`-32002`).
+    /// A well-formed predicate is ill-typed: `STARTSWITH` on a type other
+    /// than `str`, `BETWEEN` bounds of two types, an unknown tag (`-32002`).
     Type,
     /// A literal failed validation: an `i32` out of range, a bad EIP-55
     /// checksum, more than 18 decimal places (`-32003`).
@@ -242,8 +256,10 @@ pub struct PageRead {
     limits: Limits,
     bounds: QueryLimits,
     limit: usize,
+    /// Matches to skip before the page; zero on a cursor page.
+    offset: u64,
     cursor: Option<Cursor>,
-    selected: Json,
+    selection: Selection,
     binding: [u8; 32],
     height: u64,
 }
@@ -285,19 +301,8 @@ impl Planned {
                 query,
                 bounds,
             } => {
-                let n = match snapshot
-                    .try_count(
-                        arkiv::entity_namespace(),
-                        &query,
-                        read_budget(READ_BUDGET, bounds),
-                    )
-                    .map_err(Error::from)?
-                {
-                    Ok(count) => count.value,
-                    // Before the entity namespace exists there are no entities.
-                    Err(r) if r.reason == arkiv_db::Rejection::UnknownNamespace => 0,
-                    Err(r) => return Err(read_error(r)),
-                };
+                let mut budget = READ_BUDGET;
+                let n = count_matches(&snapshot, &query, bounds, &mut budget)?;
                 if n > 9_007_199_254_740_991 {
                     return Err(limits("the count exceeds the JSON safe-integer range").into());
                 }
@@ -321,6 +326,71 @@ fn read_budget(units: u64, bounds: QueryLimits) -> Budget {
         .interruptible()
         .planned()
         .with_query_limits(bounds)
+}
+fn exhausted() -> ReadError {
+    limits("the read budget is exhausted").into()
+}
+/// Charges a read's spent units to the request's `budget`.
+fn charge(budget: &mut u64, receipt: &arkiv_db::Receipt) -> Read<()> {
+    *budget = budget
+        .checked_sub(receipt.spent.units())
+        .ok_or_else(exhausted)?;
+    Ok(())
+}
+/// How many live entities match `query`, by the planned count (posting
+/// sizes where they decide it), charged to `budget`.
+fn count_matches(
+    snapshot: &Snapshot,
+    query: &Query,
+    bounds: QueryLimits,
+    budget: &mut u64,
+) -> Read<u64> {
+    match snapshot
+        .try_count(
+            arkiv::entity_namespace(),
+            query,
+            read_budget(*budget, bounds),
+        )
+        .map_err(Error::from)?
+    {
+        Ok(count) => {
+            charge(budget, &count.receipt)?;
+            Ok(count.value)
+        }
+        // Before the entity namespace exists there are no entities.
+        Err(r) if r.reason == arkiv_db::Rejection::UnknownNamespace => Ok(0),
+        Err(r) => Err(read_error(r)),
+    }
+}
+/// One native page of entities, charged to `budget`, or `None` before the
+/// entity namespace exists.
+fn native_page(
+    snapshot: &Snapshot,
+    query: &Query,
+    projection: &Projection,
+    limit: usize,
+    cursor: Option<&Cursor>,
+    bounds: QueryLimits,
+    budget: &mut u64,
+) -> Read<Option<QueryPage>> {
+    match snapshot
+        .try_query(
+            arkiv::entity_namespace(),
+            query,
+            projection,
+            limit,
+            cursor,
+            read_budget(*budget, bounds),
+        )
+        .map_err(Error::from)?
+    {
+        Ok(metered) => {
+            charge(budget, &metered.receipt)?;
+            Ok(Some(metered.value))
+        }
+        Err(r) if r.reason == arkiv_db::Rejection::UnknownNamespace => Ok(None),
+        Err(r) => Err(read_error(r)),
+    }
 }
 fn plan_count(host: &Host, params: &Json, bounds: QueryLimits) -> Read<Planned> {
     let empty = json!({});
@@ -399,13 +469,33 @@ fn rejection(reason: &arkiv_db::Rejection) -> ReadError {
         _ => Error("ReadRejected").into(),
     }
 }
-/// The `select` object: every key one of [`FIELDS`] with a boolean, except
-/// `attributes`, which may also map attribute names to booleans. Anything
-/// else, including the removed `payload` and `contentType`, is refused.
-fn selection(value: Option<&Json>) -> Result<Json> {
+/// A validated `select`.
+#[derive(Clone, Debug, PartialEq)]
+struct Selection {
+    /// The object as resolved: the request's keys, plus `key: true` unless
+    /// it says otherwise or selects nothing but `count`. It binds cursors.
+    fields: Json,
+    /// `count: true`: the size of the match set rides on every page.
+    count: bool,
+    /// Whether the request reads a page. `count` with no entity field
+    /// selected reads none: `data` is empty and there is no cursor.
+    rows: bool,
+}
+/// The `select` object: every key one of [`FIELDS`] or `count` with a
+/// boolean, except `attributes`, which may also map attribute names to
+/// booleans. Anything else, including the removed `payload` and
+/// `contentType`, is refused. `key` defaults to selected unless `count` is
+/// the only field selected.
+fn selection(value: Option<&Json>) -> Result<Selection> {
     let selected = value.cloned().unwrap_or_else(|| json!({}));
     let object = selected.as_object().ok_or(Error("InvalidParams"))?;
     for (name, v) in object {
+        if name == "count" {
+            if !v.is_boolean() {
+                return Err(Error("InvalidParams"));
+            }
+            continue;
+        }
         if !FIELDS.contains(&name.as_str()) {
             return Err(Error("InvalidParams"));
         }
@@ -423,13 +513,26 @@ fn selection(value: Option<&Json>) -> Result<Json> {
             return Err(Error("InvalidParams"));
         }
     }
-    let mut selected = selected;
-    selected
-        .as_object_mut()
-        .unwrap()
-        .entry("key")
-        .or_insert(Json::Bool(true));
-    Ok(selected)
+    let count = object.get("count") == Some(&Json::Bool(true));
+    let any_field = FIELDS.iter().any(|field| {
+        object
+            .get(*field)
+            .is_some_and(|v| v == true || v.is_object())
+    });
+    let count_only = count && !any_field;
+    let mut fields = selected;
+    if !count_only {
+        fields
+            .as_object_mut()
+            .unwrap()
+            .entry("key")
+            .or_insert(Json::Bool(true));
+    }
+    Ok(Selection {
+        fields,
+        count,
+        rows: !count_only,
+    })
 }
 /// `arkiv_getEntity`: `[key]` at the head, or `[key, block]` as of a retained
 /// block (a hex quantity or a number). The SDK's single-entity read: every
@@ -466,6 +569,10 @@ fn plan_entity(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead
         bounds,
     )
 }
+/// `arkiv_query`: `[query, options?]`. Options: `atBlock`, `select`, `limit`,
+/// `offset` and `cursor`. A cursor carries its own position, so it continues
+/// past the offset of the first page and an `offset` beside it is ignored; it
+/// needs the explicit `atBlock` of the page that issued it.
 fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead> {
     let args = params
         .as_array()
@@ -481,7 +588,7 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
         .ok_or(Error("InvalidParams"))?;
     if options
         .keys()
-        .any(|k| !["atBlock", "select", "limit", "cursor"].contains(&k.as_str()))
+        .any(|k| !["atBlock", "select", "limit", "offset", "cursor"].contains(&k.as_str()))
     {
         return Err(Error("InvalidParams").into());
     }
@@ -495,7 +602,7 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
     }
     // Checked on every page: a cursor is not a lease on its snapshot.
     host.require_state(height)?;
-    let selected = selection(options.get("select"))?;
+    let selection = selection(options.get("select"))?;
     let limit = options
         .get("limit")
         .map(quantity)
@@ -504,13 +611,18 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
     if !(1..=200).contains(&limit) {
         return Err(Error("InvalidParams").into());
     }
+    let offset = options
+        .get("offset")
+        .map(quantity)
+        .transpose()?
+        .unwrap_or(0);
     let binding: [u8; 32] = keccak256(
         serde_json::to_vec(&json!([
             host.identity.genesis_hash,
             host.identity.run_id,
             height,
             source,
-            selected
+            selection.fields
         ]))
         .map_err(|_| Error("InvalidParams"))?,
     )
@@ -542,45 +654,74 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
         limits: host.genesis.genesis.limits,
         bounds,
         limit: limit as usize,
+        offset: if cursor.is_some() { 0 } else { offset },
         cursor,
-        selected,
+        selection,
         binding,
         height,
     })
 }
 impl PageRead {
     fn run(self) -> Read<Json> {
+        self.run_within(READ_BUDGET)
+    }
+    /// The page, every read of the request (count, offset or sort walk,
+    /// rows) charged to one `budget`.
+    fn run_within(self, mut budget: u64) -> Read<Json> {
         let Self {
             snapshot,
             query,
             limits,
             bounds,
             limit,
+            offset,
             cursor,
-            selected,
+            selection,
             binding,
             height,
         } = self;
-        let mut page = read_page(&snapshot, &query, &limits, bounds, limit, cursor.clone())?;
-        let mut data = page
-            .rows
+        let count = if !selection.count {
+            None
+        } else if scans(&query, bounds) {
+            // Beyond the bounds the count scans, as its page does.
+            Some(scan_count(&snapshot, &query, &limits, bounds, &mut budget)?)
+        } else {
+            Some(count_matches(&snapshot, &query, bounds, &mut budget)?)
+        };
+        if !selection.rows {
+            return page_result(Vec::new(), None, binding, height, count);
+        }
+        let window = Window {
+            snapshot: &snapshot,
+            query: &query,
+            limits: &limits,
+            bounds,
+            limit,
+            offset,
+        };
+        // `next`: where the page after this one starts, present only when
+        // a further match exists.
+        let QueryPage { rows, mut next } = read_page(&window, cursor, &mut budget)?;
+        let mut data = rows
             .iter()
-            .map(|row| project(row, &selected))
+            .map(|row| project(row, &selection.fields))
             .collect::<Result<Vec<_>>>()?;
         let fit = rows_within(&data, PAGE_BYTES)?;
         if fit < data.len() {
             if fit == 0 {
                 return Err(self::limits("one entity alone exceeds the 8 MiB response cap").into());
             }
-            // A shorter page: re-read the same pinned snapshot with the
-            // shorter limit, so its cursor follows the last row returned.
-            page = read_page(&snapshot, &query, &limits, bounds, fit, cursor)?;
-            if page.rows.len() != fit {
-                return Err(Error("StorageCorrupt").into());
-            }
+            // A shorter page, whose cut rows are still to come: the next
+            // page starts after its last row.
             data.truncate(fit);
+            next = Some(snapshot.cursor_after(
+                arkiv::entity_namespace(),
+                &native_query(&query, bounds),
+                &Projection::ALL,
+                rows[fit - 1].id,
+            ));
         }
-        page_result(data, page.next, binding, height)
+        page_result(data, next, binding, height, count)
     }
 }
 /// How many of `rows`, in order, fit in `budget` bytes of a JSON array.
@@ -600,8 +741,12 @@ fn page_result(
     next: Option<Cursor>,
     binding: [u8; 32],
     height: u64,
+    count: Option<u64>,
 ) -> Read<Json> {
     let mut result = json!({"data":data,"blockNumber":format!("0x{height:x}")});
+    if let Some(count) = count {
+        result["count"] = json!(format!("0x{count:x}"));
+    }
     if serde_json::to_vec(&result)
         .map_err(|_| Error("ResourceLimit"))?
         .len()
@@ -633,27 +778,86 @@ fn page_result(
     }
     Ok(result)
 }
-/// Combine native pages within the read's group and literal `bounds` (the
-/// chain's committed limits unless the node raised them). Larger Boolean
-/// trees use a bounded scan fallback; other queries take the engine's
-/// indexed path. The budget is shared by all reads in this RPC.
-fn read_page(
-    snapshot: &arkiv_db::Snapshot,
-    query: &Query,
-    limits: &arkiv_db::Limits,
+/// The page a request asks for, before its starting position.
+struct Window<'a> {
+    snapshot: &'a Snapshot,
+    query: &'a Query,
+    limits: &'a Limits,
     bounds: QueryLimits,
     limit: usize,
-    mut cursor: Option<Cursor>,
-) -> Read<arkiv_db::QueryPage> {
-    let exhausted = || ReadError::from(self::limits("the read budget is exhausted"));
-    let scan = query.groups.len() > bounds.max_groups
-        || query.groups.iter().any(|g| g.len() > bounds.max_literals);
-    let all = Query::match_all();
-    let native = if scan { &all } else { query };
+    /// Matches to skip first.
+    offset: u64,
+}
+/// Whether `query` exceeds the read's group or literal `bounds`, so that it
+/// takes the bounded scan fallback instead of the index.
+fn scans(query: &Query, bounds: QueryLimits) -> bool {
+    query.groups.len() > bounds.max_groups
+        || query.groups.iter().any(|g| g.len() > bounds.max_literals)
+}
+/// The query the engine evaluates for `query`: itself, or every entity for
+/// the scan fallback, which filters the rows itself.
+fn native_query(query: &Query, bounds: QueryLimits) -> Query {
+    if scans(query, bounds) {
+        Query::match_all()
+    } else {
+        query.clone()
+    }
+}
+/// A record-id page: combine native pages within the read's group and
+/// literal `bounds` (the chain's committed limits unless the node raised
+/// them). Larger Boolean trees use a bounded scan fallback of at most
+/// [`SCAN_ROWS`] rows; other queries take the engine's indexed path. Without
+/// a cursor, the first `offset` matches are skipped: by id alone on the
+/// indexed path, then the page reads on after the last of them. An offset at
+/// or past the end gives an empty page without a continuation.
+fn read_page(window: &Window<'_>, mut cursor: Option<Cursor>, budget: &mut u64) -> Read<QueryPage> {
+    let &Window {
+        snapshot,
+        query,
+        limits,
+        bounds,
+        limit,
+        offset,
+    } = window;
+    let scan = scans(query, bounds);
+    let native = native_query(query, bounds);
+    let end = |rows| Ok(QueryPage { rows, next: None });
+    let mut skip = offset;
+    if !scan {
+        while skip > 0 {
+            let size = usize::try_from(skip)
+                .unwrap_or(usize::MAX)
+                .min(limits.max_page);
+            let Some(page) = native_page(
+                snapshot,
+                &native,
+                &Projection::ID_ONLY,
+                size,
+                cursor.as_ref(),
+                bounds,
+                budget,
+            )?
+            else {
+                return end(Vec::new());
+            };
+            skip -= page.rows.len() as u64;
+            cursor = match page.next {
+                // Read on after the last skipped match with the page's
+                // projection: a cursor is a position, not a count.
+                Some(next) if skip == 0 => Some(snapshot.cursor_after(
+                    arkiv::entity_namespace(),
+                    &native,
+                    &Projection::ALL,
+                    next.after(),
+                )),
+                Some(next) => Some(next),
+                None => return end(Vec::new()),
+            };
+        }
+    }
     let mut rows = Vec::new();
-    let mut remaining = READ_BUDGET;
     let mut resume = None;
-    for _ in 0..4096 {
+    for _ in 0..SCAN_ROWS {
         let page_size = if scan {
             1
         } else {
@@ -662,32 +866,27 @@ fn read_page(
         if page_size == 0 {
             return Err(exhausted());
         }
-        let metered = match snapshot
-            .try_query(
-                arkiv::entity_namespace(),
-                native,
-                &Projection::ALL,
-                page_size,
-                cursor.as_ref(),
-                read_budget(remaining, bounds),
-            )
-            .map_err(Error::from)?
-        {
-            Ok(metered) => metered,
+        let Some(page) = native_page(
+            snapshot,
+            &native,
+            &Projection::ALL,
+            page_size,
+            cursor.as_ref(),
+            bounds,
+            budget,
+        )?
+        else {
             // Before the entity namespace exists there are no entities.
-            Err(r) if r.reason == arkiv_db::Rejection::UnknownNamespace => {
-                return Ok(arkiv_db::QueryPage { rows, next: None });
-            }
-            Err(r) => return Err(read_error(r)),
+            return end(rows);
         };
-        remaining = remaining
-            .checked_sub(metered.receipt.spent.units())
-            .ok_or_else(exhausted)?;
-        let page = metered.value;
         for row in page.rows {
             if !scan || matches_query(query, &row) {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
                 if rows.len() == limit {
-                    return Ok(arkiv_db::QueryPage { rows, next: resume });
+                    return Ok(QueryPage { rows, next: resume });
                 }
                 rows.push(row);
                 resume = page.next.clone();
@@ -695,10 +894,66 @@ fn read_page(
         }
         cursor = page.next;
         if cursor.is_none() || (!scan && rows.len() == limit) {
-            return Ok(arkiv_db::QueryPage { rows, next: cursor });
+            return Ok(QueryPage { rows, next: cursor });
         }
     }
     Err(exhausted())
+}
+/// What the scan fallback reads of each row to evaluate `query`: the cells
+/// its literals name, or every cell when they are more than a projection
+/// may name.
+fn scan_projection(query: &Query, limits: &Limits) -> Projection {
+    let names: std::collections::BTreeSet<CellName> = query
+        .groups
+        .iter()
+        .flatten()
+        .map(|literal| literal.term.name().clone())
+        .collect();
+    if names.len() > limits.max_cells {
+        Projection::ALL
+    } else {
+        Projection::named(false, names)
+    }
+}
+/// `select.count` for a query beyond the read bounds: the matches among at
+/// most [`SCAN_ROWS`] rows, reading only the cells the query names.
+fn scan_count(
+    snapshot: &Snapshot,
+    query: &Query,
+    limits: &Limits,
+    bounds: QueryLimits,
+    budget: &mut u64,
+) -> Read<u64> {
+    let all = Query::match_all();
+    let projection = scan_projection(query, limits);
+    let (mut count, mut scanned, mut cursor) = (0u64, 0usize, None);
+    loop {
+        let Some(page) = native_page(
+            snapshot,
+            &all,
+            &projection,
+            limits.max_page,
+            cursor.as_ref(),
+            bounds,
+            budget,
+        )?
+        else {
+            return Ok(0);
+        };
+        scanned += page.rows.len();
+        if scanned > SCAN_ROWS {
+            return Err(exhausted());
+        }
+        count += page
+            .rows
+            .iter()
+            .filter(|row| matches_query(query, row))
+            .count() as u64;
+        cursor = page.next;
+        if cursor.is_none() {
+            return Ok(count);
+        }
+    }
 }
 /// The scan fallback's evaluation of `query` on one row. Like the index, it
 /// only sees indexed cells: an unindexed field never matches a predicate.
@@ -914,6 +1169,29 @@ fn native_value(key: &AnnotKey, value: &AttributeValue) -> Option<Value> {
 }
 /// One predicate's term; `source` and `start` locate it for errors.
 fn leaf(ast: Ast, neq: bool, source: &str, start: usize) -> std::result::Result<Query, QueryError> {
+    if let Ast::Between { key, low, high } = ast {
+        let n = name(&key).ok_or_else(|| {
+            QueryError::at(QueryErrorKind::Parse, source, start, "an attribute name")
+        })?;
+        let bound = |value| {
+            native_value(&key, &value).ok_or_else(|| {
+                QueryError::at(
+                    QueryErrorKind::Literal,
+                    source,
+                    start,
+                    "a block height that fits in u64",
+                )
+            })
+        };
+        let (low, high) = (bound(low)?, bound(high)?);
+        // Inclusive at both ends; a low bound above the high one matches
+        // nothing, which the engine's empty run already gives.
+        return Ok(Query::term(Term::range(
+            n,
+            Bound::Included(low),
+            Bound::Included(high),
+        )));
+    }
     let (key, value, op) = match ast {
         Ast::Eq { key, value } => (key, value, 0),
         Ast::Gt { key, value } => (key, value, 1),
@@ -993,14 +1271,12 @@ fn source_error(error: ParseError, source: &str, offset: usize) -> QueryError {
         None => QueryError::new(kind, error.message),
     }
 }
+/// Parses an `arkiv_query` string: `*`, or a Boolean expression.
 fn parse_query(source: &str) -> std::result::Result<Query, QueryError> {
     if source.len() > QUERY_BYTES {
         return Err(limits("the query is longer than 8192 bytes"));
     }
     let tokens = lexer::tokenize(source).map_err(|e| source_error(e, source, 0))?;
-    if tokens.len() == 1 && tokens[0].token == Token::Star {
-        return Ok(Query::match_all());
-    }
     let mut p = Parser {
         source,
         tokens,
@@ -1008,11 +1284,17 @@ fn parse_query(source: &str) -> std::result::Result<Query, QueryError> {
         depth: 0,
         predicates: 0,
     };
-    let q = p.or()?;
+    // `*` is the whole query.
+    let all = p.take(Token::Star);
+    let query = if all { Query::match_all() } else { p.or()? };
     if p.at != p.tokens.len() {
-        return Err(p.parse_error("AND, OR or the end of the query"));
+        return Err(p.parse_error(if all {
+            "the end of the query: * stands alone"
+        } else {
+            "AND, OR or the end of the query"
+        }));
     }
-    Ok(q)
+    Ok(query)
 }
 impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
@@ -1145,8 +1427,20 @@ impl Parser<'_> {
                 )
             })?;
             let neq = op.token == Token::Neq;
+            let between = op.token == Token::Between;
             let op_start = op.start;
-            self.at += 3;
+            // `name BETWEEN low AND high` is five tokens, its AND its own.
+            if between && self.tokens.get(self.at + 3).map(|t| &t.token) != Some(&Token::And) {
+                return Err(QueryError::at(
+                    QueryErrorKind::Parse,
+                    self.source,
+                    self.tokens
+                        .get(self.at + 3)
+                        .map_or(self.source.len(), |t| t.start),
+                    "AND: BETWEEN joins its two bounds with AND",
+                ));
+            }
+            self.at += if between { 5 } else { 3 };
             if self.at > self.tokens.len() {
                 return Err(QueryError::at(
                     QueryErrorKind::Parse,
@@ -1211,7 +1505,6 @@ mod tests {
             parse_query("NOT EXISTS(name)").unwrap().groups[0].len(),
             TAGS.len()
         );
-        assert!(parse_query("s > str('x')").is_err());
         assert!(parse_query("TYPEOF(n) = bytes").is_err());
         assert!(parse_query(&format!("{}a = true", "NOT ".repeat(40))).is_err());
         let explosive = std::iter::repeat_n("(a = true OR b = true)", 8)
@@ -1234,7 +1527,7 @@ mod tests {
             json!("-1.25")
         );
         assert!(selection(Some(&json!({"payload":1}))).is_err());
-        assert_eq!(selection(None).unwrap(), json!({"key":true}));
+        assert_eq!(selection(None).unwrap().fields, json!({"key":true}));
         // The removed payload model is not selectable at all.
         for removed in ["payload", "contentType"] {
             for choice in [true, false] {
@@ -1653,7 +1946,9 @@ mod tests {
             ("(n = u64(1)", QueryErrorKind::Parse),
             ("n = u64(1) n = u64(2)", QueryErrorKind::Parse),
             ("EXISTS(and)", QueryErrorKind::Parse),
-            ("n > str('x')", QueryErrorKind::Type),
+            ("n STARTSWITH u64(1)", QueryErrorKind::Type),
+            ("n BETWEEN u64(1) AND i32(2)", QueryErrorKind::Type),
+            ("n BETWEEN u64(1) OR u64(2)", QueryErrorKind::Parse),
             ("TYPEOF(n) = bytes", QueryErrorKind::Type),
             ("TYPEOF(n) = nope", QueryErrorKind::Type),
             ("EXISTS($owner)", QueryErrorKind::Type),
@@ -1904,6 +2199,429 @@ mod tests {
         assert_eq!(rows_within(&[json!("x".repeat(64))], 16).unwrap(), 0);
         assert_eq!(rows_within(&[json!(1), json!(2)], 5).unwrap(), 2);
         assert_eq!(rows_within(&[json!(1), json!(2)], 4).unwrap(), 1);
+    }
+    /// Submits one signed transaction of `ops` from the fixture's signer.
+    fn submit(host: &mut Host, nonce: &mut u64, ops: Vec<arkiv::ArkivOperation>) {
+        use crate::{
+            TxEnvelope, TxOp,
+            signed::{crypto::Signer, protocol::SignedTx},
+        };
+        let signer = Signer::from_bytes([1; 32]).unwrap();
+        let mut request_id = [0x66; 32];
+        request_id[24..].copy_from_slice(&nonce.to_be_bytes());
+        let tx = TxEnvelope {
+            chain_id: host.genesis.genesis.chain_id,
+            actor: signer.address(),
+            request_id,
+            tx_budget: 2_000_000,
+            ops: ops
+                .into_iter()
+                .map(|operation| TxOp::Arkiv {
+                    namespace: arkiv::entity_namespace(),
+                    operation,
+                })
+                .collect(),
+        };
+        host.submit(SignedTx::sign(&host.genesis, *nonce, tx, &signer).unwrap())
+            .unwrap();
+        *nonce += 1;
+        // The pool holds a few pending transactions per account.
+        if nonce.is_multiple_of(4) {
+            host.produce().unwrap();
+        }
+    }
+    fn create(salt: u128, attributes: Vec<(&str, arkiv_db::Cell)>) -> arkiv::ArkivOperation {
+        arkiv::ArkivOperation::Create {
+            salt,
+            flags: 0,
+            expiry: crate::Expiry {
+                expires_at: 0,
+                min_lifetime: 100,
+            },
+            attributes: attributes
+                .into_iter()
+                .map(|(n, c)| (CellName::new(n).unwrap(), c))
+                .collect(),
+        }
+    }
+    fn delete(key: &Json) -> arkiv::ArkivOperation {
+        let bytes = crate::simulator::wire::unhex(key.as_str().unwrap(), 32).unwrap();
+        arkiv::ArkivOperation::Delete {
+            key: arkiv_db::RecordKey::new(&bytes).unwrap(),
+        }
+    }
+    /// The keys of a page.
+    fn keys(page: &Json) -> Vec<Json> {
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].clone())
+            .collect()
+    }
+    /// Every page of `source` with `options`, following cursors at the
+    /// first page's block: the keys and the pages.
+    fn walk(host: &Host, source: &str, options: Json) -> (Vec<Json>, Vec<Json>) {
+        let first = query(host, &json!([source, options])).unwrap();
+        let mut all = keys(&first);
+        let mut pages = vec![first.clone()];
+        let mut cursor = first.get("cursor").cloned();
+        while let Some(token) = cursor {
+            let mut more = options.clone();
+            more["cursor"] = token;
+            more["atBlock"] = first["blockNumber"].clone();
+            let page = query(host, &json!([source, more])).unwrap();
+            all.extend(keys(&page));
+            cursor = page.get("cursor").cloned();
+            pages.push(page);
+        }
+        (all, pages)
+    }
+    #[test]
+    fn offset_skips_matches_in_creation_order() {
+        let host = fixture();
+        let every = keys(&query(&host, &json!(["*", {"limit": 10}])).unwrap());
+        assert_eq!(every.len(), 4);
+        // The fixture's page size is two, so offsets of three or more skip
+        // over more than one engine page.
+        for offset in 0..6u64 {
+            for limit in 1..4usize {
+                for spelling in [json!(offset), json!(format!("0x{offset:x}"))] {
+                    let page =
+                        query(&host, &json!(["*", {"limit": limit, "offset": spelling}])).unwrap();
+                    let from = (offset as usize).min(4);
+                    let to = (from + limit).min(4);
+                    assert_eq!(keys(&page), every[from..to], "{offset} {limit}");
+                    // A cursor exactly when matches remain after the page.
+                    assert_eq!(page.get("cursor").is_some(), to < 4, "{offset} {limit}");
+                }
+            }
+        }
+        // An offset at or past the end: an empty page without a cursor.
+        assert_eq!(
+            query(&host, &json!(["*", {"offset": "0x4"}])).unwrap(),
+            json!({"data":[],"blockNumber":"0x0"})
+        );
+        assert_eq!(
+            query(&host, &json!(["*", {"offset": u64::MAX}])).unwrap()["data"],
+            json!([])
+        );
+        // A filtered query skips its own matches: rows 0, 1 and 2.
+        let page = query(&host, &json!(["EXISTS(n)", {"offset": 2}])).unwrap();
+        assert_eq!(keys(&page), every[2..3]);
+        // The cursor of an offset page continues past it; an offset beside
+        // a cursor is ignored, since the cursor carries the position.
+        let first = query(&host, &json!(["*", {"limit": 1, "offset": 1}])).unwrap();
+        let next = |extra: Json| {
+            let mut options = json!({"limit": 2, "atBlock": "0x0", "cursor": first["cursor"]});
+            if let Some(offset) = extra.get("offset") {
+                options["offset"] = offset.clone();
+            }
+            query(&host, &json!(["*", options])).unwrap()
+        };
+        assert_eq!(keys(&next(json!({}))), every[2..4]);
+        assert_eq!(next(json!({"offset": 3})), next(json!({})));
+        assert!(next(json!({})).get("cursor").is_none());
+        // The scan fallback (nine literals) skips its own matches too.
+        let nine = |last: &str| {
+            std::iter::repeat_n("$createdAt = u64(0)", 8)
+                .chain([last])
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let scanned = nine("EXISTS(n)");
+        assert_eq!(
+            keys(&query(&host, &json!([scanned, {"offset": 1, "limit": 1}])).unwrap()),
+            every[1..2]
+        );
+        let (walked, _) = walk(&host, &scanned, json!({"offset": 1, "limit": 1}));
+        assert_eq!(walked, every[1..3]);
+        // Malformed offsets are invalid params.
+        for offset in [
+            json!(-1),
+            json!(0.5),
+            json!("0x"),
+            json!("1"),
+            json!("0x01"),
+            json!(null),
+        ] {
+            assert!(
+                matches!(
+                    query(&host, &json!(["*", {"offset": offset}])),
+                    Err(ReadError::Node(Error("InvalidParams")))
+                ),
+                "{offset}"
+            );
+        }
+    }
+    #[test]
+    fn select_count_is_the_match_set_on_every_page() {
+        let host = fixture();
+        let sdk = |count: bool| {
+            let mut select = sdk_select(json!(true));
+            select["count"] = json!(count);
+            select
+        };
+        // Beside entity fields: the page, and the count of every match.
+        let page = query(
+            &host,
+            &json!(["EXISTS(n)", {"select": sdk(true), "limit": 1}]),
+        )
+        .unwrap();
+        assert_eq!(page["count"], "0x3");
+        assert_eq!(page["data"].as_array().unwrap().len(), 1);
+        // Repeated, unchanged, on every page; independent of limit and offset.
+        let (_, pages) = walk(&host, "EXISTS(n)", json!({"select": sdk(true), "limit": 1}));
+        assert_eq!(pages.len(), 3);
+        assert!(pages.iter().all(|p| p["count"] == "0x3"));
+        let offset = query(
+            &host,
+            &json!(["EXISTS(n)", {"select": sdk(true), "offset": 9}]),
+        )
+        .unwrap();
+        assert_eq!(offset, json!({"data":[],"blockNumber":"0x0","count":"0x3"}));
+        // Unselected or false: no count at all.
+        for select in [sdk(false), json!({"key": true})] {
+            let page = query(&host, &json!(["*", {"select": select}])).unwrap();
+            assert!(page.get("count").is_none());
+        }
+        // Alone (the SDK's client.count() sends exactly this), or beside
+        // fields all false: the count is the answer, with no rows or cursor.
+        for select in [
+            json!({"count": true}),
+            json!({"key": false, "count": true}),
+            json!({"key":false,"owner":false,"creator":false,"createdAt":false,"updatedAt":false,"expiresAt":false,"creationFlags":false,"attributeSchema":false,"attributes":false,"count":true}),
+        ] {
+            assert_eq!(
+                query(&host, &json!(["*", {"select": select, "limit": 1}])).unwrap(),
+                json!({"data":[],"blockNumber":"0x0","count":"0x4"}),
+            );
+        }
+        assert_eq!(
+            query(&host, &json!(["n = u64(7)", {"select": {"count": true}}])).unwrap()["count"],
+            "0x1"
+        );
+        // `count` must be a boolean; a chain without entities counts zero.
+        assert!(selection(Some(&json!({"count": 1}))).is_err());
+        assert_eq!(
+            query(&bare_fixture(), &json!(["*", {"select": {"count": true}}])).unwrap(),
+            json!({"data":[],"blockNumber":"0x0","count":"0x0"})
+        );
+        // Beyond the read bounds (EXISTS without a type is nine groups) the
+        // count scans, as its page does, where getEntityCount refuses.
+        let nine = std::iter::repeat_n("$createdAt = u64(0)", 9)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert_eq!(
+            query(&host, &json!([nine, {"select": {"count": true}}])).unwrap()["count"],
+            "0x4"
+        );
+        assert_eq!(
+            kind(entity_count(&host, &json!([{"query": nine}]))),
+            QueryErrorKind::Limits
+        );
+        assert_eq!(
+            query(
+                &host,
+                &json!(["NOT EXISTS(n)", {"select": {"count": true}}])
+            )
+            .unwrap()["count"],
+            "0x1"
+        );
+    }
+    #[test]
+    fn between_and_ranges_take_every_indexable_type() {
+        let host = fixture();
+        let every = keys(&query(&host, &json!(["*", {"limit": 10}])).unwrap());
+        let count = |source: &str| {
+            query(&host, &json!([source])).unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count("n BETWEEN u64(7) AND u64(8)"), 2);
+        assert_eq!(count("n BETWEEN u64(8) AND u64(8)"), 1);
+        assert_eq!(count("n between u64(8) and u64(7)"), 0);
+        assert_eq!(count("n BETWEEN u64(7) AND u64(8) AND n = u64(8)"), 1);
+        assert_eq!(count("NOT n BETWEEN u64(7) AND u64(8)"), 2);
+        assert_eq!(count("n BETWEEN str('a') AND str('f')"), 1);
+        assert_eq!(count("n > str('a')"), 1);
+        assert_eq!(count("n < str('a')"), 0);
+        let mut sorted = every.clone();
+        sorted.sort_by_key(|k| k.as_str().unwrap().to_owned());
+        let (low, high) = (sorted[1].as_str().unwrap(), sorted[2].as_str().unwrap());
+        assert_eq!(count(&format!("$key > key({low})")), 2);
+        assert_eq!(
+            count(&format!("$key BETWEEN key({low}) AND key({high})")),
+            2
+        );
+        assert_eq!(
+            entity_count(&host, &json!([{"query": "n BETWEEN u64(7) AND u64(8)"}])).unwrap(),
+            json!(2)
+        );
+        assert_eq!(count("$expiresAt BETWEEN u64(10) AND u64(10)"), 4);
+    }
+    #[test]
+    fn offset_walks_and_counts_are_charged_to_the_read_budget() {
+        let mut host = fixture();
+        let mut nonce = 0;
+        for i in 0..40u64 {
+            submit(
+                &mut host,
+                &mut nonce,
+                vec![create(
+                    1000 + u128::from(i),
+                    vec![("w", arkiv_db::Cell::attribute(Value::U64(i % 7)))],
+                )],
+            );
+        }
+        host.produce().unwrap();
+        let run = |source: &str, options: Json, budget: u64| {
+            plan_query(&host, &json!([source, options]), bounds(&host))
+                .and_then(|page| page.run_within(budget))
+        };
+        // The least budget each read is served under: a walk past 39
+        // matches, or a count beside the page, costs more than a page of one,
+        // and the walk is refused as `limits` under that page's budget.
+        let least = |source: &str, options: Json| {
+            let (mut low, mut high) = (1, READ_BUDGET);
+            assert!(run(source, options.clone(), high).is_ok());
+            while low < high {
+                let mid = low + (high - low) / 2;
+                match run(source, options.clone(), mid) {
+                    Ok(_) => high = mid,
+                    Err(error) => {
+                        assert_eq!(kind(Err(error)), QueryErrorKind::Limits);
+                        low = mid + 1;
+                    }
+                }
+            }
+            low
+        };
+        let typed = "TYPEOF(w) = u64";
+        let page = least(typed, json!({"limit": 1}));
+        let skip = least(typed, json!({"limit": 1, "offset": 39}));
+        let count = least(
+            typed,
+            json!({"limit": 1, "select": {"key": true, "count": true}}),
+        );
+        assert!(skip > page + 39, "{skip} {page}");
+        assert!(count > page, "{count} {page}");
+        assert_eq!(
+            kind(run(typed, json!({"limit": 1, "offset": 39}), page)),
+            QueryErrorKind::Limits
+        );
+        // Under the real budget the offset page agrees with a full walk.
+        let every = keys(&run("TYPEOF(w) = u64", json!({"limit": 40}), READ_BUDGET).unwrap());
+        assert_eq!(
+            keys(
+                &run(
+                    "TYPEOF(w) = u64",
+                    json!({"limit": 1, "offset": 39}),
+                    READ_BUDGET
+                )
+                .unwrap()
+            ),
+            every[39..]
+        );
+    }
+    #[test]
+    fn offset_pages_at_a_pinned_block_stay_stable_while_the_head_changes() {
+        let mut host = fixture();
+        let mut nonce = 0;
+        for i in 0..12u64 {
+            submit(
+                &mut host,
+                &mut nonce,
+                vec![create(
+                    2000 + u128::from(i),
+                    vec![("p", arkiv_db::Cell::attribute(Value::U64(i % 3)))],
+                )],
+            );
+        }
+        host.produce().unwrap();
+        let pinned = format!("0x{:x}", host.head.height);
+        let select = |count: bool| json!({"key": true, "attributes": true, "count": count});
+        // Each page, its fresh cursor token reduced to whether it has one.
+        let pages = |host: &Host, source: &str, at: Option<&str>| {
+            (0..5u64)
+                .map(|page| {
+                    let mut options =
+                        json!({"limit": 3, "offset": page * 3, "select": select(true)});
+                    if let Some(at) = at {
+                        options["atBlock"] = json!(at);
+                    }
+                    let mut page = query(host, &json!([source, options])).unwrap();
+                    if let Some(cursor) = page.get_mut("cursor") {
+                        *cursor = json!(true);
+                    }
+                    page
+                })
+                .collect::<Vec<_>>()
+        };
+        // The indexed path, and the scan fallback (EXISTS without a type is
+        // nine groups).
+        let sources = ["TYPEOF(p) = u64", "EXISTS(p)"];
+        let before: Vec<_> = sources
+            .iter()
+            .map(|source| pages(&host, source, Some(&pinned)))
+            .collect();
+        for (source, pages) in sources.iter().zip(&before) {
+            let seen: Vec<_> = pages.iter().flat_map(keys).collect();
+            let distinct: std::collections::BTreeSet<_> =
+                seen.iter().map(Json::to_string).collect();
+            assert_eq!((seen.len(), distinct.len()), (12, 12), "{source}");
+            assert!(pages.iter().all(|p| p["count"] == "0xc"));
+            assert!(pages.iter().all(|p| p["blockNumber"] == pinned.as_str()));
+        }
+        // Between the pages the head moves on: an entity is created and one
+        // from the first page is deleted.
+        let doomed = keys(&before[0][0])[0].clone();
+        submit(
+            &mut host,
+            &mut nonce,
+            vec![
+                create(3000, vec![("p", arkiv_db::Cell::attribute(Value::U64(9)))]),
+                delete(&doomed),
+            ],
+        );
+        host.produce().unwrap();
+        host.produce().unwrap();
+        // Pinned to page one's block, every offset page is unchanged.
+        for (source, before) in sources.iter().zip(&before) {
+            assert_eq!(&pages(&host, source, Some(&pinned)), before, "{source}");
+        }
+        // At the head the same offsets have shifted: rows repeat or are
+        // missed across pages read before and after a write.
+        for (source, before) in sources.iter().zip(&before) {
+            let head = pages(&host, source, None);
+            assert_eq!(head[0]["count"], "0xc");
+            assert_ne!(
+                head.iter().flat_map(keys).collect::<Vec<_>>(),
+                before.iter().flat_map(keys).collect::<Vec<_>>(),
+                "{source}"
+            );
+        }
+        // An offset page at the pinned block continues by cursor, from the
+        // same snapshot, past later writes.
+        for source in sources {
+            let first = query(
+                &host,
+                &json!([source, {"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)}]),
+            )
+            .unwrap();
+            let (rest, _) = walk(
+                &host,
+                source,
+                json!({"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)}),
+            );
+            assert_eq!(keys(&first), rest[..4]);
+            let reference: Vec<_> = before[sources.iter().position(|s| *s == source).unwrap()]
+                .iter()
+                .flat_map(keys)
+                .collect();
+            assert_eq!(rest, reference[4..], "{source}");
+        }
     }
     #[test]
     fn timing_uses_numeric_height_and_observed_whole_seconds() {

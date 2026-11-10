@@ -92,17 +92,30 @@ distinct values are answered from stored posting sizes. Results, cursors and
 counts are exactly those of the clause-order evaluation. Queries are admitted
 with the genesis group and literal bounds (8 and 8) unless the node runs with
 `--read-max-groups N` (1–64) or `--read-max-literals N` (1–256); a larger
-query still takes the bounded scan fallback (`arkiv_query`) or is refused
-(`arkiv_getEntityCount`, code `-32004`, kind `limits`). These bounds are
-node-local: block execution never evaluates an SDK query.
+query still takes the bounded scan fallback (`arkiv_query`, its
+`select.count` included) or is refused (`arkiv_getEntityCount`, code
+`-32004`, kind `limits`). These bounds are node-local: block execution never
+evaluates an SDK query.
+
+`arkiv_query` pages in record-id order, which is creation order (by block,
+transaction and operation), and takes the SDK 1.0 paging options: `offset`
+(hex or number) skips that many matches before the page, and `select.count`
+adds `count`, the hex size of the whole match set at the block, independent
+of `limit`, `offset` and the cursor and repeated on every page; selected
+alone, it is the whole answer (`data: []`, no cursor). An offset walks the
+skipped matches by id and is charged to the request's 25-million-unit read
+budget with its count and rows, so a deep offset is refused as `limits` when
+the walk does not fit; an offset at or past the end is an empty page without a
+cursor. `offset` and `select.count` compose with `atBlock`: pinning page
+one's `blockNumber` keeps every offset page on that snapshot. A `cursor`
+carries its own position, so an `offset` beside one is ignored.
 
 Before the entity namespace exists (a chain without a prefill, at height 0,
 before the proposer's bootstrap in block 1) `arkiv_query` answers an empty
 page and `arkiv_getEntityCount` answers `0`. A page whose entities would
 exceed the 8 MiB response cap is shortened instead: it returns the entities
 that fit, in order, with a cursor that continues right after the last one
-returned (the node re-reads the same pinned snapshot with the shorter limit,
-so paging is unchanged).
+returned, on the same pinned snapshot, so paging is unchanged.
 
 ## Entities: user-defined columns
 
@@ -222,9 +235,9 @@ table (`src/query/errors.ts`), with a message naming the kind:
 | Code | Kind | Meaning |
 | --- | --- | --- |
 | `-32001` | `parse` | The query does not parse. `data` is `{position, expected, got}`: the UTF-8 byte offset, what the parser expected, and the source text there (`end of query` at the end). |
-| `-32002` | `type` | A predicate is ill-typed: a range operator on an equality-only type, an unknown or unindexable type tag (`TYPEOF(x) = bytes`), a system attribute compared against the wrong type, `EXISTS($owner)`, or an unknown system attribute such as `$payload` or `$contentType`. `data` is `{position, got}`. |
+| `-32002` | `type` | A predicate is ill-typed: `STARTSWITH` on a type other than `str`, `BETWEEN` bounds of two types, an unknown or unindexable type tag (`TYPEOF(x) = bytes`), a system attribute compared against the wrong type, `EXISTS($owner)`, or an unknown system attribute such as `$payload` or `$contentType`. `data` is `{position, got}`. |
 | `-32003` | `literal` | A literal fails validation: an `i32` out of range, a bad checksum, more than 18 decimal places. `data` is `{position, got}`. |
-| `-32004` | `limits` | A node budget is exceeded: more than 8192 bytes, 64 predicates or 32 levels of nesting, a Boolean expansion beyond 64 groups or 256 literals, a count beyond the read's group/literal bounds, an exhausted read budget, or a single entity whose JSON alone exceeds the 8 MiB response cap. |
+| `-32004` | `limits` | A node budget is exceeded: more than 8192 bytes, 64 predicates or 32 levels of nesting, a Boolean expansion beyond 64 groups or 256 literals, an `arkiv_getEntityCount` beyond the read's group/literal bounds, an exhausted read budget (an `offset` walk and `select.count` included), a scan fallback past 4,096 rows, or a single entity whose JSON alone exceeds the 8 MiB response cap. |
 | `-32005` | `cursor` | The cursor expired, is malformed, or belongs to another query, block or selection (cursors also need an explicit `atBlock`). |
 | `-32006` | `block` | The requested height is above the head or below the state floor (`HistoryPruned`, with `data.requested`/`data.floor`). |
 

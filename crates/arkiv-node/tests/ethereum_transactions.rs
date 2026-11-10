@@ -390,6 +390,43 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     assert_eq!(read["result"], expected, "{read}");
     let missing = call("arkiv_getEntity", json!([format!("0x{}", "00".repeat(32))])).await;
     assert_eq!(missing["result"], Json::Null, "{missing}");
+    // SDK 1.0.1's query shapes: `withCount()` with `limit` and `offset`
+    // (every select key explicit, `count` added, hex quantities), and
+    // `client.count()`, which selects `count` alone.
+    let mut counted = select.clone();
+    counted["count"] = json!(true);
+    let source = format!("$key = key({key_hex})");
+    let page = call(
+        "arkiv_query",
+        json!([source, {"select": counted, "limit": "0x14", "offset": "0x0"}]),
+    )
+    .await;
+    assert_eq!(page["result"]["count"], "0x1", "{page}");
+    assert_eq!(page["result"]["data"][0]["key"], key_hex, "{page}");
+    assert!(page["result"].get("cursor").is_none(), "{page}");
+    let past = call(
+        "arkiv_query",
+        json!([source, {"select": counted, "limit": "0x14", "offset": "0x1"}]),
+    )
+    .await;
+    assert_eq!(past["result"]["data"], json!([]), "{past}");
+    assert_eq!(past["result"]["count"], "0x1", "{past}");
+    let only = call("arkiv_query", json!(["*", {"select": {"count": true}}])).await;
+    assert_eq!(only["result"]["data"], json!([]), "{only}");
+    assert!(only["result"]["count"].as_str().unwrap().starts_with("0x"));
+    assert!(only["result"].get("cursor").is_none(), "{only}");
+    let range = call(
+        "arkiv_query",
+        json!([format!("$key BETWEEN key({key_hex}) AND key({key_hex})"), {"select": {"count": true}}]),
+    )
+    .await;
+    assert_eq!(range["result"]["count"], "0x1", "{range}");
+    let bad = call(
+        "arkiv_query",
+        json!(["score > str('a') AND score STARTSWITH u64(1)"]),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32002, "{bad}");
     // The receipt's EntityCreated log carries the sentinel as its first word.
     let tx_hash = arkiv_node::simulator::wire::hex(permanent.hash().as_slice());
     let receipt = call("eth_getTransactionReceipt", json!([tx_hash])).await;
