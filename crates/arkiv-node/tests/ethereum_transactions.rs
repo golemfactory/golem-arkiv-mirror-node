@@ -382,6 +382,14 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
         entity["result"]["data"][0]["expiresAt"], "0xffffffffffffffff",
         "{entity}"
     );
+    // SDK 1.x reads the same entity with `arkiv_getEntity`: every field but
+    // the attribute schema.
+    let mut expected = entity["result"]["data"][0].clone();
+    expected.as_object_mut().unwrap().remove("attributeSchema");
+    let read = call("arkiv_getEntity", json!([key_hex])).await;
+    assert_eq!(read["result"], expected, "{read}");
+    let missing = call("arkiv_getEntity", json!([format!("0x{}", "00".repeat(32))])).await;
+    assert_eq!(missing["result"], Json::Null, "{missing}");
     // The receipt's EntityCreated log carries the sentinel as its first word.
     let tx_hash = arkiv_node::simulator::wire::hex(permanent.hash().as_slice());
     let receipt = call("eth_getTransactionReceipt", json!([tx_hash])).await;

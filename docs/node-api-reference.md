@@ -72,7 +72,7 @@ answers code `-32006` (the SDK's `block` kind, on every method) with message
 `history pruned: requested N, floor F` and hex `data.requested`/`data.floor`. Bodies, headers and transactions stay
 available at every height. See the [pruning design](pruning-design.md).
 
-Entity queries and counts (`arkiv_query`, `arkiv_getEntityCount`), raw proof
+Entity reads, queries and counts (`arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`), raw proof
 generation (`query/eq`, `query/range`) and tree exploration are detached reads:
 they run against a snapshot pinned under the node lock, outside it. At most
 `--read-concurrency` of them run at once; another answers `429` with

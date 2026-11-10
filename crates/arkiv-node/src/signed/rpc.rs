@@ -1273,7 +1273,7 @@ async fn locked(rt: &Shared, method: String, params: Value, id: Value) -> Result
         Err(_) => Err(Error("StorageUnavailable")),
     }
 }
-/// `arkiv_query` and `arkiv_getEntityCount` on a full node, as detached reads
+/// `arkiv_query`, `arkiv_getEntity` and `arkiv_getEntityCount` on a full node, as detached reads
 /// (see [`super::reads`]): admitted before touching the node lock, planned
 /// under it, and evaluated against the pinned snapshot after releasing it.
 /// `None` forwards the request (a light node).

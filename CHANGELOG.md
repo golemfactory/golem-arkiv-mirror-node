@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### `arkiv_getEntity` for SDK 1.x
+
+- JSON-RPC `arkiv_getEntity` (`[key]` at the head or `[key, block]` at a
+  retained block) returns one entity with every field except
+  `attributeSchema`, or `null` when no live entity has the key, the shape
+  `@arkiv-network/sdk` 1.0's `getEntity` reads. It is planned as the one-row
+  `$key` query and is a detached read like `arkiv_query`.
+
 ### Node lock: reads wait out holders, writers go first
 
 - A light node's verified reads no longer fail with `ServerBusy` because a

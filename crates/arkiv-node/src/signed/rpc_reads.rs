@@ -4,7 +4,7 @@
 //! are not proofs and expire after restart or eviction; callers can restart a
 //! query at its explicitly retained block height.
 //!
-//! `arkiv_query` and `arkiv_getEntityCount` are [planned](plan) under the node
+//! `arkiv_query`, `arkiv_getEntity` and `arkiv_getEntityCount` are [planned](plan) under the node
 //! lock, which checks heights and pins the snapshot, and [run](Planned::run)
 //! after it is released (see [`super::reads`]). [`dispatch`] does both.
 //!
@@ -71,7 +71,7 @@ const FIELDS: &[&str] = &[
     "attributes",
 ];
 
-/// What a node rejected an `arkiv_query` (or `arkiv_getEntityCount`) for:
+/// What a node rejected an `arkiv_query` (or `arkiv_getEntity`, `arkiv_getEntityCount`) for:
 /// the SDK's frozen code table (`src/query/errors.ts`, `QueryErrorKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryErrorKind {
@@ -218,7 +218,10 @@ pub fn dispatch(host: &Host, method: &str, params: &Json) -> Option<Read<Json>> 
 }
 /// The methods whose evaluation runs after the node lock is released.
 pub(super) fn detached(method: &str) -> bool {
-    matches!(method, "arkiv_query" | "arkiv_getEntityCount")
+    matches!(
+        method,
+        "arkiv_query" | "arkiv_getEntity" | "arkiv_getEntityCount"
+    )
 }
 /// An SDK read with every check against the node done: what is left needs
 /// only the pinned snapshot it holds.
@@ -230,6 +233,8 @@ pub enum Planned {
         bounds: QueryLimits,
     },
     Page(Box<PageRead>),
+    /// `arkiv_getEntity`: a one-row page whose row, or `null`, is the result.
+    Entity(Box<PageRead>),
 }
 pub struct PageRead {
     snapshot: Snapshot,
@@ -249,6 +254,9 @@ pub fn plan(host: &Host, method: &str, params: &Json, reads: ReadLimits) -> Opti
     Some(match method {
         "arkiv_query" => {
             plan_query(host, params, bounds).map(|page| Planned::Page(Box::new(page)))
+        }
+        "arkiv_getEntity" => {
+            plan_entity(host, params, bounds).map(|page| Planned::Entity(Box::new(page)))
         }
         "arkiv_getEntityCount" => plan_count(host, params, bounds),
         "arkiv_getBlockTiming" => empty_params(params)
@@ -296,6 +304,13 @@ impl Planned {
                 Ok(json!(n))
             }
             Self::Page(page) => page.run(),
+            Self::Entity(page) => {
+                let mut result = page.run()?;
+                Ok(match result["data"].as_array_mut() {
+                    Some(rows) if !rows.is_empty() => rows.swap_remove(0),
+                    _ => Json::Null,
+                })
+            }
         }
     }
 }
@@ -415,6 +430,41 @@ fn selection(value: Option<&Json>) -> Result<Json> {
         .entry("key")
         .or_insert(Json::Bool(true));
     Ok(selected)
+}
+/// `arkiv_getEntity`: `[key]` at the head, or `[key, block]` as of a retained
+/// block (a hex quantity or a number). The SDK's single-entity read: every
+/// field except `attributeSchema`, or `null` when no live entity has the key.
+/// Expired entities are purged when their block is built, so a snapshot holds
+/// only live ones. Planned as the one-row `$key` query it is equivalent to.
+fn plan_entity(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead> {
+    let args = params
+        .as_array()
+        .filter(|p| !p.is_empty() && p.len() <= 2)
+        .ok_or(Error("InvalidParams"))?;
+    let key = args[0]
+        .as_str()
+        .and_then(|s| s.strip_prefix("0x"))
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or(Error("InvalidParams"))?;
+    let mut options = json!({
+        "select": {
+            "key": true, "owner": true, "creator": true, "createdAt": true,
+            "updatedAt": true, "expiresAt": true, "creationFlags": true,
+            "attributes": true,
+        },
+        "limit": 1,
+    });
+    if let Some(block) = args.get(1).filter(|b| !b.is_null()) {
+        options["atBlock"] = json!(quantity(block)?);
+    }
+    plan_query(
+        host,
+        &json!([
+            format!("$key = key(0x{})", key.to_ascii_lowercase()),
+            options
+        ]),
+        bounds,
+    )
 }
 fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead> {
     let args = params
@@ -1272,6 +1322,65 @@ mod tests {
             Some(encode_stream(&rows).unwrap()),
         )
         .unwrap()
+    }
+    fn get_entity(host: &Host, params: &Json) -> Read<Json> {
+        plan_entity(host, params, bounds(host))
+            .and_then(|page| Planned::Entity(Box::new(page)).run())
+    }
+    #[test]
+    fn get_entity_returns_the_full_live_entity_or_null() {
+        let mut host = fixture();
+        let page = query(
+            &host,
+            &json!(["n = u64(7)", {"select":sdk_select(json!(true))}]),
+        )
+        .unwrap();
+        let mut expected = page["data"][0].clone();
+        let key = expected["key"].as_str().unwrap().to_owned();
+        expected.as_object_mut().unwrap().remove("attributeSchema");
+        let entity = get_entity(&host, &json!([key])).unwrap();
+        assert_eq!(entity, expected);
+        assert!(entity.get("attributeSchema").is_none());
+        // Unindexed attributes are returned too.
+        assert_eq!(
+            entity["attributes"],
+            json!([{"name":"n","type":"u64","value":"0x7"},{"name":"note","type":"str","value":"seven"}])
+        );
+        // Keys are case-insensitive hex; an unknown key is `null`.
+        assert_eq!(
+            get_entity(
+                &host,
+                &json!([key.to_ascii_uppercase().replacen("0X", "0x", 1)])
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            get_entity(&host, &json!([format!("0x{}", "00".repeat(32))])).unwrap(),
+            Json::Null
+        );
+        // Past its expiry the entity is gone at the head but still readable at
+        // a retained block, given as a number or a hex quantity.
+        for _ in 0..10 {
+            host.produce().unwrap();
+        }
+        assert_eq!(get_entity(&host, &json!([key])).unwrap(), Json::Null);
+        assert_eq!(get_entity(&host, &json!([key, 0])).unwrap(), expected);
+        assert_eq!(get_entity(&host, &json!([key, "0x0"])).unwrap(), expected);
+        assert_eq!(get_entity(&host, &json!([key, null])).unwrap(), Json::Null);
+        assert!(get_entity(&host, &json!([key, 11])).is_err());
+        for params in [
+            json!([]),
+            json!(null),
+            json!([key, 0, 0]),
+            json!(["0x1234"]),
+            json!([key.trim_start_matches("0x")]),
+            json!([format!("0x{}", "zz".repeat(32))]),
+            json!([format!("{key} OR n = u64(8)")]),
+            json!([7]),
+        ] {
+            assert!(get_entity(&host, &params).is_err(), "{params}");
+        }
     }
     #[test]
     fn indexer_genesis_walk_uses_historical_count_and_numeric_page_limit() {

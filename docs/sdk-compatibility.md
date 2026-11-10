@@ -90,6 +90,8 @@ receipt cumulative gas includes user transactions only. `eth_subscribe` supports
 `arkiv_query` supports the SDK's typed scalar JSON, selected fields and
 attributes, historical block selection, pagination, equality and inequality,
 ranges, string prefixes, Boolean expressions, `EXISTS` and `TYPEOF`.
+`arkiv_getEntity` (`[key]` or `[key, block]`) returns one entity with every
+field except `attributeSchema`, or `null`; it is the one-row `$key` query.
 `arkiv_getEntityCount` and `arkiv_getBlockTiming` use retained native state.
 These JSON-RPC query responses are ordinary **unverified reads**. The native
 proof API continues to prove its documented equality subset separately.
@@ -121,7 +123,7 @@ imply parallel state execution. Excess demand can increase queueing latency
 and memory use rather than receiving an immediate `ServerBusy` response.
 Native REST admission and WebSocket connection limits remain separate.
 
-`arkiv_query` and `arkiv_getEntityCount` are the exception: they are detached
+`arkiv_query`, `arkiv_getEntity` and `arkiv_getEntityCount` are the exception: they are detached
 reads. They hold the node mutex only to check the height and pin its snapshot,
 then evaluate on that snapshot after releasing it, so a long count or scan no
 longer delays other requests or block production. At most
