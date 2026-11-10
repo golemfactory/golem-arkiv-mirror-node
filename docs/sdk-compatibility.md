@@ -247,20 +247,58 @@ and GLM-account real-process smoke tests also passed against the release binary.
 
 ## Full released indexer acceptance
 
-The standard Arkiv Chain Indexer v0.5.20 image stack is also exercised by
-`scripts/full-indexer-smoke.py`, using the sibling experimental checkout's
-`compose.signed-chain.yml`. Run it with Docker Compose, Bun and the installed SDK:
+The regular Arkiv Chain Indexer (`Arkiv-Network/arkiv-chain-indexer`, the UDC
+indexer, v0.6.x) is exercised by `scripts/full-indexer-smoke.py` through that
+checkout's own, unmodified `docker-compose.yml`. Run it with Docker Compose, Bun,
+the release `arkiv-proposer` and a UDC SDK checkout that
+`scripts/udc-sdk-smoke.py` supports:
 
 ```sh
+cargo build --release -p arkiv-node --bin arkiv-proposer
+ARKIV_INDEXER_DIR=../../arkiv-network/arkiv-chain-indexer \
+ARKIV_SDK_DIR=../arkiv-sdk-js \
 python3 scripts/full-indexer-smoke.py
 ```
 
-This launches an isolated three-entity prefill chain and the unchanged released
-scanner, decoder, PostgreSQL, Redis, aggregators, statistics collector, backend
-and frontend. It verifies decoded SDK lifecycle operations, receipt logs,
-historical balance readings, every block, genesis import, exact projected entity
-metadata and persistence across an indexer restart. Disposable fixture keys and
-randomly named Docker volumes are used; deployed chains are not modified.
+`ARKIV_INDEXER_DIR` defaults to `../../arkiv-network/arkiv-chain-indexer`
+(relative to this repository), `ARKIV_SDK_DIR` to `../arkiv-sdk-js` and
+`ARKIV_PROPOSER_BIN` to `target/release/arkiv-proposer`. Configuration goes
+through the environment and an empty `--env-file` in a temporary directory, so
+the indexer checkout's own `.env`, `rpc-keys/` and `baseload-config/` are never
+read or written. The containers reach the node as `host.docker.internal`, so its
+public listener binds to the Docker default bridge gateway (`docker0`, normally
+`172.17.0.1`; never a public interface) and the control listener stays on
+loopback. The user running it needs Docker access (the `docker` group).
+
+This builds the indexer images from the checkout, launches an isolated
+three-entity prefill chain (the `udc-sdk-smoke.py` chain: 500 ms blocks and a
+200,000-unit per-block storage cap) and runs the scanner, backfill scanner, gap
+filler, the released UDC decoder (`arkiv-transaction-decoder:v0.3.0`),
+PostgreSQL, Redis, aggregators, statistics collector, backend and frontend. The
+UDC SDK smoke's `exercise` stage drives the chain; then the script checks
+decoded SDK operations, receipt logs, balance readings, every block from 0
+(forward scan plus backfill), genesis import over RPC, projected entity metadata
+on `/shadow-rpc/experimental` against the node's `arkiv_query` at the same
+block, aggregates, statistics, the frontend proxy and persistence across an
+indexer restart. The index withholds `bytes` attribute values by design (it
+keeps their size and keccak256), so those values are nulled on the node side
+before the comparison; everything else must match exactly. Disposable fixture
+keys and a randomly named compose project are used, and its containers,
+volumes and built images are removed afterwards; deployed chains are not
+modified.
+
+Validated on 2026-11-17 against arkiv-chain-indexer `9f424c6` (v0.6.2) with SDK
+commit `3526519`: every check passed in about 100 seconds (170 blocks, 18
+transactions, 16 decoded operations, 3 genesis entities imported). The current
+SDK `develop` (`d464c8d`, 1.0.1-dev.0) cannot drive the exercise: it reads
+entities with `arkiv_getEntity` and pages with `offset`/`select.count` instead
+of `atBlock`/`cursor`, which this node does not implement yet (`-32601`), so
+`ARKIV_SDK_DIR` must point at a checkout from before SDK commit `fde2411`.
+
+An earlier version of this smoke targeted the experimental indexer's
+`compose.signed-chain.yml` (released v0.5.20 images, payload-era
+`scripts/sdk-compat-smoke.ts`); neither that file nor the payload-era SDK fits
+the regular UDC indexer.
 
 The indexer's genesis importer uncovered two additional RPC requirements:
 `arkiv_getEntityCount([{block: 0}])` reads the requested snapshot (with optional
