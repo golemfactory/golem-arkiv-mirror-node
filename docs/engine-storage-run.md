@@ -8,9 +8,12 @@ behavior. redb remains a dependency of the adapter, not the engine crate.
 This is an engine-only file format. It stores namespace descriptors, raw
 values, rows, indexes, allocators, pricing, host state and historical roots.
 It does not store transaction bodies, receipts, protocol blocks, inclusion
-identities or signing state. The full/light demo still runs in memory;
-durable node restart is N4. Every historical engine snapshot is retained
-on disk; there is no pruning or compaction.
+identities or signing state; a host stores those itself. The simulator and
+the signed proposer are durable hosts on top of this engine and restart
+without replay; the full/light demo runs in memory. Every historical engine
+snapshot stays on disk: a host can set a serving floor
+([pruning design](pruning-design.md)), but nothing is physically deleted or
+compacted.
 
 ## Lifecycle
 
@@ -151,6 +154,25 @@ candidate clones, concurrent read/proof output, adapter tables/allocator/
 transaction pages, and OS/allocator caches have separate ownership. A host
 must bound those workloads before claiming a total memory budget.
 
-See the [approved specification](engine-storage-v1.md) and the
-[measured acceptance report](engine-storage-v1-report.md) for functional
-gates, reproducible commands and backend limitations.
+## Rules for a host
+
+These come from the [redb experiment](redb-experiment.md) and apply to any
+host that stores its own files next to the engine:
+
+- One writer per store. A block is one storage transaction; the public head
+  moves only after the durable commit, never before.
+- Keep redb quick repair on for every transaction, including initialization.
+  No redb savepoint is used for history; history is the engine's own
+  retained manifests.
+- A file a later start relies on is written under a temporary name, synced,
+  renamed into place, and the directory is synced (`RedbStore::create` does
+  this for the store).
+- After a failed `fsync`, reading a commit back does not prove it durable
+  (Linux can mark unwritten pages clean). Acknowledge such a commit only
+  after recovery, including its reopen, has returned, and report the sync
+  failure.
+- Canonical charges and roots never depend on cache warmth, page layout,
+  sync latency or recovery work.
+
+See the [specification](engine-storage-v1.md) for the on-disk format and
+recovery policy, and the [measurements](engine-storage-v1-report.md).

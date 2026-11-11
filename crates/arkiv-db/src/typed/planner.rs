@@ -123,10 +123,6 @@ fn follower_gallop(size: u64, matches: u64) -> usize {
     usize::from(matches != 0 && size <= matches.saturating_mul(DENSE_RATIO))
 }
 
-// ---------------------------------------------------------------------------
-// Posting cursors and membership
-// ---------------------------------------------------------------------------
-
 /// A forward-only position in one posting: a planned group's driver or one
 /// of its followers.
 pub(crate) struct PostingCursor<'a> {
@@ -277,10 +273,6 @@ pub(crate) fn holds(
     Ok(found?.is_some())
 }
 
-// ---------------------------------------------------------------------------
-// Static analysis
-// ---------------------------------------------------------------------------
-
 /// What a positive literal needs of its name: an attribute of `tag`, with
 /// `value` for `Eq`.
 struct Need<'q> {
@@ -367,10 +359,6 @@ fn pairwise_disjoint(groups: &[Vec<Literal>]) -> bool {
         })
     })
 }
-
-// ---------------------------------------------------------------------------
-// Planning
-// ---------------------------------------------------------------------------
 
 /// What a plan is for: a run competes with the row map on a page, but a
 /// count walks a lone run completely (its matches are the count).
@@ -831,10 +819,6 @@ fn closed_count(plan: &Plan<'_>, live: u64) -> Option<u64> {
         .iter()
         .try_fold(size, |left, found| left.checked_sub(found.len()))
 }
-
-// ---------------------------------------------------------------------------
-// Opening groups and counting
-// ---------------------------------------------------------------------------
 
 /// Positions a completely walked run at `from`, as `open_run` does: each
 /// posting's seek and first entry are stepped at once to prime the merge.

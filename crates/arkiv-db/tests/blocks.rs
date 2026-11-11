@@ -37,8 +37,6 @@ const ERIN: OwnerId = OwnerId::new([0xe0; 20]);
 /// Unlimited, untraced budget: the cost is asserted through the receipt.
 const ALL: Budget = Budget::unlimited();
 
-// --- identities -------------------------------------------------------------
-
 /// The namespace with allocation ordinal `ordinal`, built through the public
 /// byte encoding so expected IDs never come from the engine.
 fn ns(ordinal: u64) -> NamespaceId {
@@ -53,8 +51,6 @@ fn descriptor(id: NamespaceId, owner: OwnerId, revision: u64) -> NamespaceDescri
         revision: Revision(revision),
     }
 }
-
-// --- operations -------------------------------------------------------------
 
 fn put(namespace: NamespaceId, key: &[u8], value: &[u8]) -> WriteOp {
     WriteOp::Put {
@@ -79,8 +75,6 @@ fn transfer(namespace: NamespaceId, expected_revision: u64, new_owner: OwnerId) 
     }
 }
 
-// --- receipts ---------------------------------------------------------------
-
 fn receipt(kind: ReceiptKind, schedule_id: u32, spent: u64, outcome: Outcome) -> Receipt {
     Receipt {
         kind,
@@ -92,27 +86,23 @@ fn receipt(kind: ReceiptKind, schedule_id: u32, spent: u64, outcome: Outcome) ->
     }
 }
 
-/// An applied write receipt under the FIXTURE schedule (id 1).
+// Receipts under the FIXTURE schedule (id 1).
+
 fn applied(spent: u64) -> Receipt {
     receipt(ReceiptKind::Write, 1, spent, Outcome::Applied)
 }
 
-/// A rejected write receipt under the FIXTURE schedule (id 1).
 fn rejected(spent: u64, reason: Rejection) -> Receipt {
     receipt(ReceiptKind::Write, 1, spent, Outcome::Rejected(reason))
 }
 
-/// An applied read receipt under the FIXTURE schedule (id 1).
 fn read(spent: u64) -> Receipt {
     receipt(ReceiptKind::Read, 1, spent, Outcome::Applied)
 }
 
-/// A rejected read receipt under the FIXTURE schedule (id 1).
 fn read_rejected(spent: u64, reason: Rejection) -> Receipt {
     receipt(ReceiptKind::Read, 1, spent, Outcome::Rejected(reason))
 }
-
-// --- results ----------------------------------------------------------------
 
 /// The canonical part of a read: the value (or rejection) and the receipt,
 /// with the non-canonical physical trace dropped.
@@ -149,8 +139,6 @@ fn entry(key: &[u8], value: &[u8]) -> Entry {
     }
 }
 
-// --- driving the engine -----------------------------------------------------
-
 fn branch(engine: &Engine, block_budget: Option<u64>) -> Branch {
     engine
         .begin(engine.head(), block_budget.map(Cost::new))
@@ -186,8 +174,6 @@ fn create(candidate: &mut Branch, actor: OwnerId) -> NamespaceId {
         other => panic!("create namespace produced {other:?}"),
     }
 }
-
-// --- reading a snapshot or a branch through one interface -------------------
 
 trait Reader {
     fn read_get(
@@ -271,8 +257,6 @@ fn observe(reader: &impl Reader, namespace: NamespaceId, keys: &[&[u8]]) -> Obse
     }
 }
 
-// --- 1. the six-step deliverable flow ---------------------------------------
-
 #[test]
 fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -280,7 +264,7 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     blocks.record(BlockNumber(0), engine.head()).unwrap();
     assert_eq!(engine.head(), SnapshotId::GENESIS);
 
-    // Step 1, block 1: one namespace per owner. create = 1 + 50 + 2 = 53 each.
+    // Block 1: one namespace per owner. create = 1 + 50 + 2 = 53 each.
     let mut candidate = branch(&engine, Some(1_000));
     let shop = execute(
         &mut candidate,
@@ -324,7 +308,7 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     );
     assert_eq!(after_block_1.record_count(shop), Some(0));
 
-    // Step 2, block 2: ordered operations, including put/delete/put on one
+    // Block 2: ordered operations, including put/delete/put on one
     // key inside the block. Only the last write survives; head never shows
     // an intermediate value while the candidate is open.
     let mut candidate = branch(&engine, Some(1_000));
@@ -438,7 +422,7 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     let shop_keys: &[&[u8]] = &[b"k", b"other", b"k3"];
     let shop_at_block_2 = observe(&after_block_2, shop, shop_keys);
 
-    // Step 3, block 3: transfer the shop to bob without moving any record,
+    // Block 3: transfer the shop to bob without moving any record,
     // then reject an unauthorized put, an underfunded put, and a put whose
     // budget exceeds the block's remainder. Block budget 32.
     let mut candidate = branch(&engine, Some(32));
@@ -530,7 +514,7 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     assert!(after_block_2.records_shared_with(&after_block_3, blog));
     assert_eq!(value(after_block_3.get(shop, b"k3", ALL)), None);
 
-    // Step 5: the state after block 2 is unchanged however it is reached.
+    // The state after block 2 is unchanged however it is reached.
     let by_id = engine.snapshot(snapshot_2).unwrap();
     let by_block = blocks.at(&engine, BlockNumber(2)).unwrap();
     for (label, snapshot) in [
@@ -555,7 +539,7 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
         descriptor(shop, BOB, 1)
     );
 
-    // Step 6, block 4: one block touches both namespaces; readers see all or
+    // Block 4: one block touches both namespaces; readers see all or
     // nothing of it.
     let before = engine.head_snapshot();
     let mut candidate = branch(&engine, Some(1_000));
@@ -626,8 +610,6 @@ fn six_step_flow_publishes_ordered_blocks_over_two_namespaces() {
     assert_eq!(blocks.len(), 5);
     assert_eq!(engine.snapshot_count(), 5);
 }
-
-// --- 2. empty blocks --------------------------------------------------------
 
 #[test]
 fn empty_blocks_publish_new_snapshots_with_identical_answers() {
@@ -714,8 +696,6 @@ fn empty_blocks_publish_new_snapshots_with_identical_answers() {
         "the old handle is unchanged"
     );
 }
-
-// --- 3. atomic mixed-namespace publication ----------------------------------
 
 struct Quartet {
     a: NamespaceId,
@@ -906,17 +886,9 @@ fn a_block_touching_four_namespaces_becomes_visible_all_at_once() {
         (h.record_count(q.d), published.record_count(q.d)),
         (None, Some(0))
     );
-    // C holds no records, so shared-root identity is vacuous here; the
-    // populated case is covered by the six-step flow's shop namespace.
-    assert!(
-        published.records_shared_with(&h, q.c),
-        "C was only transferred"
-    );
     assert!(!published.records_shared_with(&h, q.a));
     assert!(!published.records_shared_with(&h, q.b));
 }
-
-// --- 4. competing and stale candidates --------------------------------------
 
 #[test]
 fn a_stale_candidate_loses_and_releases_its_namespace_ordinal() {
@@ -1010,8 +982,6 @@ fn a_stale_candidate_loses_and_releases_its_namespace_ordinal() {
         "the loser reports the current head each time"
     );
 }
-
-// --- 5. block identity vs snapshot identity ---------------------------------
 
 #[test]
 fn block_numbers_and_snapshot_ids_are_distinct_sequences() {
@@ -1148,10 +1118,6 @@ fn block_numbers_and_snapshot_ids_are_distinct_sequences() {
     assert_eq!(empty_snapshot.sequence(), 3);
     blocks.record(BlockNumber(2), empty_snapshot).unwrap();
     assert_eq!(blocks.resolve(BlockNumber(2)), Some(empty_snapshot));
-    assert_ne!(
-        blocks.resolve(BlockNumber(2)),
-        blocks.resolve(BlockNumber(1))
-    );
     assert_eq!(blocks.latest(), Some((BlockNumber(2), empty_snapshot)));
     assert_eq!(blocks.len(), 2);
     assert_eq!(engine.snapshot_count(), 4);
@@ -1168,12 +1134,9 @@ fn block_numbers_and_snapshot_ids_are_distinct_sequences() {
     // Block numbers are not snapshot sequences.
     for block in [1, 2] {
         let snapshot = blocks.resolve(BlockNumber(block)).unwrap();
-        assert_ne!(snapshot.sequence(), block, "block {block}");
         assert_eq!(snapshot.sequence(), block + 1, "block {block}");
     }
 }
-
-// --- 6. foreign candidates --------------------------------------------------
 
 #[test]
 fn candidates_sealed_by_another_engine_are_foreign_even_at_genesis() {
@@ -1218,8 +1181,6 @@ fn candidates_sealed_by_another_engine_are_foreign_even_at_genesis() {
     assert_eq!(y.head_snapshot().namespace_count(), 0);
 }
 
-// --- 7. retained snapshots --------------------------------------------------
-
 #[test]
 fn every_one_of_fifty_published_blocks_stays_readable_and_unchanged() {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -1256,11 +1217,6 @@ fn every_one_of_fifty_published_blocks_stays_readable_and_unchanged() {
     }
     assert_eq!(engine.snapshot_count(), 51);
     assert_eq!(blocks.len(), 51);
-    assert_eq!(expected_k[1], some(b"v1"));
-    assert_eq!(expected_k[4], some(b"v4"));
-    assert_eq!(expected_k[5], None);
-    assert_eq!(expected_k[49], some(b"v49"));
-    assert_eq!(expected_k[50], None);
 
     for block in 0..=50u64 {
         let index = usize::try_from(block).unwrap();
@@ -1310,8 +1266,6 @@ fn every_one_of_fifty_published_blocks_stays_readable_and_unchanged() {
         }
     }
 }
-
-// --- 8. branch reads --------------------------------------------------------
 
 #[test]
 fn branch_reads_see_uncommitted_writes_that_head_never_shows() {

@@ -1,4 +1,5 @@
 //! Durable simulator model, payload whitelist, restart, uncertainty and light tests.
+
 use arkiv_db::{
     Budget, CellName, NamespaceId, Value,
     durable::Options,
@@ -27,9 +28,11 @@ fn run() -> RunConfig {
         workload: Workload::default(),
     }
 }
+
 fn host(store: Arc<dyn VersionedStore>) -> Host {
     Host::create(store, run(), [1; 16], [7; 16], Options::default()).unwrap()
 }
+
 fn request(host: &Host, height: u64, limit: u32) -> EqRequest {
     let h = host.header(height).unwrap();
     EqRequest {
@@ -48,6 +51,7 @@ fn request(host: &Host, height: u64, limit: u32) -> EqRequest {
         continuation: None,
     }
 }
+
 fn control(h: &Host, id: u8, action: &str) -> Control {
     Control {
         command_id: hex(&[id; 32]),
@@ -219,9 +223,9 @@ fn durable_controls_replay_exactly_after_restart_and_configuration_is_adopted_in
     let committed = h.head;
     let id = h.identity.clone();
     drop(h);
-    let mut h = Host::open(store.clone(), Some(&id), Options::default()).unwrap();
+    let mut h = Host::open(store, Some(&id), Options::default()).unwrap();
     assert_eq!(h.control(step.clone()).unwrap()["height"], "1");
-    assert_eq!(h.control(config.clone()).unwrap()["height"], "2");
+    assert_eq!(h.control(config).unwrap()["height"], "2");
     assert_eq!(h.head, committed);
     let mut conflicting = step;
     conflicting.action = "resume".into();
@@ -325,7 +329,7 @@ fn light_pins_history_verifies_pages_rejects_mutations_and_persists_conflict() {
     );
     assert_eq!(light.header(20).unwrap_err().0, "ChainConflict");
     drop(light);
-    assert!(matches!(Light::open(store,&h.identity),Err(e) if e.0=="ChainConflict"));
+    assert!(matches!(Light::open(store, &h.identity), Err(e) if e.0 == "ChainConflict"));
 }
 
 #[test]
@@ -360,7 +364,11 @@ fn bounded_serialization_and_profile_reject_unserviceable_genesis() {
 
 #[test]
 fn metadata_binary_codec_matches_typescript_golden_and_detects_tampering() {
-    let value = serde_json::json!({"z":[null,false,true,4294967295u32],"é":"a\u{0}","a":"9007199254740993"});
+    let value = serde_json::json!({
+        "z": [null, false, true, 4294967295u32],
+        "é": "a\u{0}",
+        "a": "9007199254740993",
+    });
     assert_eq!(
         hex(&metadata_bytes(&value).unwrap()),
         "0x060000000304000000016104000000103930303731393932353437343039393304000000017a050000000400010203ffffffff0400000002c3a904000000026100"
@@ -450,7 +458,7 @@ fn collector_handles_same_block_recreation_rollback_id_reuse_and_every_field_typ
                         namespace: ns,
                         key: key.clone(),
                     },
-                    create(key.clone()),
+                    create(key),
                 ],
             ),
             tx(
@@ -506,7 +514,7 @@ fn collector_handles_same_block_recreation_rollback_id_reuse_and_every_field_typ
     assert!(
         feed.changes
             .iter()
-            .any(|c| matches!(c,Change::RecordDelete{record_id,..} if record_id=="1"))
+            .any(|c| matches!(c, Change::RecordDelete { record_id, .. } if record_id == "1"))
     );
     let rows = feed
         .changes

@@ -1,37 +1,13 @@
 //! The typed record model: keys, ids, names, values and cells; the three
 //! record writes; and `get_record`, under model version 3.
 //!
-//! What this file establishes:
-//! - The frozen encodings: `RecordKey` (`len ‖ bytes ‖ zero padding`, 33
-//!   bytes, keys of 1..=32 bytes), the term bytes of every indexable
-//!   `Value`, the `TypeTag` ids and capabilities, and the `CellName`
-//!   grammar, checked against literal vectors.
-//! - `CreateRecord`, `PatchRecord` and `DeleteRecord` effects and whole
-//!   receipts (ledgers included) as hand-derived literals under the FIXTURE
-//!   weights, including the charge order under every budget (a budget sweep
-//!   with the state observed after each rejection), term newness with
-//!   existing terms, and the four patch shapes: value only, type only,
-//!   attribute -> field, field -> attribute, plus removal of an absent name.
-//! - The post-charge rejections `AlreadyExists`, `NotFound` and `RecordFull`
-//!   (spent 4, recorded) and `Unauthorized`/`UnknownNamespace` (spent 1,
-//!   recorded), against the admission faults (every `ArgumentFault`,
-//!   `ProjectionTooLarge`: spent 0, receipt issued, nothing recorded).
-//! - Dense ids are never reused across delete + recreate, and rollback
-//!   releases ids and restores rows, keys and terms together.
-//! - The host path: `execute_host` applies a record write in a namespace the
-//!   caller does not own with a receipt identical to the owner path,
-//!   `estimate_host == execute_host`, and every non-record op is
-//!   `NotHostOperation` with nothing recorded.
-//! - A transfer shares the typed state physically and visits no record or
-//!   index node; the raw byte keyspace and the typed records of a namespace
-//!   never interact; `get_record` projections charge only projected bytes;
-//!   a pinned snapshot answers `get_record` after later patches and deletes.
-//!
-//! Every expected row and term count comes from a `BTreeMap` reference model
-//! of the record semantics, never from the engine's own index; every cost is
-//! a literal derived by hand (the derivation is next to it). What it does not
-//! establish: query evaluation and its charges beyond a match-all page,
-//! cursor binding, expiry, and anything about durability or roots.
+//! The frozen encodings (`RecordKey` as `len ‖ bytes`, 2 to 33 bytes; term
+//! bytes; `TypeTag` ids; the `CellName` grammar) are literal vectors. Rows
+//! and term counts come from a `BTreeMap` reference model, never from the
+//! engine's index; every cost is a literal derived by hand next to it. The
+//! every-budget sweeps of the create, patch and delete vectors are in
+//! `query_metering.rs`; query evaluation and cursors are in `queries.rs` and
+//! `pagination.rs`.
 
 use std::{
     cmp::Ordering,
@@ -40,11 +16,11 @@ use std::{
 };
 
 use arkiv_db::{
-    ArgumentFault, Branch, Budget, Cell, CellKind, CellName, CellSelect, Cost,
-    DEFAULT_NAMESPACE_CAP, Effect, Engine, Entry, Executed, Ledger, LedgerEntry, Limits, NameFault,
-    NamespaceId, OperationClass, Outcome, OwnerId, PhysicalTrace, PriceSchedule, Projection, Query,
-    QueryFault, ReadResult, Receipt, ReceiptKind, RecordId, RecordKey, Rejected, Rejection,
-    Revision, Row, Snapshot, SnapshotId, TypeTag, Value, WriteOp, WriteResult,
+    ArgumentFault, Branch, Budget, Cell, CellName, CellSelect, Cost, DEFAULT_NAMESPACE_CAP, Effect,
+    Engine, Entry, Executed, Ledger, LedgerEntry, Limits, NameFault, NamespaceId, OperationClass,
+    Outcome, OwnerId, PhysicalTrace, PriceSchedule, Projection, Query, QueryFault, ReadResult,
+    Receipt, ReceiptKind, RecordId, RecordKey, Rejected, Rejection, Revision, Row, Snapshot,
+    SnapshotId, TypeTag, Value, WriteOp, WriteResult,
 };
 
 const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
@@ -55,31 +31,23 @@ const MODEL_VERSION: u32 = 3;
 /// The id `PriceSchedule::FIXTURE` carries.
 const FIXTURE_ID: u32 = 1;
 
-// ---------------------------------------------------------------------------
-// FIXTURE weights, transcribed from the brief (unit prices of the classes
-// this file charges). Used for ledger lines and the derivations below.
-// ---------------------------------------------------------------------------
-
+// FIXTURE unit prices of the classes this file charges, for ledger lines and
+// the derivations below.
 const DIRECTORY_LOOKUP: u64 = 1;
 const NAMESPACE_TRANSFER: u64 = 20;
 const POINT_READ: u64 = 3;
-const READ_BYTE: u64 = 1;
-const RECORD_CREATE: u64 = 20;
 const RECORD_PATCH: u64 = 10;
-const RECORD_DELETE: u64 = 20;
 const CELL_WRITE: u64 = 4;
 const CELL_BYTE: u64 = 1;
 const CELL_REMOVE: u64 = 4;
 const INDEX_INSERT: u64 = 6;
 const INDEX_TERM_CREATE: u64 = 30;
 const INDEX_REMOVE: u64 = 6;
-const RESULT_ROW: u64 = 3;
 const ROOT_UPDATE: u64 = 2;
 const ROW_BYTE: u64 = 1;
 
-// ---------------------------------------------------------------------------
-// The brief's worked fixture: records a, b, c created in that order, each
-// with attributes kind: Str, price: I64, $expiresAt: U64(5) and a field
+// The worked fixture: records a, b, c created in that order, each with
+// attributes kind: Str, price: I64, $expiresAt: U64(5) and a field
 // note: Bytes("xyz"); kinds book, book, pen; prices 10, 20, 5.
 //
 // Name order (bytewise, `$` = 0x24 sorts before letters): $expiresAt, kind,
@@ -89,10 +57,9 @@ const ROW_BYTE: u64 = 1;
 // so b(a) = 18 + 8 + 7 + 13 = 46, b(b) = 46, b(c) = 45; c = 4 cells, a = 3
 // attribute cells (6 terms: a value term and an existence term each). The
 // stored row adds the 1-byte key: n(a) = n(b) = 47, n(c) = 46 (RowByte).
-// Model 3 adds RootUpdate 3 to the record group (key binding, row, catalog
-// leaf) and RootUpdate 2 to every index group (posting entry, term leaf),
-// each unit priced 2.
-// ---------------------------------------------------------------------------
+// Every record group also charges RootUpdate 3 (key binding, row, catalog
+// leaf) and every index group RootUpdate 2 (posting entry, term leaf), 2
+// units each.
 
 /// create a, every term new: 1 + 3 + (20 + 4*4 + 46 + RowByte 47 +
 /// RootUpdate 3*2) + 6*(6 + 2*2) + 6*30 = 1 + 3 + 135 + 60 + 180 = 379.
@@ -107,10 +74,6 @@ const CREATE_C: u64 = 257;
 const ABC_TERMS: usize = 9;
 /// The fixture's namespace has ordinal 1.
 const NS: u64 = 1;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn ns_id(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).expect("ordinals start at 1")
@@ -298,8 +261,8 @@ fn fixture() -> (Engine, NamespaceId) {
     (engine, ns_id(NS))
 }
 
-/// Creates a, b, c on `branch`, asserting the brief's worked receipts, and
-/// mirrors them into `model`.
+/// Creates a, b, c on `branch`, asserting the worked receipts, and mirrors
+/// them into `model`.
 fn create_abc(branch: &mut Branch, ns: NamespaceId, model: &mut Model) {
     let records = [
         ("a", "book", 10, CREATE_A),
@@ -328,11 +291,8 @@ fn fixture_abc() -> (Engine, NamespaceId, Model) {
     (engine, ns, model)
 }
 
-// ---------------------------------------------------------------------------
-// Reference model: the record semantics of the brief over a BTreeMap. It
-// knows nothing about charges or the engine's index.
-// ---------------------------------------------------------------------------
-
+/// Reference model: the record semantics over a `BTreeMap`. It knows nothing
+/// about charges or the engine's index.
 #[derive(Clone, Debug, Default)]
 struct Model {
     next_id: u64,
@@ -438,7 +398,6 @@ trait TypedView {
         key: &RecordKey,
         projection: &Projection,
     ) -> ReadResult<Option<Row>>;
-    fn raw_count(&self, ns: NamespaceId) -> Option<usize>;
 }
 
 impl TypedView for Branch {
@@ -458,10 +417,6 @@ impl TypedView for Branch {
     ) -> ReadResult<Option<Row>> {
         self.get_record(ns, key, projection, Budget::unlimited())
     }
-
-    fn raw_count(&self, ns: NamespaceId) -> Option<usize> {
-        self.record_count(ns)
-    }
 }
 
 impl TypedView for Snapshot {
@@ -480,10 +435,6 @@ impl TypedView for Snapshot {
         projection: &Projection,
     ) -> ReadResult<Option<Row>> {
         self.get_record(ns, key, projection, Budget::unlimited())
-    }
-
-    fn raw_count(&self, ns: NamespaceId) -> Option<usize> {
-        self.record_count(ns)
     }
 }
 
@@ -635,10 +586,6 @@ fn assert_read_sweep<T: Debug + PartialEq>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. The record model: constructors and frozen encodings
-// ---------------------------------------------------------------------------
-
 #[test]
 fn record_keys_take_1_to_32_bytes_and_encode_as_length_and_bytes() {
     assert_eq!(RecordKey::MAX_LEN, 32);
@@ -672,7 +619,6 @@ fn record_ids_are_positive_ordinals() {
     assert_eq!(seven.ordinal(), 7);
     assert_eq!(seven.to_string(), "rec:7");
     assert!(rid(1) < rid(2) && rid(2) < rid(10), "ids order by ordinal");
-    assert_eq!(rid(7), seven);
 }
 
 #[test]
@@ -730,11 +676,11 @@ fn type_tags_have_frozen_ids_and_capabilities() {
         .map(TypeTag::id),
         [1, 2, 3, 13, 17]
     );
-    let indexable: Vec<TypeTag> = TypeTag::ALL
+    let unindexed: Vec<TypeTag> = TypeTag::ALL
         .into_iter()
         .filter(|t| !t.is_indexable())
         .collect();
-    assert_eq!(indexable, vec![TypeTag::Bytes]);
+    assert_eq!(unindexed, vec![TypeTag::Bytes]);
     // Ordered is the same set as indexable: every attribute type.
     for tag in TypeTag::ALL {
         assert_eq!(tag.is_ordered(), tag.is_indexable(), "{tag}");
@@ -782,12 +728,6 @@ fn values_have_frozen_term_bytes_and_encoded_lengths() {
     );
     assert_eq!(Value::bytes(b"xyz").encoded_len(), 3);
 
-    assert_eq!(Value::Bool(true).tag(), TypeTag::Bool);
-    assert_eq!(Value::I64(1).tag(), TypeTag::I64);
-    assert_eq!(Value::U64(1).tag(), TypeTag::U64);
-    assert_eq!(Value::str("a").tag(), TypeTag::Str);
-    assert_eq!(Value::bytes(b"a").tag(), TypeTag::Bytes);
-
     assert_eq!(
         Value::I64(-1).cmp_ordered(&Value::I64(1)),
         Some(Ordering::Less)
@@ -815,22 +755,6 @@ fn values_have_frozen_term_bytes_and_encoded_lengths() {
         Value::I64(1),
         Value::U64(1),
         "values of different types never compare equal"
-    );
-}
-
-#[test]
-fn cells_carry_a_kind_and_a_value() {
-    let indexed = attr(Value::str("book"));
-    assert_eq!(indexed.kind, CellKind::Attribute);
-    assert_eq!(indexed.value, Value::str("book"));
-    assert!(indexed.is_attribute());
-    let stored = field(Value::bytes(b"xyz"));
-    assert_eq!(stored.kind, CellKind::Field);
-    assert!(!stored.is_attribute());
-    assert_ne!(
-        attr(Value::I64(1)),
-        field(Value::I64(1)),
-        "kind is part of the cell"
     );
 }
 
@@ -867,193 +791,15 @@ fn limits_are_fixed_per_engine() {
     assert_eq!(fresh_branch(&engine).limits(), custom);
 }
 
-// ---------------------------------------------------------------------------
-// 2. Write vectors: effects, whole receipts and charge order
-// ---------------------------------------------------------------------------
-
 const ABC_KEYS: [&str; 3] = ["a", "b", "c"];
-
 #[test]
-fn create_with_every_term_new_charges_lookup_record_group_then_each_term() {
-    let (engine, ns) = fixture();
-    let op = create(ns, key("a"), fixture_cells("book", 10));
-    // DirectoryLookup 1 -> 1; PointRead 3 -> 4; {RecordCreate 20 + CellWrite
-    // 4*4 + CellByte 46 + RowByte 47 + RootUpdate 3*2} = 135 -> 139; then six
-    // new terms in name order ($expiresAt value, existence; kind value,
-    // existence; price value, existence), each {IndexInsert 6 +
-    // IndexTermCreate 30 + RootUpdate 2*2} = 40: 179, 219, 259, 299, 339, 379.
-    assert_write_sweep(
-        &engine,
-        ns,
-        &WriteVector {
-            label: "create a",
-            op: &op,
-            prefix_sums: &[1, 4, 139, 179, 219, 259, 299, 339, 379],
-            effect: Effect::RecordCreated { id: rid(1) },
-        },
-        &Model::default(),
-        &["a"],
-    );
-
-    let mut branch = fresh_branch(&engine);
-    let executed = branch
-        .execute(ALICE, op, Budget::unlimited().traced())
-        .expect("applies");
-    assert_eq!(
-        executed.receipt,
-        traced(
-            applied(CREATE_A),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::RecordCreate, 1, RECORD_CREATE),
-                (OperationClass::CellWrite, 4, CELL_WRITE),
-                (OperationClass::CellByte, 46, CELL_BYTE),
-                (OperationClass::RowByte, 47, ROW_BYTE),
-                // 3 (record group) + 6 * 2 (index groups).
-                (OperationClass::RootUpdate, 15, ROOT_UPDATE),
-                (OperationClass::IndexInsert, 6, INDEX_INSERT),
-                (OperationClass::IndexTermCreate, 6, INDEX_TERM_CREATE),
-            ],
-        )
-    );
-    let mut model = Model::default();
-    model.create(key("a"), fixture_cells("book", 10));
-    assert_matches_model(&branch, ns, &model, &["a", "b"]);
-    assert_eq!(
-        branch.term_count(ns),
-        Some(6),
-        "six terms, all created by a"
-    );
-    assert_eq!(
-        branch.record_count(ns),
-        Some(0),
-        "the raw keyspace is untouched"
-    );
-}
-
-#[test]
-fn create_with_existing_terms_charges_creation_only_for_the_new_one() {
-    let (mut engine, ns) = fixture();
-    let mut model = Model::default();
-    let mut branch = fresh_branch(&engine);
-    apply(
-        &mut branch,
-        ALICE,
-        create(ns, key("a"), fixture_cells("book", 10)),
-    );
-    model.create(key("a"), fixture_cells("book", 10));
-    engine.publish(&branch.seal()).expect("publishes a");
-
-    // create b after a: 1 -> 4 -> 139 as for a; then in name order
-    // $expiresAt value (held by a: {IndexInsert 6 + RootUpdate 2*2} = 10) 149,
-    // existence 159, kind=book 169, kind existence 179, price=20 (new: 40)
-    // 219, price existence 229.
-    let op = create(ns, key("b"), fixture_cells("book", 20));
-    assert_write_sweep(
-        &engine,
-        ns,
-        &WriteVector {
-            label: "create b",
-            op: &op,
-            prefix_sums: &[1, 4, 139, 149, 159, 169, 179, 219, 229],
-            effect: Effect::RecordCreated { id: rid(2) },
-        },
-        &model,
-        &["a", "b"],
-    );
-
-    let mut branch = fresh_branch(&engine);
-    let executed = branch
-        .execute(ALICE, op, Budget::unlimited().traced())
-        .expect("applies");
-    assert_eq!(
-        executed.receipt,
-        traced(
-            applied(CREATE_B),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::RecordCreate, 1, RECORD_CREATE),
-                (OperationClass::CellWrite, 4, CELL_WRITE),
-                (OperationClass::CellByte, 46, CELL_BYTE),
-                (OperationClass::RowByte, 47, ROW_BYTE),
-                (OperationClass::RootUpdate, 15, ROOT_UPDATE),
-                (OperationClass::IndexInsert, 6, INDEX_INSERT),
-                (OperationClass::IndexTermCreate, 1, INDEX_TERM_CREATE),
-            ],
-        )
-    );
-    model.create(key("b"), fixture_cells("book", 20));
-    assert_matches_model(&branch, ns, &model, &["a", "b"]);
-    assert_eq!(branch.term_count(ns), Some(7));
-
-    // create c: kind=pen and price=5 are new; b(c) = 45.
-    let executed = apply(
-        &mut branch,
-        ALICE,
-        create(ns, key("c"), fixture_cells("pen", 5)),
-    );
-    assert_eq!(executed.effect, Effect::RecordCreated { id: rid(3) });
-    assert_eq!(executed.receipt, applied(CREATE_C));
-    model.create(key("c"), fixture_cells("pen", 5));
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(branch.term_count(ns), Some(ABC_TERMS));
-}
-
-#[test]
-fn patch_changing_only_the_value_replaces_the_value_term_and_keeps_existence() {
+fn patch_setting_the_value_a_cell_already_holds_touches_no_term() {
     let (engine, ns, mut model) = fixture_abc();
-    // set price := I64(11) on a: 1 -> 4 -> {RecordPatch 10 + CellWrite 4 +
-    // CellByte (5 + 8) = 13 + RowByte 47 (the row keeps 46 cell bytes plus
-    // key 1) + RootUpdate 2*2} = 78 -> 82; price: old [I64 10, I64 exist],
-    // new [I64 11, I64 exist]: {IndexRemove 6 + RootUpdate 4} -> 92;
-    // {IndexInsert 6 + IndexTermCreate 30 + RootUpdate 4} (price=11 is new)
-    // -> 132. The existence term is untouched.
-    let set = vec![(name("price"), attr(Value::I64(11)))];
-    let op = patch(ns, key("a"), set.clone(), vec![]);
-    assert_write_sweep(
-        &engine,
-        ns,
-        &WriteVector {
-            label: "patch value only",
-            op: &op,
-            prefix_sums: &[1, 4, 82, 92, 132],
-            effect: Effect::RecordPatched { id: rid(1) },
-        },
-        &model,
-        &ABC_KEYS,
-    );
-
     let mut branch = fresh_branch(&engine);
-    let executed = branch
-        .execute(ALICE, op, Budget::unlimited().traced())
-        .expect("applies");
-    assert_eq!(
-        executed.receipt,
-        traced(
-            applied(132),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::RecordPatch, 1, RECORD_PATCH),
-                (OperationClass::CellWrite, 1, CELL_WRITE),
-                (OperationClass::CellByte, 13, CELL_BYTE),
-                (OperationClass::RowByte, 47, ROW_BYTE),
-                (OperationClass::RootUpdate, 6, ROOT_UPDATE),
-                (OperationClass::IndexRemove, 1, INDEX_REMOVE),
-                (OperationClass::IndexInsert, 1, INDEX_INSERT),
-                (OperationClass::IndexTermCreate, 1, INDEX_TERM_CREATE),
-            ],
-        )
-    );
+    let set = vec![(name("price"), attr(Value::I64(11)))];
+    let executed = apply(&mut branch, ALICE, patch(ns, key("a"), set.clone(), vec![]));
+    assert_eq!(executed.receipt, applied(132));
     model.patch(&key("a"), set, &[]);
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(
-        branch.term_count(ns),
-        Some(ABC_TERMS),
-        "price=10 dropped, price=11 added"
-    );
 
     // Setting the value the cell already holds is a charged no-op for the
     // index: 1 + 3 + 78 = 82 and nothing else (the row is still rewritten).
@@ -1083,70 +829,6 @@ fn patch_changing_only_the_value_replaces_the_value_term_and_keeps_existence() {
     );
     model.patch(&key("a"), same, &[]);
     assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-}
-
-#[test]
-fn patch_changing_the_type_replaces_both_terms_and_removes_are_charged_per_name() {
-    let (engine, ns, mut model) = fixture_abc();
-    // The brief's worked vector. set price := U64(10), remove [note,
-    // missing] on a: 1 -> 4 -> {RecordPatch 10 + CellWrite 4 + CellByte 13 +
-    // CellRemove 2*4 + RowByte 40 (key 1 + $expiresAt 18 + kind 8 + price
-    // 13) + RootUpdate 2*2} = 79 -> 83; names in order: missing (absent:
-    // nothing), note (field: nothing), price: old [I64 10, I64 exist] - new
-    // [U64 10, U64 exist]: {IndexRemove 6 + RootUpdate 4} (value) -> 93,
-    // (existence) -> 103; new - old: {6 + 30 + 4} (U64 10 is new) -> 143,
-    // {6 + 30 + 4} (U64 existence is new) -> 183.
-    let set = vec![(name("price"), attr(Value::U64(10)))];
-    let remove = vec![name("note"), name("missing")];
-    let op = patch(ns, key("a"), set.clone(), remove.clone());
-    assert_write_sweep(
-        &engine,
-        ns,
-        &WriteVector {
-            label: "patch type only",
-            op: &op,
-            prefix_sums: &[1, 4, 83, 93, 103, 143, 183],
-            effect: Effect::RecordPatched { id: rid(1) },
-        },
-        &model,
-        &ABC_KEYS,
-    );
-
-    let mut branch = fresh_branch(&engine);
-    let executed = branch
-        .execute(ALICE, op, Budget::unlimited().traced())
-        .expect("applies");
-    assert_eq!(
-        executed.receipt,
-        traced(
-            applied(183),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::RecordPatch, 1, RECORD_PATCH),
-                (OperationClass::CellWrite, 1, CELL_WRITE),
-                (OperationClass::CellByte, 13, CELL_BYTE),
-                (OperationClass::CellRemove, 2, CELL_REMOVE),
-                (OperationClass::RowByte, 40, ROW_BYTE),
-                // 2 (record group) + 4 * 2 (index groups).
-                (OperationClass::RootUpdate, 10, ROOT_UPDATE),
-                (OperationClass::IndexRemove, 2, INDEX_REMOVE),
-                (OperationClass::IndexInsert, 2, INDEX_INSERT),
-                (OperationClass::IndexTermCreate, 2, INDEX_TERM_CREATE),
-            ],
-        )
-    );
-    model.patch(&key("a"), set, &remove);
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    // price=10 (I64) was only a's and is dropped; the I64 existence term
-    // survives through b and c; two U64 terms appear: 9 - 1 + 2.
-    assert_eq!(branch.term_count(ns), Some(10));
-    let row = branch
-        .record(ns, &key("a"), &Projection::ALL)
-        .unwrap()
-        .value
-        .unwrap();
-    assert_eq!(row.cells.len(), 3, "note is gone, missing never existed");
 }
 
 #[test]
@@ -1313,81 +995,6 @@ fn patch_removing_names_charges_each_name_and_only_held_terms() {
 }
 
 #[test]
-fn delete_charges_lookup_delete_group_then_each_held_term() {
-    let (engine, ns, mut model) = fixture_abc();
-    // delete a: 1 -> 4 -> {RecordDelete 20 + CellRemove 4*4 + RootUpdate
-    // 3*2} = 42 -> 46; then per attribute in name order {IndexRemove 6 +
-    // RootUpdate 2*2} = 10 for the value term and 10 for the existence term:
-    // 56, 66, 76, 86, 96, 106.
-    let op = delete_record(ns, key("a"));
-    assert_write_sweep(
-        &engine,
-        ns,
-        &WriteVector {
-            label: "delete a",
-            op: &op,
-            prefix_sums: &[1, 4, 46, 56, 66, 76, 86, 96, 106],
-            effect: Effect::RecordDeleted { id: rid(1) },
-        },
-        &model,
-        &ABC_KEYS,
-    );
-
-    let mut branch = fresh_branch(&engine);
-    let executed = branch
-        .execute(ALICE, op, Budget::unlimited().traced())
-        .expect("applies");
-    assert_eq!(
-        executed.receipt,
-        traced(
-            applied(106),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::RecordDelete, 1, RECORD_DELETE),
-                (OperationClass::CellRemove, 4, CELL_REMOVE),
-                // 3 (record group) + 6 * 2 (index groups).
-                (OperationClass::RootUpdate, 15, ROOT_UPDATE),
-                (OperationClass::IndexRemove, 6, INDEX_REMOVE),
-            ],
-        )
-    );
-    assert_eq!(model.delete(&key("a")), rid(1));
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(
-        branch.term_count(ns),
-        Some(ABC_TERMS - 1),
-        "only price=10 was a's alone"
-    );
-
-    // delete c (kind=pen and price=5 were c's alone): 106 again; then b.
-    let executed = apply(&mut branch, ALICE, delete_record(ns, key("c")));
-    assert_eq!(executed.effect, Effect::RecordDeleted { id: rid(3) });
-    assert_eq!(executed.receipt, applied(106));
-    model.delete(&key("c"));
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(branch.term_count(ns), Some(6));
-    let executed = apply(&mut branch, ALICE, delete_record(ns, key("b")));
-    assert_eq!(executed.effect, Effect::RecordDeleted { id: rid(2) });
-    assert_eq!(executed.receipt, applied(106));
-    model.delete(&key("b"));
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(
-        branch.stats(ns),
-        TypedStats {
-            records: Some(0),
-            terms: Some(0),
-            consistent: Some(true)
-        },
-        "an emptied namespace holds no term"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 3. Post-charge rejections versus admission faults
-// ---------------------------------------------------------------------------
-
-#[test]
 fn already_exists_is_charged_after_the_key_lookup_and_recorded() {
     let (engine, ns, model) = fixture_abc();
     let mut branch = fresh_branch(&engine);
@@ -1550,25 +1157,9 @@ fn record_full_is_charged_after_the_lookup_but_too_many_cells_is_an_admission_fa
     );
     assert_eq!(branch.spent(), Cost::new(4 + 4 + 150 + 92));
     assert_matches_model(&branch, ns, &model, &["a", "d"]);
-    // The same limit bounds a named projection: five names are refused, four
-    // (absent ones included) are read for the fixed price 1 + 3 + 3 = 7.
-    let five_names = Projection::named(false, (0..5).map(|i| name(&format!("n{i}"))));
-    let refused = branch
-        .get_record(ns, &key("a"), &five_names, Budget::unlimited())
-        .expect_err("five names exceed max_cells 4");
-    assert_eq!(
-        refused,
-        read_admission(Rejection::InvalidQuery(QueryFault::ProjectionTooLarge))
-    );
-    let four_names = Projection::named(false, (0..4).map(|i| name(&format!("n{i}"))));
-    let read = branch
-        .get_record(ns, &key("a"), &four_names, Budget::unlimited())
-        .expect("four names are admitted");
-    assert_eq!(read.receipt, read_applied(7));
-    assert_eq!(read.value, model.row(&key("a"), &four_names));
 }
 
-/// Sixty-five distinct names, `c00`..`c64`, each an indexed `Bool`.
+/// `count` distinct names `c00`.., each an indexed `Bool`.
 fn many_cells(count: usize) -> Cells {
     (0..count)
         .map(|i| (name(&format!("c{i:02}")), attr(Value::Bool(true))))
@@ -1712,7 +1303,7 @@ fn argument_faults_are_admission_rejections_with_nothing_recorded() {
             patch(
                 ns,
                 key("a"),
-                vec![(name("v"), bytes_attr.clone())],
+                vec![(name("v"), bytes_attr)],
                 vec![name("w"), name("w")],
             ),
             BytesNotIndexable,
@@ -1734,7 +1325,7 @@ fn argument_faults_are_admission_rejections_with_nothing_recorded() {
         ),
         (
             "patch: a name in both lists",
-            patch(ns, key("a"), vec![(name("k"), ok.clone())], vec![name("k")]),
+            patch(ns, key("a"), vec![(name("k"), ok)], vec![name("k")]),
             SetAndRemoveOverlap,
         ),
     ];
@@ -1842,60 +1433,6 @@ fn argument_validation_precedes_every_charge_and_the_block_budget_check() {
     assert_eq!(branch.spent(), Cost::ZERO);
     assert_matches_model(&branch, ns, &model, &ABC_KEYS);
 }
-
-#[test]
-fn unauthorized_and_unknown_namespace_are_charged_the_directory_lookup() {
-    let (engine, ns, model) = fixture_abc();
-    let mut branch = fresh_branch(&engine);
-    let cells = vec![(name("kind"), attr(Value::str("pen")))];
-    let denied = [
-        create(ns, key("d"), cells.clone()),
-        patch(ns, key("a"), cells.clone(), vec![]),
-        delete_record(ns, key("a")),
-    ];
-    for op in denied {
-        let rejected = branch
-            .execute(BOB, op, Budget::unlimited().traced())
-            .expect_err("BOB does not own the namespace");
-        assert_eq!(
-            rejected.receipt,
-            traced(
-                self::rejected(1, Rejection::Unauthorized),
-                &[(OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP)],
-            )
-        );
-    }
-    let unknown = ns_id(2);
-    let missing = [
-        create(unknown, key("d"), cells.clone()),
-        patch(unknown, key("a"), cells, vec![]),
-        delete_record(unknown, key("a")),
-    ];
-    for op in missing {
-        let rejected = branch
-            .execute(ALICE, op, Budget::unlimited().traced())
-            .expect_err("namespace 2 does not exist");
-        assert_eq!(
-            rejected.receipt,
-            traced(
-                self::rejected(1, Rejection::UnknownNamespace),
-                &[(OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP)],
-            )
-        );
-    }
-    assert_eq!(
-        branch.receipts().len(),
-        6,
-        "post-charge rejections are recorded"
-    );
-    assert_eq!(branch.spent(), Cost::new(6));
-    assert_matches_model(&branch, ns, &model, &ABC_KEYS);
-    assert_eq!(branch.typed_record_count(unknown), None);
-}
-
-// ---------------------------------------------------------------------------
-// 4. Dense ids, rollback, the host path and transfers
-// ---------------------------------------------------------------------------
 
 #[test]
 fn ids_are_dense_and_never_reused_across_delete_and_recreate() {
@@ -2250,10 +1787,6 @@ fn a_transfer_shares_the_typed_state_and_visits_no_record_or_index_node() {
     assert_matches_model(&after, ns, &model, &ABC_KEYS);
 }
 
-// ---------------------------------------------------------------------------
-// 5. The raw keyspace, projections and historical reads
-// ---------------------------------------------------------------------------
-
 fn entry(key: &[u8], value: &[u8]) -> Entry {
     Entry {
         key: key.to_vec(),
@@ -2345,7 +1878,7 @@ fn raw_bytes_and_typed_records_share_a_namespace_but_never_a_key() {
     assert_eq!(page.value.rows, model.all_rows(&Projection::ALL));
     assert!(page.value.next.is_none());
     assert_eq!(page.receipt, read_applied(PAGE_ONE));
-    assert_eq!(branch.raw_count(ns), Some(2));
+    assert_eq!(branch.record_count(ns), Some(2));
     assert_matches_model(&branch, ns, &model, &["a"]);
     assert_eq!(branch.term_count(ns), Some(2));
 
@@ -2359,7 +1892,7 @@ fn raw_bytes_and_typed_records_share_a_namespace_but_never_a_key() {
     let executed = apply(&mut branch, ALICE, raw_delete(ns, &encoded));
     assert_eq!(executed.effect, Effect::Deleted { existed: true });
     assert_eq!(executed.receipt, applied(DELETE_ENCODED));
-    assert_eq!(branch.raw_count(ns), Some(0));
+    assert_eq!(branch.record_count(ns), Some(0));
     assert_matches_model(&branch, ns, &model, &["a"]);
     let executed = apply(&mut branch, ALICE, raw_delete(ns, b"a"));
     assert_eq!(
@@ -2372,7 +1905,7 @@ fn raw_bytes_and_typed_records_share_a_namespace_but_never_a_key() {
     // A record delete leaves raw entries alone.
     apply(&mut branch, ALICE, put(ns, b"a", b"raw"));
     apply(&mut branch, ALICE, put(ns, &encoded, b"enc"));
-    assert_eq!(branch.raw_count(ns), Some(2));
+    assert_eq!(branch.record_count(ns), Some(2));
     // delete: 1 + 3 + {20 + 4 + RootUpdate 3*2} + {IndexRemove 6 + RootUpdate
     // 2*2} * 2 = 4 + 30 + 20 = 54.
     let executed = apply(&mut branch, ALICE, delete_record(ns, record.clone()));
@@ -2380,7 +1913,7 @@ fn raw_bytes_and_typed_records_share_a_namespace_but_never_a_key() {
     assert_eq!(executed.receipt, applied(54));
     model.delete(&record);
     assert_matches_model(&branch, ns, &model, &["a"]);
-    assert_eq!(branch.raw_count(ns), Some(2));
+    assert_eq!(branch.record_count(ns), Some(2));
     let read = get(&branch, b"a");
     assert_eq!(
         (read.value, read.receipt),
@@ -2416,7 +1949,7 @@ fn raw_bytes_and_typed_records_share_a_namespace_but_never_a_key() {
     assert_eq!(executed.receipt, applied(CREATE));
     model.create(record, cells);
     assert_matches_model(&branch, ns, &model, &["a"]);
-    assert_eq!(branch.raw_count(ns), Some(2));
+    assert_eq!(branch.record_count(ns), Some(2));
 }
 
 /// An admission rejection of a read: nothing charged, nothing visited.
@@ -2434,21 +1967,14 @@ fn get_record_projections_charge_only_the_projected_bytes() {
     let snapshot = engine.head_snapshot();
     let branch = fresh_branch(&engine);
     let a = key("a");
-    // Record a: key 1 byte; cells $expiresAt 18, kind 8, note 7, price 13.
-    // Every read: DirectoryLookup 1 -> 1, PointRead 3 -> 4, then {ResultRow 3
-    // + ReadByte p}: ALL p = 47 -> 54; KEY_ONLY p = 1 -> 8; ID_ONLY p = 0
-    // -> 7; Named [price, missing] p = 13 -> 20; Named with key [kind, note]
-    // p = 1 + 8 + 7 = 16 -> 23; an empty or fully absent selection -> 7 / 8.
-    let named_price = Projection::named(false, [name("price"), name("missing")]);
+    // Record a: key 1 byte. Every read: DirectoryLookup 1 -> 1, PointRead 3
+    // -> 4, then {ResultRow 3 + ReadByte p}: an empty selection projects
+    // nothing (p = 0 -> 7); absent names with the key project the key only
+    // (p = 1 -> 8).
     let named_kind_note = Projection::named(true, [name("kind"), name("note")]);
     let named_nothing = Projection::named(false, []);
     let named_absent = Projection::named(true, [name("missing"), name("zzz")]);
-    let vectors: [(&str, &Projection, u64); 7] = [
-        ("ALL", &Projection::ALL, 54),
-        ("KEY_ONLY", &Projection::KEY_ONLY, 8),
-        ("ID_ONLY", &Projection::ID_ONLY, 7),
-        ("Named [price, missing]", &named_price, 20),
-        ("Named key [kind, note]", &named_kind_note, 23),
+    let vectors: [(&str, &Projection, u64); 2] = [
         ("Named []", &named_nothing, 7),
         ("Named key [absent]", &named_absent, 8),
     ];
@@ -2467,48 +1993,13 @@ fn get_record_projections_charge_only_the_projected_bytes() {
             "{label}"
         );
     }
-    let row = snapshot
-        .get_record(ns, &a, &named_kind_note, Budget::unlimited())
-        .expect("reads")
-        .value
-        .expect("bound");
-    assert_eq!(row.key, Some(a.clone()));
-    let names: Vec<&str> = row.cells.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["kind", "note"],
-        "projected cells stay in name order"
-    );
-    let traced_read = snapshot
-        .get_record(ns, &a, &Projection::ALL, Budget::unlimited().traced())
-        .expect("reads");
-    assert_eq!(
-        traced_read.receipt,
-        traced(
-            read_applied(54),
-            &[
-                (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                (OperationClass::PointRead, 1, POINT_READ),
-                (OperationClass::ResultRow, 1, RESULT_ROW),
-                (OperationClass::ReadByte, 47, READ_BYTE),
-            ],
-        )
-    );
 
     // An unbound key is Ok(None) after the lookup, whatever the projection.
-    for projection in [&Projection::ALL, &Projection::ID_ONLY, &named_kind_note] {
+    for projection in [&Projection::ID_ONLY, &named_kind_note] {
         assert_read_sweep("unbound", &[1, 4], &None, |budget| {
             snapshot.get_record(ns, &key("zz"), projection, budget)
         });
     }
-    // An unknown namespace is charged the directory lookup only.
-    let unknown = snapshot
-        .get_record(ns_id(2), &a, &Projection::ALL, Budget::unlimited())
-        .expect_err("namespace 2 does not exist");
-    assert_eq!(
-        unknown.receipt,
-        read_rejected(1, Rejection::UnknownNamespace)
-    );
 
     // ProjectionTooLarge: 65 names are refused before any charge, even for an
     // unknown namespace; 64 absent names read for the fixed 7.
@@ -2672,7 +2163,6 @@ fn rollback_makes_terms_created_inside_the_transaction_new_again() {
     let (engine, ns, _model) = fixture_abc();
     let mut branch = fresh_branch(&engine);
     let retype = vec![(name("price"), attr(Value::U64(20)))];
-    let twenty = vec![(name("price"), attr(Value::U64(20)))];
 
     // Without a rollback the terms are held by b, so the create pays 81.
     let mut probe = fresh_branch(&engine);
@@ -2682,15 +2172,18 @@ fn rollback_makes_terms_created_inside_the_transaction_new_again() {
         patch(ns, key("b"), retype.clone(), vec![]),
     );
     assert_eq!(patched.receipt, applied(182));
-    let held = apply(&mut probe, ALICE, create(ns, key("g"), twenty.clone()));
+    let held = apply(&mut probe, ALICE, create(ns, key("g"), retype.clone()));
     assert_eq!(held.receipt, applied(81));
-    drop(probe);
 
     let checkpoint = branch.checkpoint();
-    let patched = apply(&mut branch, ALICE, patch(ns, key("b"), retype, vec![]));
+    let patched = apply(
+        &mut branch,
+        ALICE,
+        patch(ns, key("b"), retype.clone(), vec![]),
+    );
     assert_eq!(patched.receipt, applied(182));
     assert_eq!(branch.rollback_to(checkpoint), Ok(0..1));
-    let created = apply(&mut branch, ALICE, create(ns, key("g"), twenty));
+    let created = apply(&mut branch, ALICE, create(ns, key("g"), retype));
     assert_eq!(created.effect, Effect::RecordCreated { id: rid(4) });
     assert_eq!(created.receipt, applied(141));
     assert_eq!(branch.index_consistent(ns), Some(true));

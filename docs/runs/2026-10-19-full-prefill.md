@@ -1,5 +1,13 @@
 # Full Ethereum prefill Docker run
 
+> Dated run record, kept as written apart from machine paths (`$REPO` is this
+> checkout, `$WORK` the operator's run directory). It used the payload-era
+> Sourcify converter and runner scripts (row codec 2, `sourcify-prefill.py`,
+> `run-full-prefill.py`, `full-prefill-bootstrap.py`), which have since been
+> removed: current nodes accept only row codec 3, written by
+> [`scripts/sourcify-v4-prefill.py`](../sourcify-v4-prefill.md). The commands
+> below are a record, not instructions.
+
 Started October 19, 2026 as detached container
 `arkiv-experiment-full-7m-20261019`. This is the full **7,889,852-contract,
 15,298,744-entity** processor export, not the imported 1m sample used for the
@@ -26,10 +34,10 @@ launch. The R2 credential file is mounted read-only; credentials are not in logs
 tracked files or the plan. Download credentials are removed from the process
 environment before handing off to conversion, though the mount remains present.
 
-The job directory on this host is:
+The job directory is:
 
 ```
-/home/ubuntu/arkiv-network/operations/runs/full-prefill-20261019
+$WORK/full-prefill-20261019
 ```
 
 Its `plan.json` pins the source and resource settings. `snapshot/bootstrap.py`
@@ -100,7 +108,7 @@ The runner now builds the genesis state database once. `stream-build` receives
 `--state-out <out>/genesis-state`, and the producer receives
 `--prebuilt-state <out>/genesis-state`. The producer renames the verified store
 into `node/prefill-work` and installs it without normalization or index
-construction; see [Build once](streaming-genesis-v2.md#build-once-prebuilt-state).
+construction; see [Build once](../streaming-genesis-v2.md#build-once-prebuilt-state).
 On the October 19 full run that removes about 7.2 h of producer work
 (5,499 s normalization plus 20,441 s indexes in `stream-build`, both repeated by
 the producer), leaving the stream audits and the final installation copy.
@@ -136,15 +144,15 @@ The run above uses the default `dependency-safe` expiry policy: finite heights
 up to 6,307,200 (146 days at its 2-second blocks), ordered by a single-threaded
 dependency graph. A rerun with `--expiry-policy far-future` gives every entity a
 height near 10^12 and skips the graph. See
-[Sourcify prefill conversion](sourcify-prefill-converter.md#far-future-expiry---expiry-policy-far-future).
+[Sourcify prefill conversion](../streaming-genesis-v2.md#row-expiry).
 It needs a new base genesis whose profile admits that lifetime. That is
-[examples/far-future-prefill](examples/far-future-prefill): the original base
+[examples/far-future-prefill](../examples/far-future-prefill): the original base
 with `max_lifetime = 1000000000000` and a new run ID. No node binary change is
 required.
 
 ```sh
-OLD=/home/ubuntu/arkiv-network/operations/runs/full-prefill-20261019
-RUN=/home/ubuntu/arkiv-network/operations/runs/full-prefill-far-future-YYYYMMDD
+OLD=$WORK/full-prefill-20261019
+RUN=$WORK/full-prefill-far-future-YYYYMMDD
 REPO=/path/to/this/checkout
 mkdir -p "$RUN/snapshot" "$RUN/genesis-src"
 cp "$REPO"/docs/examples/far-future-prefill/{chain.toml,far-future-glm-v2.toml} "$RUN/genesis-src/"
@@ -186,17 +194,17 @@ alone.
 `--expiry-policy unlimited` makes every entity permanent: each row gets the
 `u64::MAX` never-expires sentinel, there is no dependency graph and no rent
 (`rentWei` and the bundle's `burnedWei` are `0`). See
-[Sourcify prefill conversion](sourcify-prefill-converter.md#unlimited-expiry---expiry-policy-unlimited).
+[Sourcify prefill conversion](../streaming-genesis-v2.md#row-expiry).
 It needs a node binary with permanent-prefill support and a new base genesis
 authored with `[prefill] allow_permanent = true`, which is
-[examples/unlimited-prefill](examples/unlimited-prefill): the far-future base's
+[examples/unlimited-prefill](../examples/unlimited-prefill): the far-future base's
 chain ID, allocation, block period and sponsor with the standard profile and a
 new run ID. `genesis stream-build` on that base commits a version-4
 permanent-prefill launch; any other base rejects the stream before building.
 
 ```sh
-OLD=/home/ubuntu/arkiv-network/operations/runs/full-prefill-20261019
-RUN=/home/ubuntu/arkiv-network/operations/runs/full-prefill-unlimited-YYYYMMDD
+OLD=$WORK/full-prefill-20261019
+RUN=$WORK/full-prefill-unlimited-YYYYMMDD
 REPO=/path/to/this/checkout   # built with permanent-prefill support
 BIN="$REPO/target/release/arkiv-proposer"
 mkdir -p "$RUN/snapshot" "$RUN/genesis-src"

@@ -1,5 +1,7 @@
-//! Version-two file-backed prefill with bounded external-sort genesis construction.
+//! File-backed (`ARKPFL02`) prefill, launch versions 2 and 4, with bounded
+//! external-sort genesis construction.
 //! Live execution is not used to build or update intermediate import states.
+
 use crate::{
     genesis_bundle::{PrefillEntity, PrefillLaunch, PrefillLimits, recipe_hash},
     signed::protocol::SignedGenesis,
@@ -20,9 +22,11 @@ use std::{
 pub use crate::genesis_import_resources::{check_disk, import_redb_config};
 
 type Result<T> = std::result::Result<T, String>;
+
 fn err(e: impl std::fmt::Debug) -> String {
     format!("streaming prefill: {e:?}")
 }
+
 pub const STREAM_DOMAIN: &str = "arkiv/prefill-stream/v2";
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// The most user attributes of one row, as in a live create.
@@ -40,6 +44,7 @@ pub(crate) struct Progress {
     total_rows: u64,
     total_bytes: u64,
 }
+
 impl Progress {
     pub(crate) fn new(stage: &'static str, total_rows: u64, total_bytes: u64) -> Self {
         Self {
@@ -50,6 +55,7 @@ impl Progress {
             total_bytes,
         }
     }
+
     pub(crate) fn report(
         &mut self,
         rows: u64,
@@ -106,11 +112,13 @@ pub struct StreamReader<R> {
     max_bytes: u64,
     permanent: bool,
 }
+
 impl<R: Read> StreamReader<R> {
     /// A reader for a finite-expiry (version-2) launch.
     pub fn new(reader: R, limits: PrefillLimits) -> Result<Self> {
         Self::with_policy(reader, limits, false)
     }
+
     /// A reader under a launch policy: `permanent` (version 4) also admits
     /// rows whose expiry is the permanent sentinel `u64::MAX`.
     pub fn with_policy(mut reader: R, limits: PrefillLimits, permanent: bool) -> Result<Self> {
@@ -141,9 +149,7 @@ impl<R: Read> StreamReader<R> {
             permanent,
         })
     }
-    pub fn prefix_hash(&self) -> B256 {
-        self.hasher.clone().finalize()
-    }
+
     pub fn next_row(&mut self) -> Result<Option<PrefillEntity>> {
         if self.consumed == self.rows {
             return Ok(None);
@@ -193,6 +199,7 @@ impl<R: Read> StreamReader<R> {
         self.consumed += 1;
         Ok(Some(row))
     }
+
     pub fn finish(mut self) -> Result<StreamSummary> {
         if self.consumed != self.rows {
             return Err("unconsumed prefill rows".into());
@@ -208,6 +215,7 @@ impl<R: Read> StreamReader<R> {
         })
     }
 }
+
 fn validate_row(row: &PrefillEntity, permanent: bool) -> Result<()> {
     if row.expires_at_height == crate::genesis_bundle::PERMANENT_EXPIRY && !permanent {
         return Err(
@@ -232,9 +240,11 @@ fn validate_row(row: &PrefillEntity, permanent: bool) -> Result<()> {
     }
     Ok(())
 }
+
 pub fn audit_stream(path: &Path, limits: PrefillLimits) -> Result<StreamSummary> {
     audit_stream_with(path, limits, false)
 }
+
 /// [`audit_stream`] under a launch policy; see [`StreamReader::with_policy`].
 pub fn audit_stream_with(
     path: &Path,
@@ -243,6 +253,7 @@ pub fn audit_stream_with(
 ) -> Result<StreamSummary> {
     audit_file(&mut File::open(path).map_err(err)?, limits, permanent)
 }
+
 pub(crate) fn audit_file(
     file: &mut File,
     limits: PrefillLimits,
@@ -269,10 +280,12 @@ pub struct VerifiedStream {
     summary: StreamSummary,
     genesis_hash: B256,
 }
+
 impl VerifiedStream {
     pub fn open(g: &SignedGenesis, path: &Path) -> Result<Self> {
         Self::from_file(g, File::open(path).map_err(err)?)
     }
+
     /// Audit the actual descriptor the caller retained or copied.
     pub fn from_file(g: &SignedGenesis, mut file: File) -> Result<Self> {
         g.validate().map_err(err)?;
@@ -294,6 +307,7 @@ impl VerifiedStream {
             genesis_hash: g.hash(),
         })
     }
+
     /// Check that a newly retained hard link names the inode we audited. This is
     /// an association check, not a substitute for hashing mutable file contents.
     pub fn check_path_identity(&self, path: &Path) -> Result<()> {
@@ -331,8 +345,7 @@ pub(crate) fn import_identity(
         &bytes,
     )
 }
-// Retain the CLI byte option as a bounded ingestion tuning input. It never
-// selects transaction replay or changes canonical state.
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn bulk_build(
@@ -357,6 +370,7 @@ fn bulk_build(
         false,
     )
 }
+
 #[allow(clippy::too_many_arguments)]
 fn bulk_build_with(
     base: &SignedGenesis,
@@ -386,6 +400,7 @@ fn bulk_build_with(
 pub fn verify_stream_file(g: &SignedGenesis, stream: &Path) -> Result<()> {
     VerifiedStream::open(g, stream).map(|_| ())
 }
+
 /// Independently reconstruct an authenticated launch into a private bulk store.
 pub fn prepare_streaming(
     g: &SignedGenesis,
@@ -395,6 +410,7 @@ pub fn prepare_streaming(
 ) -> Result<DurableEngine> {
     prepare_verified_streaming(g, VerifiedStream::open(g, stream)?, work_dir, options)
 }
+
 /// Reuse an audit of the exact local inode, retaining end-to-end stream checks.
 pub fn prepare_verified_streaming(
     g: &SignedGenesis,
@@ -476,8 +492,8 @@ pub fn build_bundle_with_state(
     let mut base: SignedGenesis = decode_exact(&bytes).map_err(err)?;
     let permanent = base.prefill.as_ref().is_some_and(|p| p.permanent_prefill());
     base.prefill = None;
-    // v2 explicitly extends the cell profile; pricing and expiry reservation must
-    // already be selected by the caller's native genesis/profile constructor.
+    // A streaming launch always uses the widest cell profile; raise the block
+    // budget so the expiry reservation still fits.
     base.genesis.limits.max_cells = 64;
     let required =
         crate::params::max_expiry_delete_cost(&base.genesis.pricing, &base.genesis.limits)
@@ -583,6 +599,7 @@ pub fn build_bundle_with_state(
     File::open(parent).map_err(err)?.sync_all().map_err(err)?;
     Ok(report)
 }
+
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -592,9 +609,22 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes).map_err(err)?;
     file.sync_all().map_err(err)
 }
+
 pub fn summary_report(g: &SignedGenesis) -> Result<serde_json::Value> {
     let p = g.prefill.as_ref().ok_or("missing prefill")?;
-    let mut report = serde_json::json!({"version":p.version,"genesisHash":g.hash().to_string(),"stateRoot":p.state.root().to_string(),"recipeHash":p.recipe_hash.to_string(),"streamHash":p.stream_hash.to_string(),"rowCount":p.row_count.to_string(),"canonicalBytes":p.canonical_bytes.to_string(),"storageUnits":p.storage_units.to_string(),"burnedWei":p.burned_wei.to_string(),"sponsor":format!("0x{}",p.sponsor.iter().map(|b|format!("{b:02x}")).collect::<String>())});
+    let sponsor: String = p.sponsor.iter().map(|b| format!("{b:02x}")).collect();
+    let mut report = serde_json::json!({
+        "version": p.version,
+        "genesisHash": g.hash().to_string(),
+        "stateRoot": p.state.root().to_string(),
+        "recipeHash": p.recipe_hash.to_string(),
+        "streamHash": p.stream_hash.to_string(),
+        "rowCount": p.row_count.to_string(),
+        "canonicalBytes": p.canonical_bytes.to_string(),
+        "storageUnits": p.storage_units.to_string(),
+        "burnedWei": p.burned_wei.to_string(),
+        "sponsor": format!("0x{sponsor}"),
+    });
     // Absent for finite launches, whose reports are unchanged.
     if p.permanent_prefill() {
         report["permanentPrefill"] = serde_json::json!(true);
@@ -622,11 +652,13 @@ mod tests {
             Self(p)
         }
     }
+
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+
     fn base() -> SignedGenesis {
         SignedGenesis {
             genesis: default_native_genesis(9450, 1000, 1000),
@@ -642,6 +674,7 @@ mod tests {
             prefill: None,
         }
     }
+
     fn row(n: u64) -> PrefillEntity {
         PrefillEntity {
             creator: [2; 20],
@@ -661,6 +694,7 @@ mod tests {
             ],
         }
     }
+
     /// The same row with one byte of its unindexed `body` changed.
     fn flip_body(row: &mut PrefillEntity) {
         let Value::Bytes(body) = &row.attributes[0].1.value else {
@@ -670,6 +704,7 @@ mod tests {
         body[0] ^= 1;
         row.attributes[0].1 = Cell::field(Value::bytes(&body));
     }
+
     fn limits() -> PrefillLimits {
         PrefillLimits {
             max_entities: MAX_ENTITIES,
@@ -677,6 +712,7 @@ mod tests {
             max_storage_units: MAX_STORAGE_UNITS,
         }
     }
+
     fn stream(rows: &[PrefillEntity]) -> Vec<u8> {
         let mut b = b"ARKPFL02".to_vec();
         b.extend_from_slice(&crate::genesis_bundle::ROW_CODEC.to_be_bytes());
@@ -688,6 +724,7 @@ mod tests {
         }
         b
     }
+
     fn signed_stream(rows: &[PrefillEntity]) -> SignedGenesis {
         let mut g = crate::genesis_bundle::build_genesis(
             base(),
@@ -711,6 +748,7 @@ mod tests {
         g.validate().unwrap();
         g
     }
+
     /// Every fourth row finite (one per height), the rest permanent.
     fn mixed(n: u64) -> PrefillEntity {
         let mut r = row(n);
@@ -721,6 +759,7 @@ mod tests {
         };
         r
     }
+
     /// A version-4 launch whose state, burn and units come from the
     /// independent small (version-3) builder, which replays every row through
     /// live entity execution.
@@ -749,6 +788,7 @@ mod tests {
         g.validate().unwrap();
         g
     }
+
     #[test]
     fn reader_admits_permanent_rows_only_under_the_permanent_policy() {
         let rows = [mixed(0), mixed(1)];
@@ -775,6 +815,7 @@ mod tests {
             assert!(r.next_row().is_err());
         }
     }
+
     #[test]
     fn permanent_bulk_matches_v3_oracle_and_never_schedules_permanent_rows() {
         use arkiv_db::{Budget, Projection, RecordKey};
@@ -862,7 +903,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("permanent"), "{error}");
-        let mut finite = g.clone();
+        let mut finite = g;
         let mut l = finite.prefill.take().unwrap();
         l.version = 2;
         l.recipe_hash = recipe_hash(&finite, &l);
@@ -888,10 +929,12 @@ mod tests {
             None
         );
     }
+
     /// The audited summary of a file under the permanent policy.
     fn summary_of(path: &Path) -> StreamSummary {
         audit_stream_with(path, limits(), true).unwrap()
     }
+
     #[test]
     fn build_bundle_inherits_the_policy_from_its_base_genesis() {
         let tmp = Temp::new();
@@ -986,6 +1029,7 @@ mod tests {
         );
         assert_ne!(v2.hash(), v4.hash());
     }
+
     #[test]
     fn verified_descriptor_survives_path_replacement_and_standalone_verify_reaudits() {
         let tmp = Temp::new();
@@ -1009,6 +1053,7 @@ mod tests {
         assert!(verify_stream_file(&g, &path).is_err());
         assert!(prepare_streaming(&g, &path, &tmp.0.join("bad"), Options::default()).is_err());
     }
+
     #[test]
     fn verified_bulk_rejects_inode_mutation_truncation_and_changed_genesis() {
         let tmp = Temp::new();
@@ -1041,7 +1086,7 @@ mod tests {
         }
         fs::write(&path, valid).unwrap();
         let verified = VerifiedStream::open(&g, &path).unwrap();
-        let mut changed = g.clone();
+        let mut changed = g;
         changed.run_id[0] ^= 1;
         let mut launch = changed.prefill.take().unwrap();
         launch.recipe_hash = recipe_hash(&changed, &launch);
@@ -1056,6 +1101,7 @@ mod tests {
         .unwrap();
         assert_eq!(error, "verified prefill genesis mismatch");
     }
+
     #[test]
     fn retained_link_must_name_the_audited_inode() {
         let tmp = Temp::new();
@@ -1074,6 +1120,7 @@ mod tests {
         fs::hard_link(&original, &target).unwrap();
         verified.check_path_identity(&target).unwrap();
     }
+
     #[test]
     fn verified_finalized_restart_still_checks_prefix_and_derived_state() {
         let tmp = Temp::new();
@@ -1100,13 +1147,14 @@ mod tests {
         let resumed = prepare_streaming(&g, &path, &work, Options::default()).unwrap();
         assert_eq!(resumed.head_snapshot().state_header(), state);
         drop(resumed);
-        let mut changed = g.clone();
+        let mut changed = g;
         changed.prefill.as_mut().unwrap().burned_wei += U256::from(1);
         let error = prepare_streaming(&changed, &path, &work, Options::default())
             .err()
             .unwrap();
         assert_eq!(error, "prefill derived state/rent mismatch");
     }
+
     #[test]
     fn bounded_reader_rejects_bad_order_frames_truncation_and_trailing() {
         let valid = stream(&[row(0), row(1)]);
@@ -1137,6 +1185,7 @@ mod tests {
             assert!(result.is_err());
         }
     }
+
     #[test]
     fn both_framings_admit_exactly_a_creates_attribute_count() {
         let with = |n: usize| {
@@ -1166,6 +1215,7 @@ mod tests {
         let mut r = StreamReader::new(bytes.as_slice(), limits()).unwrap();
         assert!(r.next_row().is_err());
     }
+
     #[test]
     fn old_payload_streams_and_flagged_bytes_are_refused() {
         // The payload-era codec in the header is refused outright.
@@ -1204,6 +1254,7 @@ mod tests {
         let mut r = StreamReader::new(bytes.as_slice(), limits()).unwrap();
         assert!(r.next_row().is_err());
     }
+
     #[test]
     fn bulk_matches_v1_oracle_across_progress_settings_and_reopen() {
         let tmp = Temp::new();
@@ -1243,6 +1294,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn bounded_object_flushes_preserve_state() {
         let tmp = Temp::new();
@@ -1283,6 +1335,7 @@ mod tests {
         );
         assert_eq!((burn, units), (normal_burn, normal_units));
     }
+
     #[test]
     fn rebuilds_incomplete_scratch_after_later_frame_failure() {
         let tmp = Temp::new();
@@ -1336,6 +1389,7 @@ mod tests {
         );
         assert_eq!((burn, units), (clean_burn, clean_units));
     }
+
     #[test]
     fn more_than_v1_rows_and_bulk_identity() {
         let tmp = Temp::new();
@@ -1372,6 +1426,7 @@ mod tests {
             .is_err()
         );
     }
+
     #[test]
     fn bulk_all_types_creators_counters_and_empty_match_oracle() {
         use arkiv_db::{Budget, Projection, RecordKey};
@@ -1469,6 +1524,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn bulk_rejects_protocol_engine_capacity_and_funding_violations() {
         let tmp = Temp::new();
@@ -1559,6 +1615,7 @@ mod tests {
             .is_err()
         );
     }
+
     #[test]
     fn bulk_completed_receipt_corruption_is_rejected() {
         let tmp = Temp::new();
@@ -1581,6 +1638,7 @@ mod tests {
         fs::write(&receipt, original).unwrap();
         drop(prepare_streaming(&g, &path, &work, Options::default()).unwrap());
     }
+
     #[test]
     fn bulk_lock_protects_scratch_and_legacy_checkpoint_is_never_selected() {
         let tmp = Temp::new();

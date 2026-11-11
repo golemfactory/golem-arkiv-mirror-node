@@ -131,17 +131,11 @@ pub enum DiskOp {
     SetLen,
 }
 
-/// Calls a [`CrashDisk`] has served, by kind.
+/// Call counts of a [`CrashDisk`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiskCounters {
-    /// Successful reads.
-    pub reads: u64,
-    /// Successful writes.
-    pub writes: u64,
     /// Successful syncs.
     pub syncs: u64,
-    /// Successful length changes.
-    pub set_lens: u64,
     /// Mutating calls attempted (writes, syncs, length changes), including
     /// failed ones: the numbering that [`CrashDisk::crash_after`] uses.
     pub mutating_calls: u64,
@@ -192,7 +186,6 @@ pub struct CrashDisk {
 }
 
 impl CrashDisk {
-    /// An empty device.
     pub fn new() -> Self {
         Self::default()
     }
@@ -278,11 +271,6 @@ impl CrashDisk {
     /// (see [`cut_off`](Self::cut_off)) and fails.
     pub fn crash_after(&self, calls: u64) {
         self.lock().crash_in = Some(calls);
-    }
-
-    /// Disarms a crash point that has not fired.
-    pub fn disarm_crash(&self) {
-        self.lock().crash_in = None;
     }
 
     /// Fails the call of kind `op` after letting `skip` such calls succeed,
@@ -499,13 +487,6 @@ pub struct CrashBackend {
     disk: CrashDisk,
 }
 
-impl CrashBackend {
-    /// The device this handle writes to.
-    pub fn disk(&self) -> &CrashDisk {
-        &self.disk
-    }
-}
-
 fn cut_error() -> io::Error {
     io::Error::other("device cut off (simulated power loss)")
 }
@@ -634,7 +615,6 @@ impl StorageBackend for CrashBackend {
             ));
         }
         out.copy_from_slice(&state.volatile[start..end]);
-        state.counters.reads += 1;
         Ok(())
     }
 
@@ -647,7 +627,6 @@ impl StorageBackend for CrashBackend {
         let op = LoggedOp::SetLen(len);
         apply(&mut state.volatile, &op);
         state.log.push(op);
-        state.counters.set_lens += 1;
         Ok(())
     }
 
@@ -675,7 +654,6 @@ impl StorageBackend for CrashBackend {
         };
         apply(&mut state.volatile, &op);
         state.log.push(op);
-        state.counters.writes += 1;
         Ok(())
     }
 }

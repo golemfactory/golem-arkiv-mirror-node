@@ -277,8 +277,8 @@ fn main() -> Res<()> {
             .map_err(|e| format!("prove_eq: {e:?}"))?;
         eq_bytes.push(proof.bytes.len());
     }
-    // Range proofs over the first attribute, from each sampled value up to
-    // (excluding) the next larger sample, capped by the proof limits.
+    // Range proofs for the point range [v, v] of sampled values of the first
+    // attribute.
     let mut range_bytes = Vec::new();
     let mut range_terms = Vec::new();
     let mut samples: Vec<&Value> = sample_values.iter().map(|(_, c)| &c.value).collect();

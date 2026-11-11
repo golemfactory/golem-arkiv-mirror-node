@@ -1,17 +1,17 @@
-# redb storage experiment (node step N2)
+# redb storage experiment
 
-Node step N2 of the [node and storage plan](node-storage-plan.md) evaluates
+This experiment evaluates
 redb as the first durable backend behind a narrow storage contract. This
 document fixes the pass criteria, describes what was built and how it was
 measured, and records the results with a verdict per gate. The experiment
-stores the objects, records and heads that callers commit; it does not
-persist the engine yet (N3) or run a durable node (N4).
+stores the objects, records and heads that callers commit. Persisting the
+engine and running a durable node were built on it afterwards (see the
+[durable engine](engine-storage-run.md)) and are outside this report.
 
 ## Pass criteria
 
-Gates 1–3 restate the criteria that the frozen N2 design brief (§5.2) fixed
-before N2 began. The criteria of gates 4–9 were written by the N2
-implementer during the experiment; this document was first committed
+Gates 1–3 restate criteria fixed before the experiment began. The criteria
+of gates 4–9 were written during the experiment; this document was first committed
 together with its results, so the history does not show them fixed before
 the measurements. After review, gate 8's criterion was corrected: it said
 that running out of space "applies nothing", which the evidence contradicts
@@ -202,8 +202,8 @@ made them about 40× slower. redb's `debug_assertions` stay on in tests.
   `StoreStats` per space.
 - **Real disk**: measurement files live under `ARKIV_BENCH_DIR`, Cargo's
   target temporary directory for tests, or `<workspace>/target/bench` for the
-  example — ext4 on this machine. `std::env::temp_dir()` is a RAM tmpfs here,
-  where `fsync` does nothing, and is never used.
+  example (ext4 for the reported numbers). `std::env::temp_dir()` may be a
+  RAM tmpfs, where `fsync` does nothing, and is never used.
 - **Profiles**: debug builds of redb walk every page on open (a
   `debug_assertions` check), so open I/O and cold-cache numbers come from
   release builds only. Times are wall-clock with the operating system's page
@@ -508,7 +508,8 @@ amplification at debug scale), example Gate 9.
 | 8. Disk full | Pass | Under both quota models and injected `ENOSPC`: always a `Full` outcome; `NotCommitted(Full)` never applied; `Indeterminate(Full)` decided by reconciliation; never applied twice; the identical batch commits exactly once when space returns |
 | 9. Write amplification | Measured | Fixed per-commit cost of about 65 KB and two syncs dominates small blocks |
 
-redb 4.3.0 with this layout is adopted as the storage engine for N3 and N4.
+redb 4.3.0 with this layout is adopted as the storage engine for the durable
+engine and the node.
 No fallback is needed for gates 1 and 3–8; gate 2 uses its named narrower
 claim.
 
@@ -522,14 +523,15 @@ claim.
   bound on their pages).
 - **Global catalog object table.** `objects_catalog` holds the catalog
   (directory) nodes of every namespace and every block, so its B-tree height
-  grows with total catalog history. N2 does not measure it because the
-  engine does not write it yet; N3 must measure directory reads through it.
+  grows with total catalog history. This experiment does not measure it;
+  the [engine measurements](engine-storage-v1-report.md) cover directory
+  reads through it.
 - **Allocator state.** With quick repair, every commit rewrites redb's whole
   allocator state and every open after a crash loads it; both grow with the
   file (152 KB read at open at 1.08 GB). Recovery is not constant in bytes.
 - **Fixed per-commit cost.** About 65 KB written and two syncs per commit
   even for an empty block; mostly-empty blocks at a fixed interval write a
-  steady stream (N4 must size block intervals and measure it).
+  steady stream (a node must size its block interval for it).
 - **Silent corruption.** redb verifies page checksums only during repair and
   integrity checks, not on normal reads (its B-tree lookup in
   `tree_store/btree.rs` descends pages without checking them). Object
@@ -559,7 +561,7 @@ claim.
   relies on redb 4.3.0 rewriting its header at reopen, and does not cover
   other kernels or page-cache eviction between the failure and the reopen.
   Quick repair must stay on; the node rules are in the
-  [plan](node-storage-plan.md#atomic-durable-publication-and-restart).
+  [durable engine guide](engine-storage-run.md#rules-for-a-host).
 - **Store creation.** `RedbStore::create` is crash-safe because the store
   appears under its name only by a rename after the initialization commit,
   followed by a directory sync; the rename's atomicity is the file system's,
@@ -572,7 +574,7 @@ claim.
   a warm operating-system page cache; open I/O only meaningful in release
   builds (debug redb walks the file on open).
 - **Not covered here.** No engine persistence, roots, manifests or node
-  integration (N3, N4); no compaction or pruning (the file only shrinks by
+  integration; no compaction or pruning (the file only shrinks by
   trailing free space); redb's own `unsafe` code and `libc` dependency are
   outside the workspace's `unsafe_code = "forbid"`.
 

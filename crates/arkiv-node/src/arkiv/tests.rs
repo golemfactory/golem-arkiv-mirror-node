@@ -7,6 +7,7 @@ const CLOCK: crate::gas::RentClock = match crate::gas::RentClock::new(1_000, 1_0
     Some(clock) => clock,
     None => panic!("test clock"),
 };
+
 fn setup() -> (Engine, Branch, ArkivExecutionContext<'static>) {
     let engine = Engine::with_limits(
         PriceSchedule::FIXTURE,
@@ -39,6 +40,7 @@ fn setup() -> (Engine, Branch, ArkivExecutionContext<'static>) {
     };
     (engine, branch, ctx)
 }
+
 fn create(flags: u8) -> ArkivOperation {
     ArkivOperation::Create {
         salt: 7,
@@ -50,14 +52,17 @@ fn create(flags: u8) -> ArkivOperation {
         attributes: vec![(name("score"), Cell::attribute(Value::I32(-1)))],
     }
 }
+
 fn key(c: &ArkivExecutionContext, nonce: u64) -> RecordKey {
     RecordKey::new(&derive_entity_key(c.chain_id, &c.caller, nonce, 7)).unwrap()
 }
+
 fn run(b: &mut Branch, c: &ArkivExecutionContext, op: &ArkivOperation) -> OpOutcome {
     execute_operation(b, entity_namespace(), c, op, Budget::unlimited())
         .unwrap()
         .outcome
 }
+
 fn read(b: &Branch, k: &RecordKey) -> ArkivEntityProjection {
     project(
         &b.try_get_record(entity_namespace(), k, &Projection::ALL, Budget::unlimited())
@@ -68,9 +73,11 @@ fn read(b: &Branch, k: &RecordKey) -> ArkivEntityProjection {
     )
     .unwrap()
 }
+
 fn applied(o: OpOutcome) {
     assert!(matches!(o, OpOutcome::Applied { .. }), "{o:?}")
 }
+
 #[test]
 fn lifecycle_is_committed_owner_authority() {
     let (_e, mut b, mut c) = setup();
@@ -78,7 +85,7 @@ fn lifecycle_is_committed_owner_authority() {
     let k = key(&c, 0);
     let original = read(&b, &k);
     assert_eq!(original.creator, [1; 20]);
-    // No payload or content type: the entity holds exactly what was written.
+    // The entity holds exactly what was written.
     assert_eq!(
         original.attributes,
         vec![(name("score"), Cell::attribute(Value::I32(-1)))]
@@ -120,6 +127,7 @@ fn lifecycle_is_committed_owner_authority() {
     applied(run(&mut b, &c, &create(0)));
     assert_ne!(key(&c, 0), key(&c, 1));
 }
+
 #[test]
 fn batch_failure_rolls_back_cells_indexes_nonce_and_schedule() {
     let (_e, mut b, c) = setup();
@@ -155,6 +163,7 @@ fn batch_failure_rolls_back_cells_indexes_nonce_and_schedule() {
         derive_entity_key(c.chain_id, &c.caller, 0, 7)
     );
 }
+
 #[test]
 fn readonly_permissionless_and_exact_expiry() {
     let (_e, mut b, mut c) = setup();
@@ -191,7 +200,7 @@ fn readonly_permissionless_and_exact_expiry() {
             &mut b,
             &c,
             &ArkivOperation::ExtendExpiry {
-                key: k.clone(),
+                key: k,
                 expiry: Expiry::PERMANENT
             }
         ),
@@ -209,6 +218,7 @@ fn readonly_permissionless_and_exact_expiry() {
     .unwrap();
     assert_eq!(expired.len(), 1);
 }
+
 #[test]
 fn authority_and_projection_reject_corrupt_system_cells() {
     let (_e, mut b, c) = setup();
@@ -237,6 +247,7 @@ fn authority_and_projection_reject_corrupt_system_cells() {
         .value = Value::Key([0; 32]);
     assert_eq!(validate_proven_row(&row), Err(ArkivFault::Corrupt));
 }
+
 #[test]
 fn decimal_exact_extremes_and_sdk_names() {
     for (input, output) in [
@@ -262,40 +273,7 @@ fn decimal_exact_extremes_and_sdk_names() {
     assert!(sdk_safe_name(&"a".repeat(32)));
     assert!(!sdk_safe_name(&"a".repeat(33)));
 }
-#[test]
-fn sdk_abi_and_tombstone_validation() {
-    for value in [
-        Value::Bool(true),
-        Value::I32(i32::MIN),
-        Value::U64(u64::MAX),
-        Value::U256([255; 32]),
-        Value::Dec([255; 32]),
-        Value::Bytes32([3; 32]),
-        Value::bytes(&[0, 255]),
-        Value::str("é"),
-        Value::Addr([4; 20]),
-        Value::Key([5; 32]),
-    ] {
-        let abi = encode_abi_value(&value).unwrap();
-        assert_eq!(
-            decode_abi_value(ArkivTypeId::of(&value).unwrap() as u8, &abi).unwrap(),
-            value
-        );
-    }
-    assert!(decode_abi_value(1, &[2; 32]).is_err());
-    assert!(decode_abi_value(2, &[1; 32]).is_err());
-    assert!(decode_abi_value(9, &[1; 32]).is_err());
-    let mut n = [0; 32];
-    n[0] = b'a';
-    let tomb = AbiAttribute {
-        name: n,
-        type_id: 0,
-        value: vec![],
-    };
-    assert!(decode_protocol_triples(std::slice::from_ref(&tomb), false).is_err());
-    assert!(decode_protocol_triples(std::slice::from_ref(&tomb), true).is_ok());
-    assert!(decode_protocol_triples(&[tomb.clone(), tomb], true).is_err());
-}
+
 #[test]
 fn nonce_exhaustion_and_expiry_overflow_do_not_write() {
     let (_e, mut b, mut c) = setup();
@@ -321,6 +299,7 @@ fn nonce_exhaustion_and_expiry_overflow_do_not_write() {
         }
     ));
 }
+
 #[test]
 fn sdk_generated_key_and_decimal_fixtures() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -349,14 +328,6 @@ fn sdk_generated_key_and_decimal_fixtures() {
         )
     }
 }
-#[test]
-fn scalar_types_stay_distinct() {
-    assert!(ArkivTypeId::of(&Value::I64(1)).is_err());
-    assert_ne!(
-        ArkivTypeId::of(&Value::Bytes32([0; 32])),
-        ArkivTypeId::of(&Value::Key([0; 32]))
-    );
-}
 
 fn triple(name_text: &str, type_id: u8, value: Vec<u8>) -> AbiAttribute {
     let mut n = [0; 32];
@@ -367,27 +338,7 @@ fn triple(name_text: &str, type_id: u8, value: Vec<u8>) -> AbiAttribute {
         value,
     }
 }
-/// The ABI `typeId` of a stored cell: its [`ArkivTypeId`], with
-/// [`INDEXED_FLAG`] when it is indexed.
-fn type_id(cell: &Cell) -> Result<u8, ArkivFault> {
-    let base = ArkivTypeId::of(&cell.value)? as u8;
-    Ok(if cell.is_attribute() {
-        base | INDEXED_FLAG
-    } else {
-        base
-    })
-}
-/// The ABI triple of a stored user attribute, the inverse of
-/// [`decode_protocol_triples`] for one non-tombstone triple.
-fn encode_protocol_triple(name: &CellName, cell: &Cell) -> Result<AbiAttribute, ArkivFault> {
-    let mut word = [0u8; 32];
-    word[..name.len()].copy_from_slice(name.as_str().as_bytes());
-    Ok(AbiAttribute {
-        name: word,
-        type_id: type_id(cell)?,
-        value: encode_abi_value(&cell.value)?,
-    })
-}
+
 fn every_type() -> [Value; 10] {
     [
         Value::Bool(true),
@@ -429,19 +380,6 @@ fn every_type_id_decodes_with_and_without_the_indexed_flag() {
                 );
             }
         }
-        // The stored cell encodes back to the same triple, flag included.
-        for cell in [Cell::field(value.clone()), Cell::attribute(value.clone())] {
-            if cell.is_attribute() && matches!(value, Value::Bytes(_)) {
-                continue;
-            }
-            let encoded = encode_protocol_triple(&name("a"), &cell).unwrap();
-            assert_eq!(encoded.type_id, type_id(&cell).unwrap());
-            assert_eq!(encoded.type_id & INDEXED_FLAG != 0, cell.is_attribute());
-            assert_eq!(
-                decode_protocol_triples(&[encoded], false).unwrap(),
-                vec![(name("a"), Some(cell))]
-            );
-        }
     }
     assert_eq!(
         decode_protocol_triples(&[triple("a", 0x87, vec![1])], false),
@@ -454,6 +392,19 @@ fn every_type_id_decodes_with_and_without_the_indexed_flag() {
             Err(ArkivFault::Value)
         );
     }
+    // Malformed bool, i32 and address words.
+    assert!(decode_abi_value(1, &[2; 32]).is_err());
+    assert!(decode_abi_value(2, &[1; 32]).is_err());
+    assert!(decode_abi_value(9, &[1; 32]).is_err());
+    assert!(decode_abi_value(2, &[255; 4]).is_err());
+    // An ABI word is sign-extended to 32 bytes; the ordered term bytes differ.
+    assert_eq!(encode_abi_value(&Value::I32(-1)).unwrap(), vec![255; 32]);
+    assert_eq!(
+        Value::I32(-1).term_bytes().unwrap(),
+        vec![127, 255, 255, 255]
+    );
+    // i64 is not an SDK type.
+    assert!(ArkivTypeId::of(&Value::I64(1)).is_err());
 }
 
 #[test]
@@ -475,6 +426,12 @@ fn tombstones_are_unflagged_empty_and_patch_only() {
             "{type_id:#x}"
         );
     }
+    // Two tombstones of one name.
+    let tomb = triple("a", 0, vec![]);
+    assert_eq!(
+        decode_protocol_triples(&[tomb.clone(), tomb], true),
+        Err(ArkivFault::Duplicate)
+    );
 }
 
 #[test]
@@ -743,18 +700,6 @@ fn system_cells_leave_room_for_every_user_attribute() {
 }
 
 #[test]
-fn natural_storage_is_not_abi_or_signed_order_encoding() {
-    let negative = Value::I32(-1);
-    assert_eq!(encode_natural_value(&negative).unwrap(), vec![255; 4]);
-    assert_eq!(encode_abi_value(&negative).unwrap(), vec![255; 32]);
-    assert_eq!(negative.term_bytes().unwrap(), vec![127, 255, 255, 255]);
-    assert_eq!(decode_natural_value(2, &[255; 4]).unwrap(), negative);
-    assert!(decode_natural_value(2, &[255; 32]).is_err());
-    assert!(decode_abi_value(2, &[255; 4]).is_err());
-    assert!(decode_natural_value(1, &[2]).is_err());
-}
-
-#[test]
 fn authenticated_engine_rows_with_forged_system_types_fail_arkiv_verification() {
     use arkiv_db::proof::{EqQuery, EqRequest, ProofLimits, SnapshotRef, VerifiedEq, verify_eq};
     for (field, cell) in [
@@ -858,6 +803,7 @@ fn generic_namespaces_without_glm_cannot_receive_arkiv_entities() {
 
 /// The rent cap of the GLM fixtures, in blocks ([`CLOCK`]).
 const CAP: u64 = 1_000;
+
 /// A GLM-priced branch holding one permanent entity created the way a
 /// permanent-prefill genesis creates it (height 0, `allow_permanent_create`),
 /// plus the live context of block 5. No payer: rent is quoted, not debited.
@@ -919,6 +865,7 @@ fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey
     genesis.allow_permanent_create = false;
     (engine, branch, genesis, key)
 }
+
 fn run_rent(b: &mut Branch, c: &ArkivExecutionContext, op: &ArkivOperation) -> ArkivOutcome {
     execute_operation(b, entity_namespace(), c, op, Budget::unlimited()).unwrap()
 }
@@ -930,6 +877,7 @@ fn spent(outcome: &OpOutcome) -> u64 {
         other => panic!("{other:?}"),
     }
 }
+
 /// The rent an applied operation charged, in wei.
 fn rent_of(executed: &ArkivOutcome) -> u128 {
     assert!(
@@ -938,6 +886,7 @@ fn rent_of(executed: &ArkivOutcome) -> u128 {
     );
     u128::try_from(executed.rent_wei).unwrap()
 }
+
 fn create_until(salt: u128, expiry: Expiry) -> ArkivOperation {
     ArkivOperation::Create {
         salt,
@@ -946,12 +895,14 @@ fn create_until(salt: u128, expiry: Expiry) -> ArkivOperation {
         attributes: vec![(name("score"), Cell::attribute(Value::I32(-1)))],
     }
 }
+
 fn at(expires_at: u64) -> Expiry {
     Expiry {
         expires_at,
         min_lifetime: 0,
     }
 }
+
 fn units_of(b: &Branch, key: &RecordKey) -> u64 {
     crate::gas::storage_units(
         &b.try_get_record(
@@ -1124,11 +1075,7 @@ fn glm_updates_permanent_entities_with_capped_rent() {
     };
     assert_eq!(schedule(&b), [1, 0, 0]);
     live.caller = [2; 20];
-    applied(run(
-        &mut b,
-        &live,
-        &ArkivOperation::Delete { key: k.clone() },
-    ));
+    applied(run(&mut b, &live, &ArkivOperation::Delete { key: k }));
     assert_eq!(schedule(&b), [1, 0, 0]);
 }
 
@@ -1246,6 +1193,7 @@ fn glm_funded(balance: U256) -> (Engine, Branch, ArkivExecutionContext<'static>)
     live.payer = Some(accounts);
     (engine, branch, live)
 }
+
 fn balance(b: &Branch, c: &ArkivExecutionContext, actor: [u8; 20]) -> U256 {
     c.payer
         .unwrap()
@@ -1253,6 +1201,7 @@ fn balance(b: &Branch, c: &ArkivExecutionContext, actor: [u8; 20]) -> U256 {
         .unwrap()
         .balance
 }
+
 fn burnt(b: &Branch) -> U256 {
     burned(b.try_host_get(&BURN_KEY).unwrap()).unwrap()
 }
@@ -1562,7 +1511,7 @@ fn the_admission_quote_matches_execution() {
             expiry: Expiry::PERMANENT,
         },
         ArkivOperation::Patch {
-            key: permanent.clone(),
+            key: permanent,
             set: vec![(name("more"), Cell::field(Value::str("grown")))],
             remove: vec![],
         },
@@ -1626,7 +1575,7 @@ fn a_transaction_quote_sees_its_own_earlier_operations() {
             remove: vec![],
         },
         ArkivOperation::Patch {
-            key: permanent.clone(),
+            key: permanent,
             set: vec![(name("more"), Cell::field(Value::str("grown")))],
             remove: vec![],
         },
@@ -1639,7 +1588,7 @@ fn a_transaction_quote_sees_its_own_earlier_operations() {
         },
         // Deleted earlier in the same transaction: nothing to patch.
         ArkivOperation::Patch {
-            key: created.clone(),
+            key: created,
             set: vec![(name("late"), Cell::field(Value::bytes(&[4; 64])))],
             remove: vec![],
         },

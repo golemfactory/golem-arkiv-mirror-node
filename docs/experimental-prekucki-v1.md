@@ -1,8 +1,9 @@
-# Experimental: variable-length prefix-free trie keys (prekucki-v1)
+# Trie keys: variable-length and prefix-free (state layout 2)
 
-Branch `experimental-prekucki-v1`. An experimental implementation of GitHub
-issue #1 ("Support variable-length trie keys and remove term-value padding")
-with a deliberately different trie design. `main` is unchanged.
+This is the key layout of the engine (`LAYOUT_VERSION = 2`). It implements
+GitHub issue #1 ("Support variable-length trie keys and remove term-value
+padding") with a deliberately different trie design, developed under the
+name `prekucki-v1`.
 
 ## Summary
 

@@ -123,7 +123,7 @@ fn typed_ranges_are_complete_in_record_order_with_exact_boundaries() {
         (Value::I64(11), true),
     ]);
     let (engine, model) = fixture(input);
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     let bounds = [
         Unbounded,
         Included(Value::U64(0)),
@@ -195,7 +195,7 @@ fn signed_numeric_extremes_and_each_supported_numeric_index() {
     ]);
     for values in groups {
         let (engine, model) = fixture(values.iter().cloned().map(|v| (v, true)).collect());
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         for value in values {
             for inclusive in [false, true] {
                 let bound = if inclusive {
@@ -225,7 +225,7 @@ fn signed_numeric_extremes_and_each_supported_numeric_index() {
 fn absent_namespace_attribute_type_and_empty_index_are_authenticated() {
     for input in [vec![], vec![(Value::U64(10), true), (Value::U64(20), true)]] {
         let (engine, _) = fixture(input);
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         let mut r = request(
             &snapshot,
             Included(Value::U64(12)),
@@ -255,7 +255,7 @@ fn absent_namespace_attribute_type_and_empty_index_are_authenticated() {
 #[test]
 fn unsupported_and_mixed_bounds_fail_before_reading() {
     let (engine, _) = fixture(vec![]);
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     for (lower, upper) in [
         (Unbounded, Unbounded),
         (Included(Value::U64(1)), Included(Value::I64(2))),
@@ -281,7 +281,7 @@ fn unsupported_and_mixed_bounds_fail_before_reading() {
 #[test]
 fn every_limit_fails_closed_and_never_becomes_a_partial_page() {
     let (engine, _) = fixture((0..65).map(|n| (Value::U64(n), true)).collect());
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     let all = request(&snapshot, Included(Value::U64(0)), Unbounded);
     assert_eq!(
         snapshot
@@ -446,7 +446,7 @@ fn omitted_terms_postings_rows_and_tampered_bindings_cannot_verify() {
             .map(|n| (Value::U64(n), true))
             .collect(),
     );
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     let r = request(
         &snapshot,
         Included(Value::U64(15)),
@@ -520,7 +520,7 @@ fn omitted_terms_postings_rows_and_tampered_bindings_cannot_verify() {
     let mut w = wire.clone();
     w.snapshot.height += 1;
     reject(w);
-    let mut w = wire.clone();
+    let mut w = wire;
     w.digest = B256::ZERO;
     reject(w);
     for end in 0..bytes.len() {
@@ -705,7 +705,7 @@ fn inspected_range_connects_exact_boundary_nodes_postings_and_rows() {
             .map(|n| (Value::U64(n), true))
             .collect(),
     );
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     let r = request(
         &snapshot,
         Included(Value::U64(10)),
@@ -721,8 +721,7 @@ fn inspected_range_connects_exact_boundary_nodes_postings_and_rows() {
     let leaves = interval.leaves.iter().flatten().collect::<Vec<_>>();
     // The excluded endpoint 20 is never included. Its leaf is not even
     // opened: exclusive endpoints compare whole keys, so the subtree whose
-    // smallest key is the endpoint itself is outside (the old fixed-width
-    // predecessor arithmetic had to open it).
+    // smallest key is the endpoint itself is outside.
     assert!(
         !leaves
             .iter()
@@ -848,7 +847,7 @@ fn thousand_row_ranges_are_complete_and_overflow_fails_closed() {
                 .map(|n| (Value::U64(if distinct { n } else { 7 }), true))
                 .collect(),
         );
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         let all = request(&snapshot, Included(Value::U64(0)), Unbounded);
         let caps = RangeProofLimits::default();
         assert_eq!(caps.max_rows, 1_000);
@@ -864,13 +863,12 @@ fn thousand_row_ranges_are_complete_and_overflow_fails_closed() {
         } else {
             fixture(vec![(Value::U64(7), true); 1_000])
         };
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         let query = request(
             &snapshot,
             Included(Value::U64(0)),
             Included(Value::U64(999)),
         );
-        let started = std::time::Instant::now();
         let bytes = snapshot
             .prove_range(
                 &query,
@@ -882,8 +880,6 @@ fn thousand_row_ranges_are_complete_and_overflow_fails_closed() {
             )
             .unwrap()
             .bytes;
-        let generation = started.elapsed();
-        let started = std::time::Instant::now();
         let VerifiedRange::Complete(result) =
             verify_range(&query, &bytes, caps, Limits::DEFAULT).unwrap()
         else {
@@ -891,11 +887,6 @@ fn thousand_row_ranges_are_complete_and_overflow_fails_closed() {
         };
         let rows = result.rows;
         assert_eq!(result.term_count, if distinct { 1_000 } else { 1 });
-        eprintln!(
-            "1000 rows distinct={distinct}: {} bytes; generation={generation:?}; verification={:?}",
-            bytes.len(),
-            started.elapsed()
-        );
         assert_eq!(rows, expected[..1_000]);
         assert!(
             verify_range(
@@ -941,7 +932,7 @@ fn range_scaling_experiment() {
                 .map(|n| (Value::U64(if distinct { n as u64 } else { 7 }), true))
                 .collect(),
         );
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         let query = request(&snapshot, Included(Value::U64(0)), Unbounded);
         let caps = RangeProofLimits {
             max_rows: count,
@@ -972,8 +963,8 @@ fn range_scaling_experiment() {
     }
 }
 
-/// Every golem-grid ordered type proves complete ranges in value order, in
-/// both profiles; other types in the same attribute never leak in.
+/// Every golem-grid ordered type proves complete ranges in value order;
+/// other types in the same attribute never leak in.
 #[test]
 fn golem_grid_ordered_types_prove_complete_ranges() {
     let f64v = |x: f64| Value::f64(x).unwrap();

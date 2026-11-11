@@ -1,5 +1,6 @@
 //! Private bulk genesis construction. Only complete state has a durable head;
 //! interrupted scratch is disposable and never becomes a chain publication.
+
 use crate::{
     accounts, arkiv,
     genesis_bundle::PrefillLimits,
@@ -27,12 +28,15 @@ use std::{
 type Result<T> = std::result::Result<T, String>;
 const SORT_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
+
 fn err(e: impl std::fmt::Display) -> String {
     format!("bulk prefill: {e}")
 }
+
 fn debug_err(e: impl std::fmt::Debug) -> String {
     format!("bulk prefill: {e:?}")
 }
+
 fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     let file = File::open(path).map_err(err)?;
     if file.metadata().map_err(err)?.len() > cap {
@@ -45,6 +49,7 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -54,11 +59,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes).map_err(err)?;
     file.sync_all().map_err(err)
 }
+
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(err)
 }
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Complete {
@@ -69,6 +76,7 @@ struct Complete {
     burn: String,
     checksum: String,
 }
+
 fn receipt_hash(genesis: &EngineGenesis, rows: u64, units: u64, burn: U256) -> String {
     let mut bytes = encode(genesis);
     bytes.extend_from_slice(&rows.to_be_bytes());
@@ -139,8 +147,8 @@ pub(crate) fn build_file(
     genesis.limits = base.genesis.limits;
     genesis.validate().map_err(err)?;
     let balance = base.accounts.initial_balance(OwnerId::new(sponsor));
-    // A separate marker prevents old incremental CURRENT/checkpoints from ever
-    // being interpreted as bulk output. The lock also covers scratch deletion.
+    // `bulk-v1/` keeps bulk output apart from anything else in the work
+    // directory. The lock also covers scratch deletion.
     let bulk = work_dir.join("bulk-v1");
     fs::create_dir_all(&bulk).map_err(err)?;
     let lock = OpenOptions::new()

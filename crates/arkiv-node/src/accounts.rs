@@ -1,5 +1,6 @@
 //! Fixed-price native GLM accounts. Absent records resolve to immutable genesis allocations.
 //! The signed genesis hash authenticates those defaults; host-trie records override them.
+
 use crate::{HostFault, OpOutcome, TxEnvelope, TxOp};
 use alloy_primitives::U256;
 use arkiv_db::{
@@ -19,6 +20,7 @@ pub enum AccountFault {
     Overflow,
     Unsupported,
 }
+
 impl Encode for AccountFault {
     fn encode_to(&self, e: &mut Encoder) {
         e.u8(match self {
@@ -28,6 +30,7 @@ impl Encode for AccountFault {
         });
     }
 }
+
 impl Decode for AccountFault {
     fn decode_from(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match d.u8()? {
@@ -41,11 +44,13 @@ impl Decode for AccountFault {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountConfig {
     pub gas_price_wei: u64,
     pub allocations: Vec<(OwnerId, U256)>,
 }
+
 impl AccountConfig {
     pub fn new(mut allocations: Vec<(OwnerId, U256)>) -> Result<Self, AccountFault> {
         allocations.sort_by_key(|(actor, _)| *actor);
@@ -56,6 +61,7 @@ impl AccountConfig {
         value.validate()?;
         Ok(value)
     }
+
     pub fn validate(&self) -> Result<(), AccountFault> {
         if self.gas_price_wei != GAS_PRICE_WEI
             || self.allocations.len() > MAX_ALLOCATIONS
@@ -67,17 +73,20 @@ impl AccountConfig {
         self.initial_supply()?;
         Ok(())
     }
+
     pub fn initial_supply(&self) -> Result<U256, AccountFault> {
         self.allocations.iter().try_fold(U256::ZERO, |sum, (_, n)| {
             sum.checked_add(*n).ok_or(AccountFault::Overflow)
         })
     }
+
     pub fn initial_balance(&self, actor: OwnerId) -> U256 {
         self.allocations
             .binary_search_by_key(&actor, |(a, _)| *a)
             .map(|i| self.allocations[i].1)
             .unwrap_or(U256::ZERO)
     }
+
     pub fn resolve(&self, actor: OwnerId, value: Option<Vec<u8>>) -> Result<Account, StorageError> {
         match value {
             None => Ok(Account {
@@ -87,9 +96,11 @@ impl AccountConfig {
             Some(b) => arkiv_db::decode_exact(&b).map_err(|_| corrupt()),
         }
     }
+
     pub fn read(&self, branch: &Branch, actor: OwnerId) -> Result<Account, StorageError> {
         self.resolve(actor, branch.try_host_get(&account_key(actor))?)
     }
+
     pub fn reserve(&self, branch: &mut Branch, tx: &TxEnvelope) -> Result<(), crate::ExecError> {
         let mut account = self.read(branch, tx.actor)?;
         account.balance = account
@@ -99,6 +110,7 @@ impl AccountConfig {
         put(branch, tx.actor, account)?;
         Ok(())
     }
+
     pub fn settle(
         &self,
         branch: &mut Branch,
@@ -126,6 +138,7 @@ impl AccountConfig {
             .map_err(|_| corrupt())?;
         Ok(())
     }
+
     /// Debits `amount` from `actor` and burns it: entity rent, which is not
     /// gas. The caller has checked the balance; a shortfall here is a broken
     /// invariant, never a user rejection.
@@ -152,6 +165,7 @@ impl AccountConfig {
             .map_err(|_| corrupt())?;
         Ok(())
     }
+
     pub fn transfer(
         &self,
         branch: &mut Branch,
@@ -206,6 +220,7 @@ impl AccountConfig {
         })
     }
 }
+
 impl Encode for AccountConfig {
     fn encode_to(&self, e: &mut Encoder) {
         e.u64(self.gas_price_wei);
@@ -216,6 +231,7 @@ impl Encode for AccountConfig {
         }
     }
 }
+
 impl Decode for AccountConfig {
     const MIN_ENCODED_LEN: usize = 12;
     fn decode_from(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -242,11 +258,13 @@ impl Decode for AccountConfig {
         Ok(v)
     }
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Account {
     pub nonce: u64,
     pub balance: U256,
 }
+
 impl Encode for Account {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(1);
@@ -254,6 +272,7 @@ impl Encode for Account {
         e.fixed(&self.balance.to_be_bytes::<32>());
     }
 }
+
 impl Decode for Account {
     const MIN_ENCODED_LEN: usize = 44;
     fn decode_from(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -269,18 +288,21 @@ impl Decode for Account {
         })
     }
 }
+
 pub fn account_key(actor: OwnerId) -> [u8; 32] {
     let mut k = [0; 32];
     k[..12].copy_from_slice(b"arkiv/glm/a/");
     k[12..].copy_from_slice(actor.as_bytes());
     k
 }
+
 pub fn put(branch: &mut Branch, actor: OwnerId, account: Account) -> Result<(), StorageError> {
     branch
         .try_host_put(account_key(actor), &arkiv_db::encode(&account))?
         .map_err(|_| corrupt())?;
     Ok(())
 }
+
 pub fn burned(bytes: Option<Vec<u8>>) -> Result<U256, StorageError> {
     match bytes {
         None => Ok(U256::ZERO),
@@ -289,9 +311,11 @@ pub fn burned(bytes: Option<Vec<u8>>) -> Result<U256, StorageError> {
         )),
     }
 }
+
 pub fn fee(gas: u64) -> U256 {
     U256::from(gas) * U256::from(GAS_PRICE_WEI)
 }
+
 /// Conservative mempool reservation: fees plus gross non-self outgoing value.
 /// The pool adds the rent its admission simulation quoted
 /// ([`crate::signed::pool::Pool::insert_funded`]); execution checks rent
@@ -306,9 +330,11 @@ pub fn reservation(tx: &TxEnvelope) -> Result<U256, AccountFault> {
             _ => Ok(sum),
         })
 }
+
 fn corrupt() -> StorageError {
     StorageError::new(StorageErrorKind::Corrupt, "account state")
 }
+
 pub fn unsupported() -> OpOutcome {
     OpOutcome::HostRejected {
         fault: HostFault::Account(AccountFault::Unsupported),

@@ -11,10 +11,25 @@ transactions, native GLM transfers, and Arkiv ABI operations. It is not an EVM;
 its roots and block hashes remain native commitments. This profile does not
 provide consensus, finality, fair ordering or availability.
 
-The [design plan](signed-proposer-v1-plan.md) records the protocol and dependency
-decision. Implementation uses the existing locked Alloy primitives 1.7.3 and
-k256 0.13.4. Reth's Ethereum transaction pool is not added. `cargo +1.90.0 check
--p arkiv-node --locked` succeeds with the existing MSRV.
+## Design decisions
+
+- **Signing uses `k256` through `alloy-primitives`**, not `alloy-signer`.
+  `alloy_primitives::{Address, B256, Signature}` plus
+  `k256::ecdsa::SigningKey` are enough to sign and recover a prehash, and
+  `alloy-signer` would raise the minimum Rust version above 1.90 and pull in
+  consensus and network crates.
+- **No Reth transaction pool.** Its pool traits require Ethereum transaction
+  types (EIP-2718 decoding, fee fields, blob sidecars) and bring EVM,
+  chainspec and storage dependencies. Native operations would need fake
+  Ethereum fields, and the budget, payload and state checks would still be
+  ours. The pool here is small and has explicit limits (see below).
+- **Transaction bodies live in a separate `history.redb`.** `node.redb` keeps
+  engine state, headers, sanitized metadata and body references, so engine
+  state and retained history are stored, backed up and bounded separately.
+- **The transaction nonce has its own host key**, `arkiv/txnon/ || actor`,
+  distinct from the create nonce `arkiv/nonce/ || actor`. An included
+  transaction consumes a transaction nonce even when it rolls back; the create
+  nonce counts successful entity creates only and feeds key derivation.
 
 ## Run locally
 
@@ -112,9 +127,8 @@ status briefly; pending is volatile, and a timeout is not a rejection.
 
 ## HTTP and trust
 
-All public paths use `/signed/v1/`. The unsigned `/sim/v1/` API and PostgreSQL
-indexer configuration are unchanged; this change does not register a new
-indexer source or deploy frontend assets.
+All public paths use `/signed/v1/`. The unsigned simulator serves a separate
+`/sim/v1/` API.
 
 | Method/path | Result |
 | --- | --- |
@@ -180,8 +194,8 @@ response caps remain 4 MiB and 8 MiB. Resource-limit proof failures remain
 explicit; text queries never silently downgrade to unverified results.
 
 Reads whose cost grows with the state are detached: full-node
-`POST state/explore`, `query/eq` and `query/range`, and JSON-RPC `arkiv_query`
-and `arkiv_getEntityCount`. Such a read holds the node lock only to check
+`POST state/explore`, `query/eq` and `query/range`, and JSON-RPC `arkiv_query`,
+`arkiv_getEntity` and `arkiv_getEntityCount`. Such a read holds the node lock only to check
 heights and pin a snapshot (plus identity and limits), then evaluates on a
 blocking thread after releasing it. A REST read gives back its admission slot
 once admitted. At most `--read-concurrency` (1–64, default 4) detached reads
@@ -190,9 +204,9 @@ code `-32010`). A detached read running past `--read-deadline-secs` (1–3600,
 default 30) answers `ReadDeadlineExceeded` (HTTP 503, JSON-RPC code `-32000`),
 and one whose client disconnects is abandoned; its metered walk stops at the
 next charge and releases its permit. Status, headers, accounts, `eth_*` reads,
-transaction admission and block production therefore no longer wait for a
-long count. Those other requests, and every write, remain serialized under the
-node lock as before.
+transaction admission and block production therefore do not wait for a
+long count. Those other requests, and every write, are serialized under the
+node lock.
 
 Block production and follower sync are the node lock's writers, and the only
 callers that queue on it. Every other caller polls it, does not try while a
@@ -216,7 +230,7 @@ authenticated for up to 256 of the highest heights read, so header reads and
 snapshot pins do not repeat signature recovery under the lock.
 
 `arkiv_query` and `arkiv_getEntityCount` evaluate with planned read budgets
-(`arkiv_db::Budget::planned`, see the [query plan](snapshot-query-plan.md)):
+(`arkiv_db::Budget::planned`, see [metering](metering.md)):
 each AND-group is driven by its smallest index posting and counts use stored
 posting sizes, with the same results as the written evaluation. Their group
 and literal bounds are the genesis limits unless `--read-max-groups` (1–64)
@@ -269,7 +283,7 @@ crash suites test the underlying immediate-commit storage contract.
 cargo test -p arkiv-node \
   --test signed_protocol --test signed_pool --test signed_history \
   --test signed_host --test signed_http
-cargo test --workspace --exclude reth-trie --exclude alloy-trie
+cargo test --workspace
 ```
 
 Fault injection exercises cuts before/during history acknowledgment and engine

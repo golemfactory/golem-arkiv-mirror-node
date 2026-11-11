@@ -1,4 +1,5 @@
 //! Signed admission and independent execution; bodies live outside the engine.
+
 use super::{
     Error, Result,
     crypto::Signer,
@@ -34,6 +35,7 @@ pub struct HeaderRecord {
     pub body: BodyRef,
     pub feed: FeedBlock,
 }
+
 impl HeaderRecord {
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::new();
@@ -43,6 +45,7 @@ impl HeaderRecord {
         e.bytes(&json_bytes(&self.feed, FEED_CAP)?);
         Ok(e.into_bytes())
     }
+
     pub fn from_bytes(bytes: &[u8], genesis: &SignedGenesis, identity: &Identity) -> Result<Self> {
         let parse = || -> std::result::Result<Self, DecodeError> {
             let mut d = Decoder::new(bytes);
@@ -100,6 +103,7 @@ impl HeaderRecord {
         Ok(record)
     }
 }
+
 fn engine_genesis(identity: &SimulatorIdentity, genesis: &SignedGenesis) -> EngineGenesis {
     EngineGenesis {
         initial_state: genesis.prefill.as_ref().map(|p| p.state.clone()),
@@ -109,6 +113,7 @@ fn engine_genesis(identity: &SimulatorIdentity, genesis: &SignedGenesis) -> Engi
         max_object_bytes: 8 * 1024 * 1024,
     }
 }
+
 fn identity(stored: &SimulatorIdentity, genesis: &SignedGenesis) -> Identity {
     Identity {
         source_id: crate::simulator::host::uuid(&stored.source_id),
@@ -117,6 +122,7 @@ fn identity(stored: &SimulatorIdentity, genesis: &SignedGenesis) -> Identity {
         chain_id: genesis.genesis.chain_id.to_string(),
     }
 }
+
 struct Pending {
     record: HeaderRecord,
     block: SignedBlock,
@@ -124,6 +130,7 @@ struct Pending {
     history_saved: bool,
     engine_attempted: bool,
 }
+
 pub struct Host {
     pub engine: DurableEngine,
     pub genesis: SignedGenesis,
@@ -133,7 +140,8 @@ pub struct Host {
     pub health: &'static str,
     pub pool: Pool,
     pub prefill_stream: Option<Vec<u8>>,
-    /// Immutable, verified canonical v2 stream; never loaded wholesale.
+    /// Immutable, verified canonical stream file (`genesis_streaming`); never
+    /// loaded wholesale.
     pub prefill_file: Option<std::path::PathBuf>,
     history: History,
     signer: Option<Signer>,
@@ -156,13 +164,14 @@ pub struct Host {
     /// production. A stored block never changes.
     blocks: RefCell<BTreeMap<u64, std::sync::Arc<SignedBlock>>>,
 }
+
 /// Heights whose certificates a [`Host`] keeps authenticated.
 const CERTIFICATE_CACHE: usize = 256;
 /// Heights whose blocks a [`Host`] keeps authenticated: at most
 /// `BLOCK_CACHE × INPUT_CAP` (about 24 MiB) of inputs.
 const BLOCK_CACHE: usize = 32;
+
 impl Host {
-    #[allow(clippy::too_many_arguments)]
     pub fn create(
         store: Arc<dyn VersionedStore>,
         history: History,
@@ -183,6 +192,7 @@ impl Host {
             None,
         )
     }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_with_prefill(
         store: Arc<dyn VersionedStore>,
@@ -278,6 +288,7 @@ impl Host {
             blocks: Default::default(),
         })
     }
+
     /// Install a verified, privately staged genesis without materializing its trie.
     #[allow(clippy::too_many_arguments)]
     pub fn create_from_staged(
@@ -365,6 +376,7 @@ impl Host {
             blocks: Default::default(),
         })
     }
+
     /// Relabel a verified, privately staged genesis store in place as this
     /// node's height-zero database instead of copying it (see
     /// [`DurableEngine::adopt_staged_simulator`]). The staged engine is
@@ -450,6 +462,7 @@ impl Host {
             Publication::Indeterminate(_) => Err(Error("CommitUncertain")),
         }
     }
+
     /// Checks that `store` is exactly the height-zero database that
     /// [`Self::adopt_staged`] makes for `genesis` and `source`: the simulator
     /// identity, engine genesis, head manifest and the signed genesis record.
@@ -487,6 +500,7 @@ impl Host {
         }
         Ok(())
     }
+
     pub fn open(
         store: Arc<dyn VersionedStore>,
         history: History,
@@ -545,22 +559,27 @@ impl Host {
         }
         Ok(host)
     }
+
     /// Opens the state after `height`, refusing heights below the state
     /// floor up front with `HistoryPruned` (details in `refusal`).
     pub fn state(&self, height: u64) -> Result<arkiv_db::Snapshot> {
         crate::retention::state(&self.engine, &self.refusal, height)
     }
+
     /// Refuses state at `height` below the floor without opening it.
     pub fn require_state(&self, height: u64) -> Result<()> {
         crate::retention::require_state(&self.engine, &self.refusal, height)
     }
+
     /// Refuses receipts/logs of block `height` (they need state `height - 1`).
     pub fn require_receipts(&self, height: u64) -> Result<()> {
         crate::retention::require_receipts(&self.engine, &self.refusal, height)
     }
+
     pub fn is_producer(&self) -> bool {
         self.signer.is_some()
     }
+
     pub fn record(&self, height: u64) -> Result<HeaderRecord> {
         if height > self.head.height {
             return Err(Error("BlockNotSynced"));
@@ -574,6 +593,7 @@ impl Host {
         }
         Ok(record)
     }
+
     pub fn certificate(&self, height: u64) -> Result<SignedHeader> {
         if height <= self.head.height
             && let Some(certificate) = self.certificates.borrow().get(&height)
@@ -588,12 +608,15 @@ impl Host {
         }
         Ok(certificate)
     }
+
     pub fn feed(&self, height: u64) -> Result<FeedBlock> {
         Ok(self.record(height)?.feed)
     }
+
     pub fn block(&self, height: u64) -> Result<SignedBlock> {
         Ok(SignedBlock::clone(&*self.shared_block(height)?))
     }
+
     /// [`Self::block`] without the copy: the authenticated block, shared
     /// with the cache.
     pub fn shared_block(&self, height: u64) -> Result<std::sync::Arc<SignedBlock>> {
@@ -610,6 +633,7 @@ impl Host {
         }
         Ok(block)
     }
+
     fn read_block(&self, height: u64) -> Result<SignedBlock> {
         let record = self.record(height)?;
         let bytes = self.history.read(&record.body)?;
@@ -624,6 +648,7 @@ impl Host {
         }
         Ok(block)
     }
+
     pub fn committed_nonce(&self, actor: OwnerId) -> Result<u64> {
         Ok(self
             .genesis
@@ -636,6 +661,7 @@ impl Host {
             )?
             .nonce)
     }
+
     pub fn account(&self, height: u64, actor: OwnerId) -> Result<crate::accounts::Account> {
         let snapshot = self.state(height)?;
         Ok(self.genesis.accounts.resolve(
@@ -643,6 +669,7 @@ impl Host {
             snapshot.try_host_get(&crate::accounts::account_key(actor))?,
         )?)
     }
+
     pub fn account_response(&self, height: u64, actor: OwnerId, proof: bool) -> Result<Json> {
         let config = &self.genesis.accounts;
         let certificate = self.certificate(height)?;
@@ -653,7 +680,17 @@ impl Host {
             .initial_supply()
             .map_err(|_| Error("StorageCorrupt"))?;
         let supply = initial.checked_sub(burnt).ok_or(Error("StorageCorrupt"))?;
-        let mut value = json!({"actor":hex(actor.as_bytes()),"height":height.to_string(),"blockHash":hex(certificate.header.hash().as_slice()),"balanceWei":account.balance.to_string(),"nextNonce":account.nonce.to_string(),"gasPriceWei":config.gas_price_wei.to_string(),"initialSupplyWei":initial.to_string(),"burnedWei":burnt.to_string(),"totalSupplyWei":supply.to_string()});
+        let mut value = json!({
+            "actor": hex(actor.as_bytes()),
+            "height": height.to_string(),
+            "blockHash": hex(certificate.header.hash().as_slice()),
+            "balanceWei": account.balance.to_string(),
+            "nextNonce": account.nonce.to_string(),
+            "gasPriceWei": config.gas_price_wei.to_string(),
+            "initialSupplyWei": initial.to_string(),
+            "burnedWei": burnt.to_string(),
+            "totalSupplyWei": supply.to_string(),
+        });
         if height == self.head.height {
             value["pendingReservedWei"] = json!(self.pool.reserved(actor)?.to_string());
         }
@@ -665,12 +702,14 @@ impl Host {
         }
         Ok(value)
     }
+
     fn inclusion(&self, identity: &RequestIdentity) -> Result<Option<(Inclusion, u64)>> {
         self.engine
             .simulator_inclusion(&encode(identity))?
             .map(|b| decode_exact(&b).map_err(|_| Error("StorageCorrupt")))
             .transpose()
     }
+
     pub fn request_status(&self, actor: OwnerId, request_id: [u8; 32]) -> Result<Json> {
         let identity = RequestIdentity {
             scope: Scope::Tx,
@@ -691,22 +730,45 @@ impl Host {
                 .map_err(|_| Error("StorageCorrupt"))?;
             // Rent is burned beside the fee, not as gas.
             let rent = &tx.rent_wei;
-            return Ok(
-                json!({"gasUsed":gas_used.to_string(),"gasPriceWei":crate::accounts::GAS_PRICE_WEI.to_string(),"feeChargedWei":crate::accounts::fee(gas_used).to_string(),"rentChargedWei":rent.to_string(),"status":"included","actor":hex(actor.as_bytes()),"requestId":hex(&request_id),"nonce":nonce.to_string(),"transactionHash":hex(inclusion.digest.as_slice()),"height":inclusion.height.to_string(),"index":inclusion.index,"executionStatus":tx.status,"durability":"durable"}),
-            );
+            return Ok(json!({
+                "gasUsed": gas_used.to_string(),
+                "gasPriceWei": crate::accounts::GAS_PRICE_WEI.to_string(),
+                "feeChargedWei": crate::accounts::fee(gas_used).to_string(),
+                "rentChargedWei": rent.to_string(),
+                "status": "included",
+                "actor": hex(actor.as_bytes()),
+                "requestId": hex(&request_id),
+                "nonce": nonce.to_string(),
+                "transactionHash": hex(inclusion.digest.as_slice()),
+                "height": inclusion.height.to_string(),
+                "index": inclusion.index,
+                "executionStatus": tx.status,
+                "durability": "durable",
+            }));
         }
         if let Some(tx) = self.pool.pending(actor, request_id) {
-            return Ok(
-                json!({"status":"pending","actor":hex(actor.as_bytes()),"requestId":hex(&request_id),"transactionHash":hex(tx.hash().as_slice()),"nonce":tx.nonce.to_string(),"durability":"volatile"}),
-            );
+            return Ok(json!({
+                "status": "pending",
+                "actor": hex(actor.as_bytes()),
+                "requestId": hex(&request_id),
+                "transactionHash": hex(tx.hash().as_slice()),
+                "nonce": tx.nonce.to_string(),
+                "durability": "volatile",
+            }));
         }
         if let Some((hash, reason)) = self.pool.dropped.request(actor, request_id) {
-            return Ok(
-                json!({"status":"dropped","reason":reason,"actor":hex(actor.as_bytes()),"requestId":hex(&request_id),"transactionHash":hash,"durability":"volatile"}),
-            );
+            return Ok(json!({
+                "status": "dropped",
+                "reason": reason,
+                "actor": hex(actor.as_bytes()),
+                "requestId": hex(&request_id),
+                "transactionHash": hash,
+                "durability": "volatile",
+            }));
         }
         Ok(json!({"status":"unknown","actor":hex(actor.as_bytes()),"requestId":hex(&request_id)}))
     }
+
     pub fn submit(&mut self, tx: SignedTx) -> Result<Json> {
         if !self.is_producer() {
             return Err(Error("ProducerOnly"));
@@ -742,6 +804,7 @@ impl Host {
         }
         self.request_status(identity.actor, identity.request_id)
     }
+
     /// What `tx` would charge in the next block on the head state
     /// ([`crate::arkiv::quote_tx`]): its operations in order, each seeing
     /// what the earlier ones of `tx` created or changed, the rent reserved
@@ -792,6 +855,7 @@ impl Host {
             _ => Error("StorageCorrupt"),
         })
     }
+
     pub fn produce(&mut self) -> Result<SignedHeader> {
         if !self.is_producer() {
             return Err(Error("ProducerOnly"));
@@ -821,6 +885,7 @@ impl Host {
         let inputs = self.pool.select(|actor| self.committed_nonce(actor))?;
         self.execute_publish(inputs, None)
     }
+
     pub fn import(&mut self, block: SignedBlock) -> Result<SignedHeader> {
         if self.is_producer() {
             return Err(Error("FollowerOnly"));
@@ -841,9 +906,8 @@ impl Host {
                 self.history.freeze_conflict(&evidence)?;
                 return Err(Error("ChainConflict"));
             }
-            if self.block(height)?.inputs != block.inputs
-                || self.block(height)?.outcomes != block.outcomes
-            {
+            let known = self.shared_block(height)?;
+            if known.inputs != block.inputs || known.outcomes != block.outcomes {
                 return Err(Error("ChainConflict"));
             }
             return self.certificate(self.head.height);
@@ -860,6 +924,7 @@ impl Host {
         block.authenticate(&self.genesis)?;
         self.execute_publish(block.inputs.clone(), Some(&block))
     }
+
     /// A sampled authentic header at a retained height can establish
     /// equivocation even when no new block body is advertised.
     pub fn observe_certificate(&mut self, certificate: &SignedHeader) -> Result<()> {
@@ -883,6 +948,7 @@ impl Host {
         }
         Ok(())
     }
+
     /// Equivocation can also be established before either header is imported.
     pub fn observe_pair(&mut self, first: &SignedHeader, second: &SignedHeader) -> Result<()> {
         first.authenticate(&self.genesis)?;
@@ -898,6 +964,7 @@ impl Host {
         }
         Ok(())
     }
+
     /// Executes and publishes the next block: `expected`'s inputs when
     /// importing (every transaction must fit), or the producer's candidate
     /// `inputs`, built into a block without the candidates that cannot be
@@ -1093,6 +1160,7 @@ impl Host {
         });
         self.finish_pending(false)
     }
+
     fn finish_pending(&mut self, retry: bool) -> Result<SignedHeader> {
         if self.health == "chain-conflict" {
             return Err(Error("ChainConflict"));
@@ -1165,9 +1233,11 @@ impl Host {
             }
         }
     }
+
     pub fn retry_pending(&mut self) -> Result<SignedHeader> {
         self.finish_pending(true)
     }
+
     pub fn proof(&self, request: &arkiv_db::proof::EqRequest) -> Result<Vec<u8>> {
         eq_proof_bytes(
             &self.proof_state(&request.snapshot, "CursorMismatch")?,

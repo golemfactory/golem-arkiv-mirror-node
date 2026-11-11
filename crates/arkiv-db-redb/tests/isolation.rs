@@ -23,8 +23,7 @@
 //!   per level: physical O(log namespaces), not constant.
 //!
 //! What it does not establish: latency isolation on shared hardware, and the
-//! cost of the shared catalog object table, which the engine does not use
-//! yet (N3).
+//! cost of the shared catalog object table.
 
 mod common;
 

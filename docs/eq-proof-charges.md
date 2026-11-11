@@ -120,5 +120,5 @@ returned until the entire proof, next cursor and end of input are valid.
 These are complete equality pages relative to the authenticated index and
 its execution invariant. A producer can sign an invalid index omitting an
 otherwise matching row; this profile is not a proof of correct execution.
-There is no persistence, pruning, broader expression proof or standalone
-point-read API implied by this D2 subset.
+No pruning, broader expression proof or standalone point-read API is
+implied by this profile.

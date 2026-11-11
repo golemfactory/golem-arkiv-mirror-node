@@ -2,7 +2,7 @@
 //!
 //! Two contracts live here:
 //!
-//! - [`KvStore`]: the original ordered byte-key map behind the raw
+//! - [`KvStore`]: the ordered byte-key map behind the raw
 //!   `Database` facade. It is single-version and has no durability outcome.
 //! - [`versioned`]: immutable content-addressed objects, insert-only records
 //!   and one durable head committed atomically, with explicit commit outcomes
@@ -42,8 +42,8 @@ pub trait KvStore {
 
     /// Returns all entries whose keys start with `prefix`, in ascending order.
     ///
-    /// An empty prefix matches every key. This initial interface materializes
-    /// all matching entries; it provides neither pagination nor a result cap.
+    /// An empty prefix matches every key. This interface materializes all
+    /// matching entries; it provides neither pagination nor a result cap.
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Entry>, Self::Error>;
 
     /// Applies an entire batch in submission order, with no partial visibility.

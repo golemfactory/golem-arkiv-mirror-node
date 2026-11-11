@@ -2,7 +2,6 @@
 //! Small commits sweep every mutating call; spilling commits sample writes
 //! and bracket every growth/sync boundary, with durable/full/torn images.
 
-mod common;
 mod engine_support;
 
 use arkiv_db::durable::{DurableEngine, Publication, Recovery, WriterState};

@@ -10,7 +10,7 @@
 //! reports the first divergence.
 //!
 //! Nothing here is durable: this is the memory reference the durable node
-//! (step N4) is compared against, and the offline replay check.
+//! is compared against, and the offline replay check.
 
 use std::fmt;
 
@@ -227,26 +227,29 @@ impl MemoryChain {
     pub fn finalize(&mut self, prepared: PreparedBlock) -> Result<Block, ChainError> {
         validate::check_header(&self.spec, self.head(), &prepared.block.header)
             .map_err(|fault| ChainError::InvalidBlock(BlockFault::Successor(fault)))?;
-        let mut requests = self.requests.clone();
-        requests
+        // `commit_block` cannot fail after this check, so the index is
+        // untouched if publication fails.
+        self.requests
+            .check_block(self.spec.chain_id(), &prepared.block.inputs)
+            .map_err(ChainError::InvalidBlock)?;
+        let snapshot = self
+            .engine
+            .publish(&prepared.executed.candidate)
+            .map_err(ChainError::Engine)?;
+        self.requests
             .commit_block(
                 self.spec.chain_id(),
                 prepared.block.header.height,
                 &prepared.block.inputs,
             )
             .map_err(ChainError::InvalidBlock)?;
-        let snapshot = self
-            .engine
-            .publish(&prepared.executed.candidate)
-            .map_err(ChainError::Engine)?;
-        self.requests = requests;
         self.headers.push(prepared.block.header);
         self.snapshots.push(snapshot);
         Ok(prepared.block)
     }
 
     /// Independently re-executes and compares every outcome and header byte
-    /// (including protocol-2 terminal root) before publication.
+    /// (the terminal state root included) before publication.
     pub fn apply(&mut self, block: &Block) -> Result<(), ChainError> {
         validate::check_header(&self.spec, self.head(), &block.header)
             .map_err(|fault| ChainError::InvalidBlock(BlockFault::Successor(fault)))?;

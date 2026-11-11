@@ -5,22 +5,21 @@
 This document specifies every byte string the node hashes, stores or
 compares between runs. It has two parts:
 
-1. **The canonical codec, version 1** (node step N0b-2, implemented in
-   `arkiv_db::codec`): the encoding rules, the layout and tag table of every
+1. **The canonical codec, version 1** (implemented in `arkiv_db::codec`): the encoding rules, the layout and tag table of every
    engine type the node will put into blocks, receipts and state, and the
    domain-separated digest. Golden vectors are in
    [`crates/arkiv-db/tests/codec.rs`](../crates/arkiv-db/tests/codec.rs).
-2. **Block format version 3 and block execution** (node step N0b-3,
-   implemented in the `arkiv-node` library): genesis, headers, block
+2. **The block format (version 5) and block execution** (implemented in the
+   `arkiv-node` library): genesis, headers, block
    inputs, transaction envelopes and outcomes built from the codec in
    part 1, their hashes, the genesis invariants, the successor rule, and
    the execution, selection, request-identity and replay rules. Golden
    vectors are in
    [`crates/arkiv-node/tests/block_format.rs`](../crates/arkiv-node/tests/block_format.rs);
-   see [part 2](#part-2-block-format-version-1).
+   see [part 2](#part-2-block-format).
 
-The codec is not an interchange format for clients. JSON is transport only
-([node plan](node-storage-plan.md#block-and-process-contract)); nothing
+The codec is not an interchange format for clients. JSON is transport only;
+nothing
 derived from Rust `Debug` output, JSON, physical storage ids, snapshot ids,
 cache state or process tokens is ever encoded into a hashed byte string.
 
@@ -64,7 +63,7 @@ several times their encoded size).
 
 Lengths and counts are `u32`. Encoding a byte string or sequence longer
 than `u32::MAX` panics; no value the engine admits comes near that, and the
-node's request, transaction and block byte limits (N0b-3, N1) are far
+node's request, transaction and block byte limits are far
 smaller.
 
 ### What decoders enforce
@@ -93,14 +92,14 @@ and the 20-byte raw-key cap. (An empty patch is not an admission fault: it
 is golem-db's no-op.) Those depend on instance limits or produce
 deterministic rejections with receipts; an operation that violates them
 decodes and is then rejected by the engine at admission, or earlier by the
-host's static validation (N0b-3). `codec.rs` tests this boundary.
+host's static validation. `codec.rs` tests this boundary.
 
 ### Versioning
 
 - `CODEC_VERSION = 1` covers the rules, every layout and every tag table in
   this part. Codec bytes do not carry the version themselves: the container
   that stores or hashes them does (the block format version of part 2, and
-  the store metadata of node step N4), and a reader refuses a version it
+  the durable store metadata), and a reader refuses a version it
   does not know rather than guessing.
 - Unknown tags are rejected (`UnknownTag`), never skipped or mapped to a
   default.
@@ -364,11 +363,10 @@ constants and a bad one is a programming error.
 
 Domain naming convention: `arkiv/<object>/v<layout version>`, lowercase,
 with the version of the hashed object's layout (not the codec version), so
-a new layout of the same object gets a new domain. The domains of the
-[node plan](node-storage-plan.md) (`arkiv/state/v1` is the engine's state
-root since node step N3b; see `docs/architecture.md`):
+a new layout of the same object gets a new domain. The domains
+(`arkiv/state/v1` is the engine's state root; see `docs/architecture.md`):
 
-| Domain | Hashes | Step |
+| Domain | Hashes | Status |
 | --- | --- | --- |
 | `arkiv/header/v1` | encoded header (with the state root): the block hash | in use |
 | `arkiv/inputs/v2` | encoded block inputs (format 2: entity attributes as cells) | in use; `v1` retired |
@@ -393,11 +391,11 @@ accepted short inputs matches the tag tables); and digests against
 `keccak256` over hand-assembled preimages. A unit test in `codec.rs` checks
 that a sequence decoder reserves no more bytes than its remaining input.
 
-## Part 2: block format version 5
+## Part 2: block format
 
 ### Status
 
-Implemented in the `arkiv-node` library (node step N0b-3): `block` (types,
+Implemented in the `arkiv-node` library: `block` (types,
 encodings, hashes), `params` (genesis invariants, reservation, sweep
 bound, `ChainSpec`), `validate` (static validation, successor rule),
 `select` (selection and its replay check), `identity` (request identities,
@@ -480,7 +478,7 @@ is 32 raw bytes, `OwnerId` 20, `RequestId` (a request id) 32.
 
 Receipts inside outcomes are the part-1 `Receipt` encoding (no debug
 ledger). `RequestIdentity` and `Inclusion` are not hashed; their encodings
-exist for the durable inclusion records of step N4.
+exist for the durable inclusion records.
 
 ### Tag tables
 
@@ -907,7 +905,7 @@ test's comments.
 
 Run with `cargo test -p arkiv-node --offline`. Expected values are
 hand-derived or come from an independent oracle; see the
-[test strategy](testing.md#node-library-tests-node-step-n0b-3).
+[test strategy](testing.md#node-library-tests).
 
 - `block_format.rs`: golden vectors for every type of this part (every
   `TxOp` and `OpOutcome` variant, the header, genesis, inputs,
@@ -926,6 +924,6 @@ hand-derived or come from an independent oracle; see the
 - `exec.rs`, `genesis.rs`, `validation.rs`, `selection.rs`, `identity.rs`:
   the failure paths, invariants and rules above.
 
-Not established: the `ExecError::Storage` path. The memory engine's `try_`
-forms never fail, so no test can inject a storage error yet; it becomes
-testable with the persistent engine (N3b/N3c).
+Not established by these tests: the `ExecError::Storage` path. The memory
+engine's `try_` forms never fail, so these tests cannot inject a storage
+error; that needs a durable engine.

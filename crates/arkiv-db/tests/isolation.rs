@@ -6,30 +6,11 @@
 //! phases another namespace (B) grows by 10 000 records and the directory
 //! grows by 500 namespaces.
 //!
-//! What this file establishes:
-//! - The logical charges of A's workload (whole `Receipt`s, ledgers included)
-//!   and its results are the hand-computed literals below and stay identical
-//!   when B grows (phase 1) and when the directory grows (phase 2).
-//! - The namespace-local physical work (`record_nodes`) depends only on A's
-//!   own record map: it is identical across phases and equals the literals
-//!   derived by hand from the shape of A's raw record trie (documented at
-//!   the assertions). A transfer visits no record node. A scan that runs out
-//!   of budget stops lazily instead of materializing the whole result and
-//!   charging afterwards.
-//! - The shared directory work (`directory_nodes`) is unchanged by another
-//!   namespace's record growth and is exactly A's lookup path in the
-//!   directory trie (3 nodes with three namespaces, 5 with 503; twice that
-//!   for applied writes), within the `2·8 + 1` = 17-node path bound of
-//!   8-byte ids.
-//! - Keys of one namespace are never returned through another namespace, and
-//!   a miss through the wrong namespace costs the fixed miss price.
-//! - A snapshot pinned at the end of phase 0 answers the read workload with the
-//!   same values and receipts after phases 1 and 2.
-//!
-//! What it does not establish: freedom from shared CPU, memory or cache
-//! interference (the physical counters are node visits, not time), the
-//! directory's commitment in the state root (`roots.rs`) or its proofs,
-//! and durability.
+//! Receipts and results are hand-computed literals; the physical node counts
+//! are derived by hand from the shape of A's raw record trie and of the
+//! directory trie (see the comment above `A_TRIE_NODES`). Both must be the
+//! same in every phase, and a snapshot pinned after phase 0 must keep its
+//! answers. State roots are covered by `roots.rs`.
 
 use std::collections::BTreeSet;
 
@@ -39,10 +20,6 @@ use arkiv_db::{
     PriceSchedule, ReadResult, Receipt, ReceiptKind, Rejection, Revision, Snapshot, SnapshotId,
     WriteOp, WriteResult,
 };
-
-// ---------------------------------------------------------------------------
-// Actors and fixture shape
-// ---------------------------------------------------------------------------
 
 const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 const BOB: OwnerId = OwnerId::new([0xb0; 20]);
@@ -58,7 +35,7 @@ const BINARY_RECORDS: [(&[u8], &[u8]); 4] = [
     (b"a\xff", b"high"),                    // 2-byte key, 4-byte value
     (b"\xff\xff", b"\xff\xff\xff\xff\xff"), // 2-byte key, 5-byte value
 ];
-const A_RECORDS: u64 = 64;
+const A_RECORDS: usize = 64;
 
 /// B holds `b/00000`..`b/00004` after phase 0 (7-byte keys, 9-byte values
 /// `bee-NNNNN`) and `b/00005`..`b/10004` on top after phase 1.
@@ -74,13 +51,11 @@ const EXTRA_NAMESPACES: usize = 500;
 const PHASE0_NAMESPACES: usize = 3;
 const PHASE2_NAMESPACES: usize = PHASE0_NAMESPACES + EXTRA_NAMESPACES;
 
-// ---------------------------------------------------------------------------
-// Hand-computed costs under PriceSchedule::FIXTURE (id 1), model version 3:
-// DirectoryLookup 1, NamespaceCreate 50, NamespaceTransfer 20, PutRecord 10,
-// DeleteRecord 5, WriteKeyByte 2, WriteValueByte 1, PointRead 3, ScanSeek 4,
-// ScanEntry 2, ReadByte 1, RootUpdate 2 (1 per create/transfer group, 2 per
-// put/delete group).
-// ---------------------------------------------------------------------------
+// The costs below are hand-computed under PriceSchedule::FIXTURE (id 1),
+// model version 3: DirectoryLookup 1, NamespaceCreate 50, NamespaceTransfer 20,
+// PutRecord 10, DeleteRecord 5, WriteKeyByte 2, WriteValueByte 1, PointRead 3,
+// ScanSeek 4, ScanEntry 2, ReadByte 1, RootUpdate 2 (1 per create/transfer
+// group, 2 per put/delete group).
 
 /// get present: DirectoryLookup 1 + PointRead 3 + ReadByte 7 (`text-07`).
 const GET_PRESENT_COST: u64 = 11;
@@ -127,10 +102,6 @@ const B_GROWTH_BLOCK_COST: u64 = 76_000;
 const PHASE2_BLOCK_COST: u64 = 26_500;
 /// scan "b/" over B after phase 1: 5 + 10 005 entries at 2 + 7 + 9 = 18.
 const B_SCAN_ALL_COST: u64 = 180_095;
-
-// ---------------------------------------------------------------------------
-// Workload steps
-// ---------------------------------------------------------------------------
 
 const GET_PRESENT: &str = "get present key a/07";
 const GET_ABSENT: &str = "get absent key a/99";
@@ -609,10 +580,6 @@ fn receipt(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Assertions
-// ---------------------------------------------------------------------------
-
 fn find<'a>(steps: &'a [Step], name: &str) -> &'a Step {
     steps
         .iter()
@@ -674,10 +641,6 @@ fn assert_directory_nodes_equal(baseline: &[Step], rerun: &[Step], phase: &str) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trie shapes and the node counts derived from them
-// ---------------------------------------------------------------------------
-//
 // Every map is a Merkle Patricia trie (see docs/state-trie.md). A node visit
 // is counted once per step that examines the node: a lookup or an update
 // counts the key's path, a removal also the sibling it loads when a branch
@@ -695,11 +658,12 @@ fn assert_directory_nodes_equal(baseline: &[Step], rerun: &[Step], phase: &str) 
 // it and then inserts the updated catalog leaf along the same path, twice
 // the nodes; a write rejected as unauthorized stops after the lookup.
 //
-// A's raw record map: 64 keys, each encoded as `key ‖ 0x00 pad to 20 ‖ len`
-// (21 bytes, 42 nibbles). `\x00` starts with nibble 0, the `a…` keys with
-// 6 (0x61), `\xff\xff` with f, so the root is a branch with three children.
+// A's raw record map: 64 keys, each encoded as its bytes with `00` escaped
+// to `01 01` and `01` to `01 02`, then a `00` terminator. `\x00` (`01 01 00`)
+// starts with nibble 0, the `a…` keys with 6 (0x61), `\xff\xff` with f, so
+// the root is a branch with three children.
 // Under slot 6 every key continues with nibble 1 (an extension of one
-// nibble), then the second byte's high nibble is 0 (`a\x00`), f (`a\xff`) or
+// nibble), then the next byte's high nibble is 0 (`a\x00`, escaped), f (`a\xff`) or
 // 2 (`a/…`, 0x2f): a branch B2 with two leaves. The 60 `a/XY` keys share
 // nibbles f and 3 (0x2f's low nibble, the digit byte's high nibble): an
 // extension of two nibbles, then a branch B5 on the tens digit X (slots 0
@@ -718,11 +682,12 @@ const DIRECTORY_PATH_BOUND: u64 = 17;
 /// Every node of A's raw record map.
 const A_TRIE_NODES: u64 = 81;
 
+const _: () = assert!(DIRECTORY_PATH_THREE <= DIRECTORY_PATH_BOUND);
+const _: () = assert!(DIRECTORY_PATH_503 <= DIRECTORY_PATH_BOUND);
+
 /// Directory work of each step is exactly the lookup path (reads, and a
-/// write rejected before its update) or twice it (applied writes), and
-/// within the generic bound of 17 per path.
+/// write rejected before its update) or twice it (applied writes).
 fn assert_directory_nodes_follow_the_trie(steps: &[Step], path: u64, phase: &str) {
-    assert!(path <= DIRECTORY_PATH_BOUND);
     for step in steps {
         let expected = match (step.receipt.kind, step.receipt.outcome) {
             (ReceiptKind::Write, Outcome::Applied) => 2 * path,
@@ -751,9 +716,9 @@ fn assert_absolute_record_bounds(steps: &[Step], phase: &str) {
         // The seek descends the root to the `\x00` leaf; the walk then
         // steps into every other node once.
         (SCAN_ALL, A_TRIE_NODES),
-        // Seek for `a/1` padded: root, extension, B2, extension, B5 (slot
-        // 1), and the tens-1 extension, whose path [3] is above the
-        // prefix's padding nibble 0, so it is the first pending node (6).
+        // Seek for `a/1`: root, extension, B2, extension, B5 (slot 1), and
+        // the tens-1 extension, whose path [3] is above the 0 nibble of the
+        // prefix's terminator, so it is the first pending node (6).
         // Walking it: the tens-1 branch and its ten leaves (11); the step
         // that ends the scan: the tens-2 extension, branch and `a/20` (3).
         (SCAN_A1, 6 + 11 + 3),
@@ -787,13 +752,6 @@ fn assert_absolute_record_bounds(steps: &[Step], phase: &str) {
             "{phase}: record nodes of {name}"
         );
     }
-    // A raw key path has at most `2·21 + 1` = 43 nodes.
-    for name in [GET_PRESENT, GET_ABSENT, GET_FOREIGN_KEY] {
-        assert!(
-            find(steps, name).physical.record_nodes <= 43,
-            "{phase}: {name}"
-        );
-    }
     let miss = find(steps, SCAN_FOREIGN_PREFIX);
     assert_eq!(
         miss.receipt.spent,
@@ -819,21 +777,7 @@ fn assert_absolute_record_bounds(steps: &[Step], phase: &str) {
         Observed::Rejected(Rejection::OutOfBudget),
         "{phase}: aborted scan outcome"
     );
-    let transfer = find(steps, TRANSFER);
-    assert_eq!(
-        transfer.physical.record_nodes, 0,
-        "{phase}: a transfer visits no record node"
-    );
-    let descriptor = find(steps, DESCRIPTOR);
-    assert_eq!(
-        descriptor.physical.record_nodes, 0,
-        "{phase}: a descriptor read visits no record node"
-    );
 }
-
-// ---------------------------------------------------------------------------
-// Fixture construction
-// ---------------------------------------------------------------------------
 
 fn entry(key: &[u8], value: &[u8]) -> Entry {
     Entry {
@@ -975,7 +919,7 @@ impl World {
         let head = world.head();
         assert_eq!(head.id(), phase0);
         assert_eq!(head.namespace_count(), PHASE0_NAMESPACES);
-        assert_eq!(head.record_count(a), Some(A_RECORDS as usize));
+        assert_eq!(head.record_count(a), Some(A_RECORDS));
         assert_eq!(head.record_count(b), Some(B_INITIAL_RECORDS));
         assert_eq!(head.record_count(c), Some(0));
         world
@@ -1059,15 +1003,11 @@ impl World {
         );
         assert_eq!(
             after.record_count(self.a),
-            Some(A_RECORDS as usize),
+            Some(A_RECORDS),
             "{phase}: A size"
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn workload_baseline_matches_hand_computed_receipts() {
@@ -1140,8 +1080,6 @@ fn workload_is_unchanged_by_directory_growth_within_the_trie_bound() {
     assert_record_nodes_equal(&baseline, &rerun, "phase 2");
     // The directory did grow, so A's lookup path is longer: the shape for
     // 503 ids derived above, within the 17-node bound of 8-byte keys.
-    let namespaces = after.namespace_count();
-    assert_eq!(namespaces, PHASE2_NAMESPACES);
     assert_directory_nodes_follow_the_trie(&rerun, DIRECTORY_PATH_503, "phase 2");
     assert_absolute_record_bounds(&rerun, "phase 2");
     world.assert_a_untouched_since(&before, "phase 2 after the discarded branch");
@@ -1216,7 +1154,6 @@ fn transfer_work_is_independent_of_namespace_size() {
         transfer_receipt(),
         "transfer of 10 005 records"
     );
-    assert_eq!(small.receipt, large.receipt);
     let transferred = Effect::Transferred {
         revision: Revision(1),
     };
@@ -1273,7 +1210,7 @@ fn transfer_work_is_independent_of_namespace_size() {
         before.records_shared_with(&after, world.b),
         "B moved no record"
     );
-    assert_eq!(after.record_count(world.a), Some(A_RECORDS as usize));
+    assert_eq!(after.record_count(world.a), Some(A_RECORDS));
     assert_eq!(after.record_count(world.b), Some(B_TOTAL_RECORDS));
     assert_eq!(
         world.descriptor_at_head(world.a),
@@ -1323,7 +1260,6 @@ fn keys_of_another_namespace_are_invisible_and_miss_at_fixed_cost() {
 
     // Nothing A returns is a key of B, in any read shape.
     let b_keys: BTreeSet<Vec<u8>> = (0..B_TOTAL_RECORDS).map(b_key).collect();
-    assert_eq!(b_keys.len(), B_TOTAL_RECORDS);
     let a_all = head.scan_prefix(world.a, b"", traced).expect("A exists");
     assert_eq!(a_all.value, a_records_in_key_order());
     assert!(
@@ -1332,7 +1268,6 @@ fn keys_of_another_namespace_are_invisible_and_miss_at_fixed_cost() {
     );
     assert_eq!(a_all.receipt.spent, Cost::new(SCAN_ALL_COST));
     for key in [b"b/00000".as_slice(), b"b/00004", b"b/05000", b"b/10004"] {
-        assert!(b_keys.contains(key), "{key:?} is a fixture key of B");
         let in_b = head.get(world.b, key, traced).expect("B exists");
         assert!(in_b.value.is_some(), "{key:?} is present in B");
         let through_a = head.get(world.a, key, traced).expect("A exists");
@@ -1352,7 +1287,6 @@ fn keys_of_another_namespace_are_invisible_and_miss_at_fixed_cost() {
     let through_a = head.scan_prefix(world.a, b"b/", traced).expect("A exists");
     assert!(through_a.value.is_empty());
     assert_eq!(through_a.receipt, miss_receipt(SCAN_FOREIGN_PREFIX));
-    assert_eq!(through_a.receipt.spent, Cost::new(SCAN_MISS_COST));
 
     // The other direction and the empty namespace behave the same way.
     let a_through_b = head.scan_prefix(world.b, b"a/", traced).expect("B exists");

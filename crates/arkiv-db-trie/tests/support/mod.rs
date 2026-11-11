@@ -1,4 +1,5 @@
-//! Shared test support: a seeded generator and the independent oracles.
+//! Shared test support: a seeded generator, the independent oracles and
+//! closed-interval wrappers for the interval verifier.
 //!
 //! Two root/proof oracles, neither of which shares code with the crate
 //! under test:
@@ -18,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::{B256, keccak256};
 use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, Nibbles, proof::ProofRetainer};
+use arkiv_db_trie::{IntervalEntries, IntervalLimits, KeyRange, ProofError, VerifiedInterval};
 
 /// SplitMix64: small, seeded and deterministic.
 pub struct Rng(pub u64);
@@ -300,4 +302,44 @@ pub fn deep_keys<const N: usize>() -> Vec<[u8; N]> {
         keys.push(key);
     }
     keys
+}
+
+/// [`arkiv_db_trie::walk_interval`] over the closed interval
+/// `[lower, upper]`, with keys of at most 256 bytes.
+pub fn walk_closed<N: AsRef<[u8]>>(
+    root: arkiv_db_trie::ObjectId,
+    lower: &[u8],
+    upper: &[u8],
+    nodes: &[N],
+    max_entries: usize,
+) -> Result<IntervalEntries, ProofError> {
+    arkiv_db_trie::walk_interval(
+        root,
+        &KeyRange::closed(lower, upper),
+        nodes,
+        IntervalLimits {
+            max_entries,
+            max_key_len: 256,
+        },
+    )
+}
+
+/// [`arkiv_db_trie::inspect_interval`] with the arguments of
+/// [`walk_closed`].
+pub fn inspect_closed<N: AsRef<[u8]>>(
+    root: arkiv_db_trie::ObjectId,
+    lower: &[u8],
+    upper: &[u8],
+    nodes: &[N],
+    max_entries: usize,
+) -> Result<(IntervalEntries, VerifiedInterval), ProofError> {
+    arkiv_db_trie::inspect_interval(
+        root,
+        &KeyRange::closed(lower, upper),
+        nodes,
+        IntervalLimits {
+            max_entries,
+            max_key_len: 256,
+        },
+    )
 }

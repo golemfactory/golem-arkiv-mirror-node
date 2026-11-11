@@ -1,17 +1,15 @@
-# Rogue One node metrics
+# Node metrics
 
 `arkiv-proposer producer|full|light` accepts `--metrics-listen 127.0.0.1:19600`
 and optional `--metrics-interval-secs 300` (minimum 10). The dedicated HTTP
 listener serves Prometheus text at `/metrics`. Disabled unless configured.
-The exporter listens on loopback in Rogue One. Public Nginx exact `/metrics`
-routes expose it at `https://rpc.rogue-one.eu/metrics`,
-`https://full-node.rogue-one.eu/metrics`, and
-`https://light-node.rogue-one.eu/metrics`, as requested by the operator. RPC and
-node panels keep their existing routes; private controls remain blocked.
+Keep the exporter on loopback and publish it, if at all, through a reverse
+proxy route that exposes exactly `/metrics`; the private control listener
+must stay blocked.
 
-Metric names use `rogue_one_`: classic Prometheus metric identifiers cannot
-contain the requested hyphens. Deployment job names may use `rogue-one-producer`,
-`rogue-one-full`, and `rogue-one-light`. Add chain/instance labels in scrape config.
+Metric names use the prefix `rogue_one_`, after the first deployment
+(Prometheus identifiers cannot contain hyphens). Add chain and instance
+labels in the scrape configuration.
 
 ## Storage and overhead
 
@@ -84,18 +82,18 @@ Node tick durations include queueing/network time and are not DB operation timin
 
 ```yaml
 scrape_configs:
-  - job_name: rogue-one-producer
+  - job_name: arkiv-producer
     scheme: https
     static_configs:
-      - targets: ['rpc.rogue-one.eu']
-  - job_name: rogue-one-full
+      - targets: ['producer.example.org']
+  - job_name: arkiv-full
     scheme: https
     static_configs:
-      - targets: ['full-node.rogue-one.eu']
-  - job_name: rogue-one-light
+      - targets: ['full.example.org']
+  - job_name: arkiv-light
     scheme: https
     static_configs:
-      - targets: ['light-node.rogue-one.eu']
+      - targets: ['light.example.org']
 ```
 
 Alternatively a host-local Prometheus can scrape HTTP loopback ports 19600

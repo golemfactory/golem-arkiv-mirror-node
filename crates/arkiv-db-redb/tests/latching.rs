@@ -138,7 +138,7 @@ fn recover_is_retryable_while_the_device_fails() {
     commit(&store, genesis.clone());
     disk.fail_all(DiskOp::Read, io::ErrorKind::Other);
     let first = store.head().unwrap_err();
-    assert_eq!(store.health(), Health::Failed(first.clone()));
+    assert_eq!(store.health(), Health::Failed(first));
     for _ in 0..3 {
         let error = store.recover().unwrap_err();
         assert_eq!(error.kind, StorageErrorKind::Io);

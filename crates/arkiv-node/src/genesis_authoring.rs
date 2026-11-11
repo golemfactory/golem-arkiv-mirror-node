@@ -1,5 +1,6 @@
 //! Strict, small-input authoring frontend. Human source bytes are provenance;
 //! only the canonical launch record and prefill stream define chain identity.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -61,6 +62,7 @@ struct Manifest {
     allocations: Allocations,
     prefill: Prefill,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Chain {
@@ -70,6 +72,7 @@ struct Chain {
     block_period_ms: String,
     proposer: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileRef {
@@ -78,6 +81,7 @@ struct ProfileRef {
     bytes: Option<u64>,
     sha256: Option<String>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Allocations {
@@ -87,12 +91,14 @@ struct Allocations {
     entry: Option<Vec<Allocation>>,
     expected_initial_supply_wei: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AllocationDocument {
     schema: String,
     allocation: Vec<Allocation>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Allocation {
@@ -100,6 +106,7 @@ struct Allocation {
     address: String,
     balance_wei: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Prefill {
@@ -120,6 +127,7 @@ struct Prefill {
     #[serde(default)]
     dataset: Vec<DatasetRef>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorLimits {
@@ -127,6 +135,7 @@ struct AuthorLimits {
     max_canonical_bytes: String,
     max_storage_units: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DatasetRef {
@@ -136,6 +145,7 @@ struct DatasetRef {
     bytes: Option<u64>,
     sha256: Option<String>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntityDocument {
@@ -143,6 +153,7 @@ struct EntityDocument {
     #[serde(default)]
     entity: Vec<Entity>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileRef {
@@ -150,6 +161,7 @@ struct FileRef {
     bytes: Option<u64>,
     sha256: Option<String>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entity {
@@ -162,6 +174,7 @@ struct Entity {
     #[serde(default)]
     attributes: BTreeMap<String, Attribute>,
 }
+
 /// One user attribute: exactly one typed value and an explicit `indexed`.
 /// `bytes` is Base64; `bytes_text` (exact UTF-8) and `bytes_file` (a pinned
 /// source file) are other spellings of a `bytes` value. `bytes` is never
@@ -183,6 +196,7 @@ struct Attribute {
     addr: Option<String>,
     key: Option<String>,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Profile {
@@ -197,6 +211,7 @@ struct Profile {
     chain_params: Params,
     signed_limits: WireLimits,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Pricing {
@@ -205,6 +220,7 @@ struct Pricing {
     gas_price_wei: String,
     rent_rule: String,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct EngineLimits {
@@ -218,6 +234,7 @@ struct EngineLimits {
     max_groups: usize,
     max_literals: usize,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Params {
@@ -238,6 +255,7 @@ struct Params {
     /// The consensus `max_new_storage_units_per_block`, at least 1.
     max_new_storage_units_per_block: String,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct WireLimits {
@@ -245,6 +263,7 @@ struct WireLimits {
     max_input_bytes: u32,
     max_body_bytes: u32,
 }
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SourcePin {
@@ -252,6 +271,7 @@ struct SourcePin {
     bytes: u64,
     sha256: String,
 }
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Lock {
@@ -264,6 +284,7 @@ struct Lock {
     source: Vec<SourcePin>,
     resolved: serde_json::Value,
 }
+
 struct Compiled {
     root: File,
     genesis: SignedGenesis,
@@ -283,9 +304,11 @@ fn err(e: impl std::fmt::Display) -> String {
     }
     message
 }
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
 fn expect(value: &str, required: &str, field: &str) -> Result<()> {
     if value == required {
         Ok(())
@@ -293,6 +316,7 @@ fn expect(value: &str, required: &str, field: &str) -> Result<()> {
         Err(format!("unsupported {field}: {}", err(value)))
     }
 }
+
 fn identifier(s: &str) -> Result<()> {
     if s.is_empty()
         || s.len() > 64
@@ -304,6 +328,7 @@ fn identifier(s: &str) -> Result<()> {
     }
     Ok(())
 }
+
 fn decimal_integer(s: &str, signed: bool) -> Result<()> {
     let magnitude = if signed {
         s.strip_prefix('-').unwrap_or(s)
@@ -319,18 +344,22 @@ fn decimal_integer(s: &str, signed: bool) -> Result<()> {
     }
     Ok(())
 }
+
 fn number<T: std::str::FromStr>(s: &str) -> Result<T> {
     decimal_integer(s, false)?;
     s.parse().map_err(|_| "integer out of range".into())
 }
+
 fn signed_number<T: std::str::FromStr>(s: &str) -> Result<T> {
     decimal_integer(s, true)?;
     s.parse().map_err(|_| "signed integer out of range".into())
 }
+
 fn uint256(s: &str) -> Result<U256> {
     decimal_integer(s, false)?;
     U256::from_str_radix(s, 10).map_err(|_| "U256 out of range".into())
 }
+
 fn fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
     let s = s.strip_prefix("0x").ok_or("expected lowercase 0x hex")?;
     if s.len() != N * 2
@@ -346,9 +375,11 @@ fn fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
     }
     Ok(out)
 }
+
 fn hex_digit(b: u8) -> u8 {
     if b <= b'9' { b - b'0' } else { b - b'a' + 10 }
 }
+
 fn base64_bytes(s: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD.decode(s).map_err(err)?;
     if STANDARD.encode(&bytes) != s {
@@ -356,6 +387,7 @@ fn base64_bytes(s: &str) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
 fn decimal_units(s: &str) -> Result<[u8; 32]> {
     let negative = s.starts_with('-');
     let magnitude = s.strip_prefix('-').unwrap_or(s);
@@ -386,6 +418,7 @@ fn decimal_units(s: &str) -> Result<[u8; 32]> {
     }
     Ok(units.to_be_bytes())
 }
+
 fn cell(a: Attribute, inputs: &mut Inputs) -> Result<Cell> {
     let mut values = Vec::new();
     if let Some(v) = a.bool {
@@ -439,6 +472,7 @@ fn cell(a: Attribute, inputs: &mut Inputs) -> Result<Cell> {
         Cell::field(value)
     })
 }
+
 fn address(s: &str, aliases: &BTreeMap<String, [u8; 20]>) -> Result<[u8; 20]> {
     match s.strip_prefix('@') {
         Some(label) => aliases
@@ -541,12 +575,14 @@ fn no_multiline(text: &str) -> Result<()> {
     }
     Ok(())
 }
+
 fn utf8(bytes: &[u8]) -> Result<&str> {
     if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         return Err("UTF-8 BOM is unsupported".into());
     }
     std::str::from_utf8(bytes).map_err(err)
 }
+
 fn parse_toml<T: DeserializeOwned>(bytes: &[u8], path: &str) -> Result<T> {
     if bytes.len() > DOCUMENT_CAP {
         return Err(format!("{path}: document exceeds 1 MiB"));
@@ -558,6 +594,7 @@ fn parse_toml<T: DeserializeOwned>(bytes: &[u8], path: &str) -> Result<T> {
 // serde_json::Value normally silently replaces duplicate object keys. This
 // recursive visitor rejects them before conversion into the typed row schema.
 struct StrictJson(serde_json::Value);
+
 impl<'de> Deserialize<'de> for StrictJson {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         struct V;
@@ -608,6 +645,7 @@ impl<'de> Deserialize<'de> for StrictJson {
         d.deserialize_any(V)
     }
 }
+
 fn strict_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let value: StrictJson = serde_json::from_slice(bytes).map_err(err)?;
     serde_json::from_value(value.0).map_err(err)
@@ -627,6 +665,7 @@ fn relative(path: &str) -> Result<Vec<&str>> {
     }
     Ok(parts)
 }
+
 fn open_directory(path: &Path) -> Result<File> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -653,6 +692,7 @@ fn open_directory(path: &Path) -> Result<File> {
     }
     Ok(current)
 }
+
 fn open_relative(root: &File, path: &str, flags: OFlags) -> Result<File> {
     let parts = relative(path)?;
     let mut dir = root.try_clone().map_err(err)?;
@@ -677,6 +717,7 @@ fn open_relative(root: &File, path: &str, flags: OFlags) -> Result<File> {
         .map_err(|e| format!("{path}: {}", err(e)))?,
     ))
 }
+
 fn read_relative(root: &File, path: &str, cap: usize) -> Result<Vec<u8>> {
     let file = open_relative(root, path, OFlags::RDONLY)?;
     let meta = file.metadata().map_err(err)?;
@@ -694,12 +735,14 @@ fn read_relative(root: &File, path: &str, cap: usize) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
 struct Inputs {
     root: File,
     pins: Vec<SourcePin>,
     paths: BTreeSet<String>,
     total: usize,
 }
+
 impl Inputs {
     fn read(&mut self, path: &str, length: Option<u64>, hash: Option<&str>) -> Result<Vec<u8>> {
         relative(path)?;
@@ -786,6 +829,7 @@ fn profile_native(profile: &Profile, chain: &Chain) -> Result<Genesis> {
         admins: Vec::new(),
     })
 }
+
 /// The profile's rent cap in seconds, 1 to 100 years.
 fn rent_cap(p: &Params) -> Result<u64> {
     let seconds = number::<u64>(&p.max_rent_lifetime_seconds)?;
@@ -797,6 +841,7 @@ fn rent_cap(p: &Params) -> Result<u64> {
     }
     Ok(seconds)
 }
+
 fn normalize_entity(
     e: Entity,
     aliases: &BTreeMap<String, [u8; 20]>,
@@ -831,6 +876,7 @@ fn normalize_entity(
         attributes,
     })
 }
+
 fn compile(path: &Path) -> Result<Compiled> {
     let parent = path
         .parent()
@@ -949,7 +995,11 @@ fn compile(path: &Path) -> Result<Compiled> {
         || limits.max_canonical_bytes > DOCUMENT_CAP as u64
         || limits.max_storage_units > INPUT_CAP as u64
     {
-        return Err("prefill limits exceed supported 256 rows / 1 MiB canonical bytes / 8 MiB storage units".into());
+        return Err(concat!(
+            "prefill limits exceed supported ",
+            "256 rows / 1 MiB canonical bytes / 8 MiB storage units"
+        )
+        .into());
     }
     let sponsor = address(&prefill.sponsor, &aliases)?;
     let mut rows = prefill.entity;
@@ -1034,14 +1084,17 @@ fn temporary_name(kind: &str) -> String {
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     )
 }
+
 fn write_new(root: &File, path: &str, bytes: &[u8]) -> Result<()> {
     let mut file = open_relative(root, path, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL)?;
     file.write_all(bytes).map_err(err)?;
     file.sync_all().map_err(err)
 }
+
 fn old_lock(root: &File) -> Result<Lock> {
     parse_toml(&read_relative(root, LOCK_FILE, DOCUMENT_CAP)?, LOCK_FILE)
 }
+
 fn write_lock(root: &File, lock: &Lock, refresh: bool) -> Result<()> {
     let name = temporary_name("lock");
     let bytes = toml::to_string_pretty(lock).map_err(err)?;
@@ -1308,6 +1361,7 @@ mod tests {
             stdfs::write(self.chain(), toml::to_string(&source).unwrap()).unwrap();
         }
     }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = stdfs::remove_dir_all(&self.0);
@@ -1663,13 +1717,17 @@ mod tests {
             ),
             (
                 "attributes.title = { str = \"Welcome\", indexed = true }",
-                "attributes.title = { str = \"Welcome\", indexed = true }\nattributes.\"$owner\" = { addr = \"0x2222222222222222222222222222222222222222\", indexed = true }",
+                concat!(
+                    "attributes.title = { str = \"Welcome\", indexed = true }\n",
+                    "attributes.\"$owner\" = ",
+                    "{ addr = \"0x2222222222222222222222222222222222222222\", indexed = true }",
+                ),
             ),
             (
                 "bytes_text = \"Welcome to Arkiv.\"",
                 "bytes_text = \"Welcome to Arkiv.\", bytes = \"\"",
             ),
-            // The removed payload model is not a spelling of anything.
+            // Unknown keys are refused.
             ("flags = 0", "flags = 0\ncontent_type = \"text/plain\""),
             (
                 "flags = 0",
@@ -1842,6 +1900,7 @@ mod tests {
     trait ErrorString {
         fn unwrap_err_string(self) -> String;
     }
+
     impl<T> ErrorString for Result<T> {
         fn unwrap_err_string(self) -> String {
             match self {

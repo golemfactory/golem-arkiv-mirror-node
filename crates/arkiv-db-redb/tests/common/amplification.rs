@@ -10,17 +10,12 @@ use super::{BenchDir, block, commit, quantile, timed};
 /// One series: equal object volume, one block size.
 #[derive(Clone, Debug)]
 pub struct Series {
-    /// Objects per block (0: blocks with records only).
-    pub objects_per_block: u64,
-    /// Blocks committed.
     pub blocks: u64,
     /// Object and record bytes the batches carried.
     pub logical_bytes: u64,
     /// Backend I/O of all commits.
     pub backend: BackendStats,
-    /// File size at the end.
     pub file_bytes: u64,
-    /// Total commit time.
     pub elapsed: Duration,
     /// Median commit latency.
     pub p50: Duration,
@@ -81,7 +76,6 @@ pub fn measure(
     drop(store);
     let elapsed = times.iter().sum();
     Series {
-        objects_per_block,
         blocks,
         logical_bytes: logical,
         backend,

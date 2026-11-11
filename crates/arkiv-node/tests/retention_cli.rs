@@ -1,4 +1,5 @@
 //! `--state-retention` wiring in the node binaries.
+
 use std::{
     process::{Command, Stdio},
     time::Duration,
@@ -10,6 +11,7 @@ fn run_dir(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     path
 }
+
 fn fails(binary: &str, args: &[&str]) -> String {
     let output = Command::new(binary).args(args).output().unwrap();
     assert!(!output.status.success(), "{args:?}");
@@ -69,6 +71,7 @@ fn light_roles_and_malformed_values_are_rejected() {
 }
 
 struct Child(std::process::Child);
+
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -83,7 +86,7 @@ async fn simulator_producer_reports_the_configured_window() {
         socket.local_addr().unwrap().to_string()
     };
     let dir = run_dir("sim-producer");
-    let _child = Child(
+    let child = Child(
         Command::new(env!("CARGO_BIN_EXE_arkiv-simulator"))
             .args([
                 "producer",
@@ -117,6 +120,6 @@ async fn simulator_producer_reports_the_configured_window() {
     assert_eq!(status["stateRetention"], "window");
     assert_eq!(status["stateRetentionWindow"], "3");
     assert_eq!(status["stateFloor"], "0");
-    drop(_child);
+    drop(child);
     let _ = std::fs::remove_dir_all(dir);
 }

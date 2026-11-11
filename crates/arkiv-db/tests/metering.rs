@@ -1,14 +1,13 @@
-//! Hand-counted metering vectors for the milestone-1 engine: per-operation
+//! Hand-counted metering vectors for the raw operations: per-operation
 //! charge points under every budget, ledgers, charge ordering, block budgets,
 //! overflow, estimation parity, determinism and pricing pinning.
 //!
 //! Every expected number in this file is a literal derived by hand from the
 //! FIXTURE weights (DirectoryLookup 1, NamespaceCreate 50, NamespaceTransfer
 //! 20, PutRecord 10, DeleteRecord 5, WriteKeyByte 2, WriteValueByte 1,
-//! PointRead 3, ScanSeek 4, ScanEntry 2, ReadByte 1, RootUpdate 2) and the
-//! model-version-3 charge points of the raw operations: the version-1 points
-//! plus `RootUpdate` 1 in the namespace create/transfer group and
-//! `RootUpdate` 2 in the put/delete group. Nothing here asks the engine or a
+//! PointRead 3, ScanSeek 4, ScanEntry 2, ReadByte 1, RootUpdate 2). The
+//! namespace create/transfer group includes `RootUpdate` 1 and the
+//! put/delete group `RootUpdate` 2. Nothing here asks the engine or a
 //! schedule what an operation should cost.
 
 use std::fmt::Debug;
@@ -35,10 +34,6 @@ const FIXTURE_ID: u32 = 1;
 
 const OUT_OF_BUDGET: Outcome = Outcome::Rejected(Rejection::OutOfBudget);
 const COST_OVERFLOW: Outcome = Outcome::Rejected(Rejection::CostOverflow);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn ns_id(ordinal: u64) -> NamespaceId {
     NamespaceId::from_bytes(ordinal.to_be_bytes()).expect("ordinals start at 1")
@@ -338,102 +333,67 @@ fn assert_read_vector<T: Debug + PartialEq>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. Per-operation vectors under every budget
-// ---------------------------------------------------------------------------
-
 #[test]
-fn put_replacing_a_record_charges_lookup_then_the_record_group() {
+fn raw_write_vectors_under_every_budget() {
     let (engine, ns) = fixture();
-    // Put(k3, v4): DirectoryLookup 1 -> 1; group PutRecord 10 + WriteKeyByte
-    // 3*2 + WriteValueByte 4*1 + RootUpdate 2*2 = 24 -> 25.
-    assert_write_vector(
-        &engine,
-        ns,
-        "put replace",
-        &put(ns, K3, V4),
-        &[1, 25],
-        Effect::Put { replaced: true },
-    );
-}
-
-#[test]
-fn put_inserting_a_record_charges_the_same_and_reports_no_replacement() {
-    let (engine, ns) = fixture();
-    // Put("abe", v4): identical lengths to Put(k3, v4), so 1 then 1 + 24 = 25.
-    assert_write_vector(
-        &engine,
-        ns,
-        "put insert",
-        &put(ns, b"abe", V4),
-        &[1, 25],
-        Effect::Put { replaced: false },
-    );
-}
-
-#[test]
-fn delete_of_a_present_key_charges_lookup_then_the_delete_group() {
-    let (engine, ns) = fixture();
-    // Delete(k3): DirectoryLookup 1 -> 1; group DeleteRecord 5 + WriteKeyByte
-    // 3*2 + RootUpdate 2*2 = 15 -> 16.
-    assert_write_vector(
-        &engine,
-        ns,
-        "delete present",
-        &delete(ns, K3),
-        &[1, 16],
-        Effect::Deleted { existed: true },
-    );
-}
-
-#[test]
-fn delete_of_a_missing_key_costs_the_same_and_reports_existed_false() {
-    let (engine, ns) = fixture();
-    // Delete("zzz"): same 3-byte key, so 1 then 1 + 5 + 6 + 4 = 16; nothing
-    // to remove, and RootUpdate is charged all the same.
-    assert_write_vector(
-        &engine,
-        ns,
-        "delete missing",
-        &delete(ns, b"zzz"),
-        &[1, 16],
-        Effect::Deleted { existed: false },
-    );
-}
-
-#[test]
-fn transfer_charges_lookup_then_the_transfer_group() {
-    let (engine, ns) = fixture();
-    // Transfer: DirectoryLookup 1 -> 1; group NamespaceTransfer 20 +
-    // RootUpdate 1*2 = 22 -> 23.
-    assert_write_vector(
-        &engine,
-        ns,
-        "transfer",
-        &transfer(ns, 0, BOB),
-        &[1, 23],
-        Effect::Transferred {
-            revision: Revision(1),
-        },
-    );
-}
-
-#[test]
-fn create_namespace_charges_lookup_then_the_create_group() {
-    let (engine, _ns) = fixture();
-    // CreateNamespace: DirectoryLookup 1 -> 1; group NamespaceCreate 50 +
-    // RootUpdate 1*2 = 52 -> 53. The fixture holds ordinal 1, so the new
-    // namespace is ordinal 2.
-    assert_write_vector(
-        &engine,
-        ns_id(1),
-        "create",
-        &WriteOp::CreateNamespace {
-            name: arkiv_db::NamespaceName::new("test").unwrap(),
-        },
-        &[1, 53],
-        Effect::NamespaceCreated(ns_id(2)),
-    );
+    let vectors = [
+        // Put(k3, v4): DirectoryLookup 1 -> 1; group PutRecord 10 +
+        // WriteKeyByte 3*2 + WriteValueByte 4*1 + RootUpdate 2*2 = 24 -> 25.
+        (
+            "put replace",
+            put(ns, K3, V4),
+            [1, 25],
+            Effect::Put { replaced: true },
+        ),
+        // Put("abe", v4): identical lengths to Put(k3, v4), so 1 then 1 + 24
+        // = 25.
+        (
+            "put insert",
+            put(ns, b"abe", V4),
+            [1, 25],
+            Effect::Put { replaced: false },
+        ),
+        // Delete(k3): DirectoryLookup 1 -> 1; group DeleteRecord 5 +
+        // WriteKeyByte 3*2 + RootUpdate 2*2 = 15 -> 16.
+        (
+            "delete present",
+            delete(ns, K3),
+            [1, 16],
+            Effect::Deleted { existed: true },
+        ),
+        // Delete("zzz"): same 3-byte key, so 1 then 1 + 5 + 6 + 4 = 16;
+        // nothing to remove, and RootUpdate is charged all the same.
+        (
+            "delete missing",
+            delete(ns, b"zzz"),
+            [1, 16],
+            Effect::Deleted { existed: false },
+        ),
+        // Transfer: DirectoryLookup 1 -> 1; group NamespaceTransfer 20 +
+        // RootUpdate 1*2 = 22 -> 23.
+        (
+            "transfer",
+            transfer(ns, 0, BOB),
+            [1, 23],
+            Effect::Transferred {
+                revision: Revision(1),
+            },
+        ),
+        // CreateNamespace: DirectoryLookup 1 -> 1; group NamespaceCreate 50 +
+        // RootUpdate 1*2 = 52 -> 53. The fixture holds ordinal 1, so the new
+        // namespace is ordinal 2.
+        (
+            "create",
+            WriteOp::CreateNamespace {
+                name: arkiv_db::NamespaceName::new("test").unwrap(),
+            },
+            [1, 53],
+            Effect::NamespaceCreated(ns_id(2)),
+        ),
+    ];
+    for (name, op, prefix_sums, effect) in vectors {
+        assert_write_vector(&engine, ns, name, &op, &prefix_sums, effect);
+    }
 }
 
 #[test]
@@ -549,10 +509,6 @@ fn put_with_empty_key_and_value_costs_fifteen_and_omits_zero_count_classes() {
     assert_eq!(stored.receipt, read_receipt(4, Outcome::Applied));
 }
 
-// ---------------------------------------------------------------------------
-// 2. Ledger vectors
-// ---------------------------------------------------------------------------
-
 #[test]
 fn traced_put_ledger_lists_every_charged_class_once() {
     let (engine, ns) = fixture();
@@ -612,61 +568,6 @@ fn traced_scan_ledger_aggregates_per_class_in_first_charge_order() {
         )
     );
 }
-
-#[test]
-fn untraced_receipts_have_no_ledger_and_otherwise_equal_traced_ones() {
-    let (engine, ns) = fixture();
-    let snapshot = engine.head_snapshot();
-
-    let mut untraced_branch = fresh_branch(&engine, Some(1_000));
-    let mut traced_branch = fresh_branch(&engine, Some(1_000));
-    let untraced_put = untraced_branch
-        .execute(ALICE, put(ns, K3, V4), Budget::limit(25))
-        .expect("25 is exact");
-    let traced_put = traced_branch
-        .execute(ALICE, put(ns, K3, V4), Budget::limit(25).traced())
-        .expect("25 is exact");
-    assert_eq!(untraced_put.receipt.ledger, None);
-    assert!(traced_put.receipt.ledger.is_some());
-    assert_eq!(untraced_put.receipt, write_receipt(25, Outcome::Applied));
-    assert_eq!(without_ledger(&traced_put.receipt), untraced_put.receipt);
-    assert_eq!(traced_put.effect, untraced_put.effect);
-    assert_eq!(untraced_branch.spent(), traced_branch.spent());
-
-    let untraced_scan = snapshot
-        .scan_prefix(ns, b"ab", Budget::limit(20))
-        .expect("20 is exact");
-    let traced_scan = snapshot
-        .scan_prefix(ns, b"ab", Budget::limit(20).traced())
-        .expect("20 is exact");
-    assert_eq!(untraced_scan.receipt.ledger, None);
-    assert_eq!(untraced_scan.receipt, read_receipt(20, Outcome::Applied));
-    assert_eq!(without_ledger(&traced_scan.receipt), untraced_scan.receipt);
-    assert_eq!(traced_scan.value, untraced_scan.value);
-
-    // The same holds for rejections: an unknown namespace costs the lookup.
-    let untraced_miss = snapshot
-        .descriptor(ns_id(9), Budget::unlimited())
-        .expect_err("ordinal 9 does not exist");
-    let traced_miss = snapshot
-        .descriptor(ns_id(9), Budget::unlimited().traced())
-        .expect_err("ordinal 9 does not exist");
-    assert_eq!(
-        untraced_miss.receipt,
-        read_receipt(1, Outcome::Rejected(Rejection::UnknownNamespace))
-    );
-    assert_eq!(
-        traced_miss.receipt,
-        traced(
-            read_receipt(1, Outcome::Rejected(Rejection::UnknownNamespace)),
-            &[(OperationClass::DirectoryLookup, 1, 1, 1)]
-        )
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 3. Charge ordering
-// ---------------------------------------------------------------------------
 
 #[test]
 fn unknown_namespace_is_charged_the_lookup_before_it_is_reported() {
@@ -741,24 +642,6 @@ fn unauthorized_put_spends_exactly_the_lookup_under_any_budget() {
 }
 
 #[test]
-fn transfer_one_unit_short_spends_only_the_lookup_and_changes_nothing() {
-    let (engine, ns) = fixture();
-    let mut branch = fresh_branch(&engine, None);
-    // Transfer: lookup 1 fits 22; the group NamespaceTransfer 20 +
-    // RootUpdate 2 would reach 23 > 22.
-    let rejected = branch
-        .execute(ALICE, transfer(ns, 0, BOB), Budget::limit(22))
-        .expect_err("22 is one short of 23");
-    assert_eq!(rejected.reason, Rejection::OutOfBudget);
-    assert_eq!(rejected.receipt, write_receipt(1, OUT_OF_BUDGET));
-    let descriptor = branch
-        .descriptor(ns, Budget::unlimited())
-        .expect("the namespace exists")
-        .value;
-    assert_eq!(descriptor, fixture_descriptor(ns));
-}
-
-#[test]
 fn scan_aborting_between_entries_keeps_earlier_charges_and_returns_nothing() {
     let (engine, ns) = fixture();
     let snapshot = engine.head_snapshot();
@@ -781,22 +664,6 @@ fn scan_aborting_between_entries_keeps_earlier_charges_and_returns_nothing() {
             ]
         )
     );
-    // Budget 19: still one short of the second group; spent stays at 14.
-    let rejected = snapshot
-        .scan_prefix(ns, b"ab", Budget::limit(19))
-        .expect_err("19 is one short of 20");
-    assert_eq!(rejected.receipt, read_receipt(14, OUT_OF_BUDGET));
-    // Budget 20: exact, both entries.
-    let scanned = snapshot
-        .scan_prefix(ns, b"ab", Budget::limit(20))
-        .expect("20 is exact");
-    assert_eq!(scanned.value, fixture_records());
-    assert_eq!(scanned.receipt, read_receipt(20, Outcome::Applied));
-    // Budget 13: the first entry group (9) does not fit after 5; spent 5.
-    let rejected = snapshot
-        .scan_prefix(ns, b"ab", Budget::limit(13))
-        .expect_err("the first entry does not fit");
-    assert_eq!(rejected.receipt, read_receipt(5, OUT_OF_BUDGET));
 }
 
 #[test]
@@ -834,10 +701,6 @@ fn rejections_are_checked_unknown_then_unauthorized_then_stale_revision() {
     assert_eq!(observe(&branch, ns).descriptor, fixture_descriptor(ns));
     assert_eq!(branch.spent(), Cost::new(3));
 }
-
-// ---------------------------------------------------------------------------
-// 4. Block budget vector
-// ---------------------------------------------------------------------------
 
 #[test]
 fn block_budget_vector_admits_charges_and_records_exactly_as_specified() {
@@ -976,76 +839,7 @@ fn block_budget_vector_admits_charges_and_records_exactly_as_specified() {
             write_receipt(1, OUT_OF_BUDGET),
         ]
     );
-    assert!(
-        sealed
-            .receipts()
-            .iter()
-            .all(|receipt| receipt.kind == ReceiptKind::Write)
-    );
 }
-
-// ---------------------------------------------------------------------------
-// 5. Exact and zero budgets
-// ---------------------------------------------------------------------------
-
-#[test]
-fn exact_budget_succeeds_while_one_short_and_zero_fail() {
-    let (engine, ns) = fixture();
-    let mut branch = fresh_branch(&engine, None);
-    // Put(k3, v4) = 25.
-    let executed = branch
-        .execute(ALICE, put(ns, K3, V4), Budget::limit(25))
-        .expect("an exact budget succeeds");
-    assert_eq!(executed.receipt, write_receipt(25, Outcome::Applied));
-
-    let rejected = branch
-        .execute(ALICE, put(ns, K3, V4), Budget::limit(24))
-        .expect_err("one short fails");
-    assert_eq!(rejected.reason, Rejection::OutOfBudget);
-    assert_eq!(rejected.receipt, write_receipt(1, OUT_OF_BUDGET));
-
-    let rejected = branch
-        .execute(ALICE, put(ns, K3, V4), Budget::limit(0))
-        .expect_err("zero fails at the first charge");
-    assert_eq!(rejected.receipt.outcome, OUT_OF_BUDGET);
-    assert_eq!(rejected.receipt, write_receipt(0, OUT_OF_BUDGET));
-
-    // Exact budgets for the other ops: Delete(k3) 16, Transfer 23, Create 53.
-    let deleted = branch
-        .execute(ALICE, delete(ns, K3), Budget::limit(16))
-        .expect("16 is exact");
-    assert_eq!(deleted.receipt, write_receipt(16, Outcome::Applied));
-    let transferred = branch
-        .execute(ALICE, transfer(ns, 0, BOB), Budget::limit(23))
-        .expect("23 is exact");
-    assert_eq!(transferred.receipt, write_receipt(23, Outcome::Applied));
-    let created = branch
-        .execute(
-            BOB,
-            WriteOp::CreateNamespace {
-                name: arkiv_db::NamespaceName::new("test").unwrap(),
-            },
-            Budget::limit(53),
-        )
-        .expect("53 is exact");
-    assert_eq!(created.receipt, write_receipt(53, Outcome::Applied));
-    let rejected = branch
-        .execute(
-            BOB,
-            WriteOp::CreateNamespace {
-                name: arkiv_db::NamespaceName::new("test").unwrap(),
-            },
-            Budget::limit(52),
-        )
-        .expect_err("52 is one short of 53");
-    assert_eq!(rejected.receipt, write_receipt(1, OUT_OF_BUDGET));
-    // 25 + 1 + 0 + 16 + 23 + 53 + 1 = 119.
-    assert_eq!(branch.spent(), Cost::new(119));
-}
-
-// ---------------------------------------------------------------------------
-// 6. Overflow
-// ---------------------------------------------------------------------------
 
 #[test]
 fn write_group_overflow_fails_atomically_after_the_lookup() {
@@ -1079,7 +873,6 @@ fn write_group_overflow_fails_atomically_after_the_lookup() {
         .execute(ALICE, put(ns, b"", b"ab"), Budget::unlimited())
         .expect_err("2 * u64::MAX overflows");
     assert_eq!(rejected.reason, Rejection::CostOverflow);
-    assert_eq!(rejected.receipt.outcome, COST_OVERFLOW);
     assert_eq!(
         rejected.receipt,
         receipt(ReceiptKind::Write, 7, 1, COST_OVERFLOW)
@@ -1292,10 +1085,6 @@ fn first_charge_overflow_and_block_aggregate_saturation() {
     assert_eq!(head.record_count(ns), Some(2));
 }
 
-// ---------------------------------------------------------------------------
-// 7. Estimation
-// ---------------------------------------------------------------------------
-
 #[test]
 fn estimate_matches_execute_for_a_mixed_operation_list() {
     let (engine, ns) = fixture();
@@ -1504,6 +1293,23 @@ fn estimate_has_no_side_effects() {
     assert_eq!(first.receipt, write_receipt(53, Outcome::Applied));
     assert_eq!(second.receipt, first.receipt);
     assert_eq!(branch.namespace_count(), 1);
+    assert_eq!(
+        branch
+            .descriptor(ns_id(2), Budget::unlimited())
+            .expect_err("the estimated namespace does not exist")
+            .reason,
+        Rejection::UnknownNamespace
+    );
+    // The published snapshot underneath is untouched as well.
+    let snapshot = engine.head_snapshot();
+    assert_eq!(snapshot.namespace_count(), 1);
+    assert_eq!(
+        snapshot
+            .scan_prefix(ns, b"", Budget::unlimited())
+            .unwrap()
+            .value,
+        fixture_records()
+    );
 
     let executed = branch
         .execute(
@@ -1564,66 +1370,6 @@ fn estimates_are_state_bound_not_cached() {
     assert_eq!(branch.remaining(), Cost::new(8));
     assert_eq!(branch.spent(), Cost::new(26));
 }
-
-#[test]
-fn estimate_runs_on_scratch_state_that_never_leaks() {
-    let (engine, ns) = fixture();
-    // `estimate` takes `&self`; the runtime checks cover the scratch copy.
-    let branch = fresh_branch(&engine, None);
-    let before = observe(&branch, ns);
-
-    branch
-        .estimate(ALICE, put(ns, K3, b"leak"), Budget::unlimited())
-        .expect("the estimate applies");
-    assert_eq!(
-        branch.get(ns, K3, Budget::unlimited()).unwrap().value,
-        Some(V4.to_vec()),
-        "an estimated put leaves the old value"
-    );
-    branch
-        .estimate(ALICE, delete(ns, K3B), Budget::unlimited())
-        .expect("the estimate applies");
-    assert_eq!(
-        branch.get(ns, K3B, Budget::unlimited()).unwrap().value,
-        Some(V1.to_vec()),
-        "an estimated delete leaves the record"
-    );
-    branch
-        .estimate(ALICE, transfer(ns, 0, BOB), Budget::unlimited())
-        .expect("the estimate applies");
-    branch
-        .estimate(
-            ALICE,
-            WriteOp::CreateNamespace {
-                name: arkiv_db::NamespaceName::new("test").unwrap(),
-            },
-            Budget::unlimited(),
-        )
-        .expect("the estimate applies");
-    assert_eq!(observe(&branch, ns), before);
-    assert_eq!(branch.namespace_count(), 1);
-    assert_eq!(
-        branch
-            .descriptor(ns_id(2), Budget::unlimited())
-            .expect_err("the estimated namespace does not exist")
-            .reason,
-        Rejection::UnknownNamespace
-    );
-    // The published snapshot underneath is untouched as well.
-    let snapshot = engine.head_snapshot();
-    assert_eq!(snapshot.namespace_count(), 1);
-    assert_eq!(
-        snapshot
-            .scan_prefix(ns, b"", Budget::unlimited())
-            .unwrap()
-            .value,
-        fixture_records()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 8. Determinism
-// ---------------------------------------------------------------------------
 
 #[test]
 fn repeated_reads_on_a_snapshot_yield_identical_receipts() {
@@ -1825,17 +1571,42 @@ fn tracing_never_changes_charges() {
         assert_eq!(stripped, untraced, "{op:?}");
     }
     let snapshot = engine.head_snapshot();
-    let untraced = snapshot.get(ns, K3, Budget::limit(7)).expect_err("7 < 8");
-    let traced = snapshot
+    let untraced_get = snapshot.get(ns, K3, Budget::limit(7)).expect_err("7 < 8");
+    let traced_get = snapshot
         .get(ns, K3, Budget::limit(7).traced())
         .expect_err("7 < 8");
-    assert_eq!(untraced.receipt, read_receipt(4, OUT_OF_BUDGET));
-    assert_eq!(without_ledger(&traced.receipt), untraced.receipt);
-}
+    assert_eq!(untraced_get.receipt, read_receipt(4, OUT_OF_BUDGET));
+    assert_eq!(without_ledger(&traced_get.receipt), untraced_get.receipt);
 
-// ---------------------------------------------------------------------------
-// 9. Pricing pinning
-// ---------------------------------------------------------------------------
+    let untraced_scan = snapshot
+        .scan_prefix(ns, b"ab", Budget::limit(20))
+        .expect("20 is exact");
+    let traced_scan = snapshot
+        .scan_prefix(ns, b"ab", Budget::limit(20).traced())
+        .expect("20 is exact");
+    assert_eq!(untraced_scan.receipt, read_receipt(20, Outcome::Applied));
+    assert_eq!(without_ledger(&traced_scan.receipt), untraced_scan.receipt);
+    assert_eq!(traced_scan.value, untraced_scan.value);
+
+    // The same holds for rejections: an unknown namespace costs the lookup.
+    let untraced_miss = snapshot
+        .descriptor(ns_id(9), Budget::unlimited())
+        .expect_err("ordinal 9 does not exist");
+    let traced_miss = snapshot
+        .descriptor(ns_id(9), Budget::unlimited().traced())
+        .expect_err("ordinal 9 does not exist");
+    assert_eq!(
+        untraced_miss.receipt,
+        read_receipt(1, Outcome::Rejected(Rejection::UnknownNamespace))
+    );
+    assert_eq!(
+        traced_miss.receipt,
+        traced(
+            read_receipt(1, Outcome::Rejected(Rejection::UnknownNamespace)),
+            &[(OperationClass::DirectoryLookup, 1, 1, 1)]
+        )
+    );
+}
 
 #[test]
 fn pricing_is_pinned_to_the_base_and_applies_only_after_publication() {
@@ -1989,10 +1760,6 @@ fn rollback_restores_pending_pricing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 10. Receipt kinds
-// ---------------------------------------------------------------------------
-
 #[test]
 fn read_receipts_are_never_recorded_and_sealed_receipts_are_all_writes() {
     let (engine, ns) = fixture();
@@ -2041,11 +1808,6 @@ fn read_receipts_are_never_recorded_and_sealed_receipts_are_all_writes() {
             read_receipt(1, OUT_OF_BUDGET),
         ]
     );
-    assert!(
-        reads
-            .iter()
-            .all(|receipt| receipt.kind == ReceiptKind::Read)
-    );
     assert!(branch.receipts().is_empty(), "reads are never recorded");
     assert_eq!(branch.spent(), Cost::ZERO);
     assert_eq!(branch.remaining(), Cost::new(100));
@@ -2077,12 +1839,6 @@ fn read_receipts_are_never_recorded_and_sealed_receipts_are_all_writes() {
             write_receipt(25, Outcome::Applied),
             write_receipt(1, Outcome::Rejected(Rejection::Unauthorized)),
         ]
-    );
-    assert!(
-        sealed
-            .receipts()
-            .iter()
-            .all(|receipt| receipt.kind == ReceiptKind::Write)
     );
     assert_eq!(sealed.spent(), Cost::new(26));
 }

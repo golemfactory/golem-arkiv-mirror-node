@@ -1,6 +1,7 @@
 //! State retention on a signed full node: every state consumer refuses
 //! heights below the floor with an explicit HistoryPruned error, serves the
 //! floor and the head, and archive (the default) is unchanged.
+
 use alloy_primitives::{U256, keccak256};
 use arkiv_db::{
     CellName, Value as DbValue,
@@ -29,6 +30,7 @@ fn signer(who: u8) -> Signer {
     key[31] = who;
     Signer::from_bytes(key).unwrap()
 }
+
 fn genesis() -> SignedGenesis {
     let funded = [1, 2].map(|who| {
         (
@@ -45,6 +47,7 @@ fn genesis() -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn create(nonce: u64) -> SignedTx {
     let signer = signer(2);
     let mut request = [0; 32];
@@ -119,20 +122,28 @@ async fn call(rt: &Shared, method: &str, params: Value) -> Value {
     )
     .await
 }
+
 fn ok(answer: &Value) -> &Value {
     assert!(answer.get("error").is_none(), "{answer}");
     &answer["result"]
 }
+
 fn pruned(answer: &Value, requested: u64, floor: u64) {
     assert_eq!(
         answer["error"],
-        json!({"code":rpc::HISTORY_PRUNED_CODE,"message":format!("history pruned: requested {requested}, floor {floor}"),"data":{"requested":format!("0x{requested:x}"),"floor":format!("0x{floor:x}")}}),
+        json!({
+            "code": rpc::HISTORY_PRUNED_CODE,
+            "message": format!("history pruned: requested {requested}, floor {floor}"),
+            "data": {"requested": format!("0x{requested:x}"), "floor": format!("0x{floor:x}")},
+        }),
         "{answer}"
     );
 }
+
 fn address() -> String {
     hex(signer(2).address().as_bytes())
 }
+
 fn entity_nonce_call() -> Value {
     let mut data = keccak256(b"entityNonce(address)")[..4].to_vec();
     data.extend([0; 12]);
@@ -295,7 +306,13 @@ async fn rest_answers_410_with_floor_details() {
     assert_eq!(status["stateRetentionWindow"], "2");
     assert_eq!(status["stateFloor"], "4");
     assert_eq!(status["receiptFloor"], "5");
-    let gone = |height: u64| json!({"error":"HistoryPruned","requestedHeight":height.to_string(),"stateFloor":"4"});
+    let gone = |height: u64| {
+        json!({
+            "error": "HistoryPruned",
+            "requestedHeight": height.to_string(),
+            "stateFloor": "4",
+        })
+    };
     for path in ["", "/proof"] {
         let r = client
             .get(format!(
@@ -337,7 +354,15 @@ async fn rest_answers_410_with_floor_details() {
     for (height, expect) in [("3", Some(gone(3))), ("6", None)] {
         let resolved: Value = client
             .post(format!("{url}/signed/v1/query/resolve"))
-            .json(&json!({"height":height,"namespace":"1","attribute":"group","valueType":"u64","value":"1","limit":1,"cursor":null}))
+            .json(&json!({
+                "height": height,
+                "namespace": "1",
+                "attribute": "group",
+                "valueType": "u64",
+                "value": "1",
+                "limit": 1,
+                "cursor": null,
+            }))
             .send()
             .await
             .unwrap()

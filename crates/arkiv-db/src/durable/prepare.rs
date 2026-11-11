@@ -1,6 +1,6 @@
 use super::{DurableError, Options};
 use crate::{
-    MapKind, Value,
+    Value,
     engine::WorkingState,
     layout::{Blob, NamespaceState, Posting, StoredRecord},
 };
@@ -16,7 +16,6 @@ pub struct PreparationStats {
     pub payload_bytes: usize,
     pub batch_container_bytes: usize,
     pub dedup_entry_bytes: usize,
-    pub emitted_by_map: BTreeMap<MapKind, u64>,
 }
 
 impl From<StageError> for DurableError {
@@ -106,7 +105,6 @@ pub(crate) struct Staging {
     pub(crate) stats: PreparationStats,
     seen: BTreeMap<(SpaceId, ObjectId), usize>,
     space: SpaceId,
-    map: MapKind,
     options: Options,
 }
 
@@ -131,7 +129,6 @@ impl Staging {
             },
             seen: BTreeMap::new(),
             space: SpaceId::Catalog,
-            map: MapKind::Catalog,
             options: options.clone(),
         };
         let mut budget = StageBudget::new(options.prepare_visits);
@@ -139,26 +136,23 @@ impl Staging {
             .catalog
             .try_stage_with(&mut sink, &mut budget, &mut |leaf, sink, budget| {
                 let space = SpaceId::Namespace(leaf.descriptor.id.ordinal());
-                sink.simple(&leaf.records, space, MapKind::Records, budget)?;
-                sink.simple(&leaf.typed.keys, space, MapKind::Keys, budget)?;
-                sink.simple(&leaf.typed.rows, space, MapKind::Rows, budget)?;
+                sink.simple(&leaf.records, space, budget)?;
+                sink.simple(&leaf.typed.keys, space, budget)?;
+                sink.simple(&leaf.typed.rows, space, budget)?;
                 sink.space = space;
-                sink.map = MapKind::Terms;
                 leaf.typed.terms.try_stage_with(
                     sink,
                     budget,
                     &mut |posting: &Posting, sink, budget| {
-                        sink.simple(&posting.0, space, MapKind::Postings, budget)?;
+                        sink.simple(&posting.0, space, budget)?;
                         sink.space = space;
-                        sink.map = MapKind::Terms;
                         Ok(())
                     },
                 )?;
                 sink.space = SpaceId::Catalog;
-                sink.map = MapKind::Catalog;
                 Ok(())
             })?;
-        sink.simple(&state.host, SpaceId::Host, MapKind::Host, &mut budget)?;
+        sink.simple(&state.host, SpaceId::Host, &mut budget)?;
         sink.stats.staging_visits = budget.visited();
         sink.stats.unique_objects = sink.objects.len();
         sink.stats.batch_container_bytes =
@@ -174,11 +168,9 @@ impl Staging {
         &mut self,
         map: &MerkleMap<K, V>,
         space: SpaceId,
-        kind: MapKind,
         budget: &mut StageBudget,
     ) -> Result<(), DurableError> {
         self.space = space;
-        self.map = kind;
         map.try_stage_with(self, budget, &mut |_, _, _| Ok(()))
     }
 }
@@ -186,7 +178,6 @@ impl Staging {
 impl TryObjectSink for Staging {
     type Error = DurableError;
     fn record(&mut self, id: crate::B256, bytes: &[u8]) -> Result<(), DurableError> {
-        *self.stats.emitted_by_map.entry(self.map).or_default() += 1;
         let key = (self.space, id.0);
         if let Some(index) = self.seen.get(&key) {
             if self.objects[*index].2 != bytes {

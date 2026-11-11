@@ -1,5 +1,8 @@
 # Rogue One: fresh 21,000-gas transfer chain
 
+Dated run record of one deployment (2026-09-26, host `rogue-one.eu`). It is
+not product documentation and is not kept up to date.
+
 The 2026-09-26 reset replaces chain 9008 with **chain 9009**. Plain native
 transfers now cost exactly 21,000 gas, including transactions submitted in
 legacy or EIP-1559 Ethereum encoding. `eth_estimateGas` returns 21,000 for
@@ -38,7 +41,7 @@ including transaction fees.
 
 ## Deployment and credentials
 
-Host-private deployment directory: `/home/ubuntu/.config/rogue-one-9009`.
+The deployment directory is private to the host (`$DEPLOY`).
 The `rogue-one-current` symlink selects the active deployment. `compose.json`
 starts node, indexer, explorer, panels, PostgreSQL, Redis and faucet services;
 `identity.json`, `bundle/report.json` and `release.json` record public trust pins,
@@ -56,7 +59,7 @@ only the login password for operators. `keys/faucet.key` is the funding key.
 Never print, commit or put these credentials in URLs. Existing Google explorer
 login settings and baseload mnemonic are retained in private environment files.
 
-Operate with `sudo /home/ubuntu/.config/rogue-one-current/compose ...`.
+Operate with `sudo $DEPLOY/compose ...`.
 Do not recreate genesis or delete data/volumes during an ordinary restart.
 The stopped chain 9008 deployment and volumes remain available for recovery;
 its services share host ports and must not run beside chain 9009.
@@ -78,9 +81,8 @@ Verified deployment identity:
 - Faucet verification transaction: `0x889aec6d784a2b345f1e2b6e7294a8fad060f12a0b4bf73bff9765141cbb853e`
 - Faucet receipt: block 93, 21,000 gas, 0.000021 GLM fee.
 
-Validation passed 962 workspace tests (three heavy tests explicitly ignored),
-the isolated native-account process smoke test, and upstream faucet tests under
-the Go race detector. Live verification passed both Ethereum transaction types,
+Validation ran the workspace tests, the isolated native-account process smoke
+test, and upstream faucet tests under the Go race detector. Live verification passed both Ethereum transaction types,
 SDK creation, follower replay/proofs, indexing, authentication, and exact faucet
 fees. Restart verification preserved genesis, all tested transfer receipts and
 faucet balance across all three node roles. Public metrics remained available.

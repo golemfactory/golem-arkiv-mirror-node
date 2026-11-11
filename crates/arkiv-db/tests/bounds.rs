@@ -1,4 +1,6 @@
-//! Admission boundaries applied to real block packets and historical states.
+//! Admission bounds on names, raw keys and indexed values, on branches and
+//! published snapshots.
+
 use std::ops::Bound;
 
 use arkiv_db::*;
@@ -186,8 +188,7 @@ fn raw_keys_and_prefixes_are_rejected_before_any_lookup_or_write_charge() {
 }
 
 #[test]
-fn index_values_have_a_hard_byte_cap_while_payloads_keep_their_own_limit() {
-    // Raising the payload limit cannot raise the indexed-value cap.
+fn raising_payload_limits_does_not_raise_the_indexed_string_limit() {
     let mut engine = Engine::with_limits(
         PriceSchedule::FIXTURE,
         Limits {
@@ -200,7 +201,8 @@ fn index_values_have_a_hard_byte_cap_while_payloads_keep_their_own_limit() {
     let ns = create_namespace(&mut branch, "shop");
     let name = CellName::new(&"a".repeat(20)).unwrap();
     let payload = CellName::new("payload").unwrap();
-    let value = Value::str(&"é".repeat(arkiv_db::Limits::DEFAULT_INDEXED_LEN / 2)); // 32 characters, 64 UTF-8 bytes.
+    // 64 characters, 128 UTF-8 bytes: exactly the indexed limit.
+    let value = Value::str(&"é".repeat(Limits::DEFAULT_INDEXED_LEN / 2));
     let large = Value::bytes(&vec![0; 8192]);
     let key = RecordKey::new(b"row").unwrap();
     branch
@@ -219,10 +221,7 @@ fn index_values_have_a_hard_byte_cap_while_payloads_keep_their_own_limit() {
         .unwrap();
     let spent = branch.spent();
     let receipts = branch.receipts().len();
-    let too_long = Value::str(&format!(
-        "{}x",
-        "é".repeat(arkiv_db::Limits::DEFAULT_INDEXED_LEN / 2)
-    ));
+    let too_long = Value::str(&format!("{}x", "é".repeat(Limits::DEFAULT_INDEXED_LEN / 2)));
     for op in [
         WriteOp::CreateRecord {
             namespace: ns,
@@ -263,7 +262,7 @@ fn index_values_have_a_hard_byte_cap_while_payloads_keep_their_own_limit() {
         Query::term(Term::not_eq(name.clone(), too_long.clone())),
         Query::term(Term::starts_with(
             name.clone(),
-            &"x".repeat(arkiv_db::Limits::DEFAULT_INDEXED_LEN + 1),
+            &"x".repeat(Limits::DEFAULT_INDEXED_LEN + 1),
         )),
     ];
     let reason = Rejection::InvalidQuery(QueryFault::ValueTooLarge);
@@ -325,10 +324,7 @@ fn index_values_have_a_hard_byte_cap_while_payloads_keep_their_own_limit() {
     assert!(row.cells.contains(&(payload, Cell::field(large))));
     for term in [
         Term::eq(name.clone(), value.clone()),
-        Term::starts_with(
-            name.clone(),
-            &"é".repeat(arkiv_db::Limits::DEFAULT_INDEXED_LEN / 2),
-        ),
+        Term::starts_with(name.clone(), &"é".repeat(Limits::DEFAULT_INDEXED_LEN / 2)),
     ] {
         assert_eq!(
             snapshot

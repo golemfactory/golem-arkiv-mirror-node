@@ -83,53 +83,43 @@ fn put_host(branch: &mut Branch, key: [u8; 32], value: &[u8]) {
 }
 
 #[test]
-fn a_due_count_without_records_is_inconsistent() {
+fn inconsistent_due_schedules_abort_the_block() {
     let chain = chain_with_due_record();
-    let mut branch = branch(&chain);
-    // Two due at height 3 in namespace 2, but only one record expires.
-    put_host(&mut branch, due_key(3, 2), &count(2));
-    put_host(&mut branch, total_key(3), &count(2));
-    assert_eq!(
-        run(&chain, branch, &BlockInputs::default()),
-        Err(ExecError::ScheduleInconsistent(
+    for (entries, fault) in [
+        // Two due at height 3 in namespace 2, but only one record expires.
+        (
+            vec![(due_key(3, 2), 2), (total_key(3), 2)],
             ScheduleFault::CountMismatch {
                 height: 3,
                 namespace: ns(2),
                 due: 2,
                 deleted: 1,
-            }
-        ))
-    );
-}
-
-#[test]
-fn a_total_that_disagrees_with_its_counts_is_inconsistent() {
-    let chain = chain_with_due_record();
-    let mut branch = branch(&chain);
-    put_host(&mut branch, total_key(3), &count(5));
-    assert_eq!(
-        run(&chain, branch, &BlockInputs::default()),
-        Err(ExecError::ScheduleInconsistent(
+            },
+        ),
+        // A total that disagrees with its counts.
+        (
+            vec![(total_key(3), 5)],
             ScheduleFault::TotalMismatch {
                 height: 3,
                 total: 5,
                 due: 1,
-            }
-        ))
-    );
-}
-
-#[test]
-fn a_total_without_counts_is_inconsistent() {
-    let chain = chain_with_due_record();
-    let mut branch = branch(&chain);
-    put_host(&mut branch, total_key(2), &count(1));
-    assert_eq!(
-        run(&chain, branch, &BlockInputs::default()),
-        Err(ExecError::ScheduleInconsistent(
-            ScheduleFault::OrphanTotal { height: 2 }
-        ))
-    );
+            },
+        ),
+        // A total without counts.
+        (
+            vec![(total_key(2), 1)],
+            ScheduleFault::OrphanTotal { height: 2 },
+        ),
+    ] {
+        let mut branch = branch(&chain);
+        for (key, n) in entries {
+            put_host(&mut branch, key, &count(n));
+        }
+        assert_eq!(
+            run(&chain, branch, &BlockInputs::default()),
+            Err(ExecError::ScheduleInconsistent(fault))
+        );
+    }
 }
 
 #[test]

@@ -19,11 +19,9 @@ impl From<TrieError> for CopyFailure {
     }
 }
 
-/// A direct-mapped cache bounds duplicate posting work independently of the
-/// number of terms. A collision only repeats a traversal. The nonzero length
-/// marks an occupied slot: decoded term leaves cannot contain empty postings.
 /// At 48 bytes per slot the production cache retains exactly 768 KiB.
 pub(super) const POSTING_CACHE_SLOTS: usize = 16_384;
+const _: () = assert!(size_of::<CopiedPosting>() * POSTING_CACHE_SLOTS == 768 * 1024);
 
 #[derive(Clone, Copy, Default)]
 struct CopiedPosting {
@@ -32,6 +30,9 @@ struct CopiedPosting {
     len: u64,
 }
 
+/// A direct-mapped cache bounds duplicate posting work independently of the
+/// number of terms. A collision only repeats a traversal. The nonzero length
+/// marks an occupied slot: decoded term leaves cannot contain empty postings.
 pub(super) struct PostingCache {
     slots: Box<[CopiedPosting]>,
 }
@@ -598,11 +599,5 @@ mod tests {
             assert_eq!(source.stats().object_reads(), reads + 1);
             assert!(!copy.postings.borrow().contains(&root.0, 1, 1).unwrap());
         }
-    }
-
-    #[test]
-    fn posting_cache_capacity_is_fixed() {
-        let cache = PostingCache::new(POSTING_CACHE_SLOTS);
-        assert_eq!(std::mem::size_of_val(&*cache.slots), 768 * 1024);
     }
 }

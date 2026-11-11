@@ -1,4 +1,5 @@
 //! Bounded signed node transport. Equality and complete index-range proofs.
+
 #[path = "range_api.rs"]
 mod range_api;
 #[path = "state_api.rs"]
@@ -48,6 +49,7 @@ pub enum Node {
         identity: Identity,
     },
 }
+
 impl Node {
     pub fn genesis(&self) -> &SignedGenesis {
         match self {
@@ -55,18 +57,21 @@ impl Node {
             Self::Light { light, .. } => &light.genesis,
         }
     }
+
     pub fn identity(&self) -> &Identity {
         match self {
             Self::Full(h) => &h.identity,
             Self::Light { identity, .. } => identity,
         }
     }
+
     pub fn head(&self) -> crate::Header {
         match self {
             Self::Full(h) => h.head,
             Self::Light { light, .. } => light.head,
         }
     }
+
     pub fn certificate(&self, height: u64) -> Result<SignedHeader> {
         match self {
             Self::Full(h) => h.certificate(height),
@@ -74,12 +79,13 @@ impl Node {
         }
     }
 }
+
 pub struct Runtime {
     /// The node lock. Writers that keep the chain moving take it with
     /// [`Self::write_node`], reads that must not fail on a momentary holder
-    /// with [`Self::read_node`] and JSON-RPC requests with
-    /// [`Self::rpc_node`]; transaction admission and control try it once
-    /// and answer `ServerBusy`.
+    /// with `read_node` and JSON-RPC requests with
+    /// `rpc_node`. Transaction admission and control use
+    /// `read_node` too.
     pub node: Mutex<Node>,
     /// Writers waiting in [`Self::write_node`]; reads yield to them.
     writers: AtomicUsize,
@@ -104,7 +110,9 @@ pub struct Runtime {
     pub(super) rpc: Mutex<super::rpc::RpcState>,
     continuations: Mutex<VecDeque<(String, EqRequest, VerifiedContinuation)>>,
 }
+
 pub type Shared = Arc<Runtime>;
+
 impl Runtime {
     pub fn new(
         node: Node,
@@ -114,6 +122,7 @@ impl Runtime {
     ) -> Result<Shared> {
         Self::with_read_limits(node, peer, replication_peer, token, ReadLimits::default())
     }
+
     pub fn with_read_limits(
         node: Node,
         peer: Option<String>,
@@ -146,31 +155,37 @@ impl Runtime {
             replication_peer,
             token,
             client,
-            slots: Arc::new(Semaphore::new(4)),
+            slots: Arc::new(Semaphore::new(READ_CONCURRENCY)),
             reads,
             rpc: Mutex::new(rpc),
             continuations: Mutex::new(VecDeque::new()),
         }))
     }
+
     pub fn read_limits(&self) -> ReadLimits {
         self.reads.limits()
     }
+
     /// Detached reads currently holding a read permit.
     pub fn reads_in_flight(&self) -> usize {
         self.reads.in_flight()
     }
-    /// Reads polling the node lock in [`Self::read_node`].
+
+    /// Reads polling the node lock in `read_node`.
     pub fn reads_waiting(&self) -> usize {
         self.waiting_reads.load(Ordering::SeqCst)
     }
-    /// JSON-RPC requests polling the node lock in [`Self::rpc_node`].
+
+    /// JSON-RPC requests polling the node lock in `rpc_node`.
     pub fn requests_waiting(&self) -> usize {
         self.waiting_rpc.load(Ordering::SeqCst)
     }
+
     /// Writers waiting for the node lock in [`Self::write_node`].
     pub fn writers_waiting(&self) -> usize {
         self.writers.load(Ordering::SeqCst)
     }
+
     /// Takes the node lock for a writer that keeps the chain moving (block
     /// production, follower sync), waiting for the current holder; call it
     /// from a blocking thread only. Writers are the only callers that queue
@@ -181,6 +196,7 @@ impl Runtime {
         let _writer = Count::new(&self.writers);
         self.node.lock().map_err(|_| Error("StorageUnavailable"))
     }
+
     /// Takes the node lock for a read that must not fail just because the
     /// lock is held at that moment (a detached read's capture, a REST
     /// request, a light node's verified read); call it from a blocking
@@ -195,6 +211,7 @@ impl Runtime {
             .map_err(|_| Error("StorageUnavailable"))?;
         self.poll_node(Some(deadline), READ)
     }
+
     /// Takes the node lock for a JSON-RPC request, which waits for it
     /// without a deadline; from a blocking thread only. Requests take turns
     /// like reads, apart from them, so a flood of requests competes with
@@ -206,6 +223,7 @@ impl Runtime {
             .map_err(|_| Error("StorageUnavailable"))?;
         self.poll_node(None, RPC)
     }
+
     /// Polls the node lock for the read or JSON-RPC request (`kind`) whose
     /// turn it is, answering `ServerBusy` at `deadline` if any. It never
     /// queues on the mutex and does not try while a writer waits, nor while
@@ -252,6 +270,7 @@ impl Runtime {
         }
     }
 }
+
 /// Whose turn the node lock is ([`Runtime::poll_node`]): either kind's, a
 /// read's or a JSON-RPC request's.
 const ANY: u8 = 0;
@@ -269,17 +288,20 @@ const FIRST_PAUSE: Duration = Duration::from_micros(20);
 const LONGEST_PAUSE: Duration = Duration::from_micros(200);
 /// Counts its holder in an [`AtomicUsize`] while it lives.
 struct Count<'a>(&'a AtomicUsize);
+
 impl<'a> Count<'a> {
     fn new(counter: &'a AtomicUsize) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self(counter)
     }
 }
+
 impl Drop for Count<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
 /// Runs `f` under [`Runtime::read_node`] on a blocking thread that keeps the
 /// request's admission `permit` until it returns, even after cancellation.
 async fn with_node<T: Send + 'static>(
@@ -295,6 +317,7 @@ async fn with_node<T: Send + 'static>(
     .await
     .map_err(|_| Error("StorageUnavailable"))?
 }
+
 /// Runs `f` under [`Runtime::write_node`] on a blocking thread.
 async fn writing<T: Send + 'static>(
     rt: &Shared,
@@ -305,6 +328,7 @@ async fn writing<T: Send + 'static>(
         .await
         .map_err(|_| Error("StorageUnavailable"))?
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenesisResponse {
@@ -312,6 +336,7 @@ pub struct GenesisResponse {
     pub genesis_bytes: String,
     pub certificate_bytes: String,
 }
+
 impl GenesisResponse {
     pub fn validate(
         &self,
@@ -336,6 +361,7 @@ impl GenesisResponse {
         Ok((genesis, certificate))
     }
 }
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Headers {
@@ -343,6 +369,7 @@ pub struct Headers {
     pub certificates: Vec<String>,
     pub sampled: String,
 }
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReadQuery {
@@ -351,9 +378,15 @@ struct ReadQuery {
     after_hash: Option<String>,
     limit: Option<usize>,
 }
+
 fn snapshot(header: &crate::Header) -> Json {
-    json!({"height":header.height.to_string(),"hash":hex(header.hash().as_slice()),"stateRoot":hex(header.state_root.as_slice())})
+    json!({
+        "height": header.height.to_string(),
+        "hash": hex(header.hash().as_slice()),
+        "stateRoot": hex(header.state_root.as_slice()),
+    })
 }
+
 pub fn status(node: &Node) -> Json {
     let genesis = node.genesis();
     // A permanent-prefill launch (versions 3 and 4) also holds rent-free
@@ -385,32 +418,65 @@ pub fn status(node: &Node) -> Json {
         "rentReceiptField":"rentFee",
         // Rent is bounded by the sender's balance only, not by anything the
         // transaction signs; the pool reserves a quote with a height margin.
-        "rentBound":"sender-balance", "rentQuoteMarginBlocks":crate::signed::pool::RENT_QUOTE_MARGIN_BLOCKS.to_string(),
+        "rentBound":"sender-balance",
+        "rentQuoteMarginBlocks":crate::signed::pool::RENT_QUOTE_MARGIN_BLOCKS.to_string(),
         "maxNewStorageUnitsPerBlock":params.max_new_storage_units_per_block.to_string(),
         "permanentEntitiesSupported":true, "refunds":false, "storageRefunds":false,
         "unusedGasRefunds":true,
         "scope":"live-state logical occupancy; archive history excluded"
     });
+    let read_mode = if matches!(node, Node::Light { .. }) {
+        "forwarded-unverified"
+    } else {
+        "local-unverified"
+    };
     capabilities["sdkRpcProfile"] = json!({
-        "id":"arkiv-sdk-native-v1", "endpoint":"/", "transports":["http-jsonrpc","websocket-jsonrpc"],
-        "ethereumCompatibleConsensus":false, "completeEthereumApi":false,
-        "signedWrites":true,
-        "transactionFormats":["eip155-legacy","eip1559-empty-access-list"],
-        "queryLanguage":"bounded-typed-boolean", "queryProofs":false,
-        "queryOperators":["equality","inequality","ranges","prefix","and","or","not","exists","typeof"],
-        "subscriptions":["newHeads","logs"], "readMode":if matches!(node,Node::Light{..}){"forwarded-unverified"}else{"local-unverified"},
-        "unsupported":["arbitrary-evm","contract-creation","nonempty-access-lists","ethereum-mpt-roots"],
-        "feePolicy":"fixed-one-gwei; signed-prices-are-ceilings; no-priority-payment"
+        "id": "arkiv-sdk-native-v1",
+        "endpoint": "/",
+        "transports": ["http-jsonrpc", "websocket-jsonrpc"],
+        "ethereumCompatibleConsensus": false,
+        "completeEthereumApi": false,
+        "signedWrites": true,
+        "transactionFormats": ["eip155-legacy", "eip1559-empty-access-list"],
+        "queryLanguage": "bounded-typed-boolean",
+        "queryProofs": false,
+        "queryOperators": [
+            "equality",
+            "inequality",
+            "ranges",
+            "prefix",
+            "and",
+            "or",
+            "not",
+            "exists",
+            "typeof",
+        ],
+        "subscriptions": ["newHeads", "logs"],
+        "readMode": read_mode,
+        "unsupported": [
+            "arbitrary-evm",
+            "contract-creation",
+            "nonempty-access-lists",
+            "ethereum-mpt-roots",
+        ],
+        "feePolicy": "fixed-one-gwei; signed-prices-are-ceilings; no-priority-payment",
     });
     // Every lifetime of at least `maxRentLifetimeSeconds`, permanent
     // (`expiresAt` = u64::MAX) included, pays the same capped rent.
     capabilities["gas"]["permanentEntities"] = json!({
-        "expiresAt":u64::MAX.to_string(), "expirySweep":false,
-        "liveCreate":true, "liveExtendToPermanent":"owner-only", "liveUpdate":true, "liveDelete":true,
-        "extendPermanent":"owner-only no-op-success; a finite expiry is ExpiryShortened",
-        "permissionlessExtensionLimit":"height + maxRentLifetimeBlocks; further, permanence included, is owner-only (PermanenceOwnerOnly)",
-        "rent":"capped-at-maxRentLifetimeSeconds",
-        "genesisRows":if permanent_prefill {"sponsored-without-rent"} else {"none"}
+        "expiresAt": u64::MAX.to_string(),
+        "expirySweep": false,
+        "liveCreate": true,
+        "liveExtendToPermanent": "owner-only",
+        "liveUpdate": true,
+        "liveDelete": true,
+        "extendPermanent": "owner-only no-op-success; a finite expiry is ExpiryShortened",
+        "permissionlessExtensionLimit": concat!(
+            "height + maxRentLifetimeBlocks; further, permanence included, ",
+            "is owner-only (PermanenceOwnerOnly)",
+        ),
+        "rent": "capped-at-maxRentLifetimeSeconds",
+        "genesisRows": if permanent_prefill {"sponsored-without-rent"} else {"none"},
     });
     capabilities["genesisPrefill"] = json!(genesis.prefill.is_some());
     capabilities["signatures"] = json!(true);
@@ -423,12 +489,43 @@ pub fn status(node: &Node) -> Json {
         ),
         Node::Light { light, .. } => ("light", light.health, false),
     };
-    let mut value = json!({"apiVersion":1,"feedVersion":1,"identity":node.identity(),"sourceId":node.identity().source_id,"runId":node.identity().run_id,"genesisHash":node.identity().genesis_hash,"chainId":node.identity().chain_id,"sourceKind":"arkiv-native-signed","authentication":"signed-proposer-v1","proposer":hex(&node.genesis().proposer),"consensus":false,"finality":false,"role":role,"health":health,"paused":paused,"head":snapshot(&node.head()),"durability":"durable","bodyRetention":if matches!(node,Node::Light{..}){"headers-only"}else{"all"},"proofProfiles":[crate::simulator::profile::PROOF_PROFILE,range_api::PROFILE],"capabilities":capabilities});
+    let body_retention = if matches!(node, Node::Light { .. }) {
+        "headers-only"
+    } else {
+        "all"
+    };
+    let mut value = json!({
+        "apiVersion": 1,
+        "feedVersion": 1,
+        "identity": node.identity(),
+        "sourceId": node.identity().source_id,
+        "runId": node.identity().run_id,
+        "genesisHash": node.identity().genesis_hash,
+        "chainId": node.identity().chain_id,
+        "sourceKind": "arkiv-native-signed",
+        "authentication": "signed-proposer-v1",
+        "proposer": hex(&node.genesis().proposer),
+        "consensus": false,
+        "finality": false,
+        "role": role,
+        "health": health,
+        "paused": paused,
+        "head": snapshot(&node.head()),
+        "durability": "durable",
+        "bodyRetention": body_retention,
+        "proofProfiles": [crate::simulator::profile::PROOF_PROFILE, range_api::PROFILE],
+        "capabilities": capabilities,
+    });
     // State retention of this node (a light node keeps no state: null).
     let retention = match node {
         Node::Full(h) => crate::retention::status(&h.engine),
         Node::Light { .. } => {
-            json!({"stateRetention":null,"stateRetentionWindow":null,"stateFloor":null,"receiptFloor":null})
+            json!({
+                "stateRetention": null,
+                "stateRetentionWindow": null,
+                "stateFloor": null,
+                "receiptFloor": null,
+            })
         }
     };
     if let (Some(value), Json::Object(fields)) = (value.as_object_mut(), retention) {
@@ -436,6 +533,7 @@ pub fn status(node: &Node) -> Json {
     }
     value
 }
+
 /// Details of this request's `HistoryPruned` refusal, recorded on the host
 /// while the request held the node lock.
 fn refusal(rt: &Shared, result: &Result<Json>) -> Option<(u64, u64)> {
@@ -447,13 +545,16 @@ fn refusal(rt: &Shared, result: &Result<Json>) -> Option<(u64, u64)> {
         Node::Light { .. } => None,
     }
 }
+
 fn respond(rt: &Shared, result: Result<Json>) -> Response {
     let refusal = refusal(rt, &result);
     response_with(result, refusal)
 }
+
 fn response(result: Result<Json>) -> Response {
     response_with(result, None)
 }
+
 fn response_with(result: Result<Json>, refusal: Option<(u64, u64)>) -> Response {
     match result {
         Ok(value) => match json_bytes(&value, RESPONSE_CAP) {
@@ -484,6 +585,7 @@ fn response_with(result: Result<Json>, refusal: Option<(u64, u64)>) -> Response 
         }
     }
 }
+
 fn actor(s: &str) -> Result<OwnerId> {
     Ok(OwnerId::new(
         unhex(s, 20)?
@@ -491,6 +593,7 @@ fn actor(s: &str) -> Result<OwnerId> {
             .map_err(|_| Error("InvalidRequest"))?,
     ))
 }
+
 fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     if path == "status" {
         return Ok(status(node));
@@ -504,15 +607,19 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     }
     if path == "prefill" {
         return match node {
-            Node::Full(host) => Ok(
-                json!({"prefillBytes":hex(host.prefill_stream.as_ref().ok_or(Error("PrefillBundleRequired"))?)}),
-            ),
+            Node::Full(host) => {
+                let stream = host
+                    .prefill_stream
+                    .as_ref()
+                    .ok_or(Error("PrefillBundleRequired"))?;
+                Ok(json!({"prefillBytes": hex(stream)}))
+            }
             _ => Err(Error("FullNodeRequired")),
         };
     }
     if path == "headers" || path == "feed/blocks" {
-        let limit = q.limit.unwrap_or(64);
-        if !(1..=64).contains(&limit) {
+        let limit = q.limit.unwrap_or(HEADER_BATCH);
+        if !(1..=HEADER_BATCH).contains(&limit) {
             return Err(Error("InvalidRequest"));
         }
         let start = if let Some(after) = &q.after_height {
@@ -555,9 +662,11 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
                 break;
             }
         }
-        return Ok(
-            json!({"identity":node.identity(),"blocks":blocks,"sampled":pack(&node.certificate(node.head().height)?)}),
-        );
+        return Ok(json!({
+            "identity": node.identity(),
+            "blocks": blocks,
+            "sampled": pack(&node.certificate(node.head().height)?),
+        }));
     }
     if let Some(height) = path.strip_prefix("feed/blocks/") {
         let Node::Full(h) = node else {
@@ -584,9 +693,12 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
         };
         let address = actor(address)?;
         let committed = h.committed_nonce(address)?;
-        return Ok(
-            json!({"actor":hex(address.as_bytes()),"committedNextNonce":committed.to_string(),"pendingNextNonce":h.pool.contiguous_next(address,committed).to_string(),"sampled":snapshot(&h.head)}),
-        );
+        return Ok(json!({
+            "actor": hex(address.as_bytes()),
+            "committedNextNonce": committed.to_string(),
+            "pendingNextNonce": h.pool.contiguous_next(address, committed).to_string(),
+            "sampled": snapshot(&h.head),
+        }));
     }
     if let ["requests", address, id] = parts.as_slice() {
         let Node::Full(h) = node else {
@@ -601,6 +713,7 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     }
     Err(Error("InvalidRequest"))
 }
+
 /// Bounded binary transport for a file-backed canonical genesis stream.
 /// The follower verifies the complete stream against its pinned genesis.
 #[derive(Deserialize)]
@@ -609,6 +722,7 @@ struct PrefillChunkQuery {
     offset: u64,
     length: u32,
 }
+
 async fn prefill_chunk(State(rt): State<Shared>, Query(q): Query<PrefillChunkQuery>) -> Response {
     const CHUNK_CAP: u32 = 1024 * 1024;
     if q.length == 0 || q.length > CHUNK_CAP {
@@ -672,6 +786,7 @@ async fn prefill_chunk(State(rt): State<Shared>, Query(q): Query<PrefillChunkQue
         Err(error) => response(Err(error)),
     }
 }
+
 async fn http_read(
     State(rt): State<Shared>,
     Path(path): Path<String>,
@@ -693,6 +808,7 @@ async fn http_read(
     .unwrap_or(Err(Error("StorageUnavailable")));
     respond(&rt, result)
 }
+
 async fn parse<T: serde::de::DeserializeOwned>(body: Body, cap: usize) -> Result<T> {
     let bytes = tokio::time::timeout(Duration::from_secs(5), to_bytes(body, cap))
         .await
@@ -700,32 +816,32 @@ async fn parse<T: serde::de::DeserializeOwned>(body: Body, cap: usize) -> Result
         .map_err(|_| Error("InvalidRequest"))?;
     serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AccountQuery {
     actor: String,
     height: String,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Submission {
     transaction_bytes: String,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProofRequest {
-    request: String,
-}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Classify {
     query: String,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Control {
     action: String,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TextQuery {
@@ -736,6 +852,7 @@ struct TextQuery {
     limit: u32,
     cursor: Option<String>,
 }
+
 async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Body) -> Response {
     let admission = match rt.slots.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -753,37 +870,125 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
     }
     let permit = Arc::new(admission);
     let shared = rt.clone();
-    let result:Result<Json>=async {
-        if matches!(path.as_str(), "query/range/resolve" | "query/range/verified" | "query/range/inspect") { return range_api::handle(rt.clone(), &path, body, permit.clone()).await; }
-        if path=="query/account" { let request: AccountQuery = parse(body, REQUEST_CAP).await?; return verified_account(rt.clone(), request, permit.clone()).await; }
-        if path=="query/classify" {let r:Classify=parse(body,REQUEST_CAP).await?;return Ok(json!(query_language::classify(&r.query)));}
-        if path=="query/text" {
-            let r:TextQuery=parse(body,REQUEST_CAP).await?;let classification=query_language::classify(&r.query);
-            let fail=if classification.language.status!="valid"{Some("QueryLanguageError")}else if r.require_proof&&classification.proof.status!="supported"{Some("UnsupportedProof")}else if classification.execution.status!="supported"{Some("UnsupportedQueryExecution")}else{None};
-            if let Some(code)=fail{return Ok(json!({"error":code,"queryText":r.query,"classification":classification,"verificationStatus":{"status":"not_executed"}}));}
-            let s=classification.selection.as_ref().ok_or(Error("UnsupportedQueryExecution"))?;
-            let request=VerifiedRequest {height:r.height,namespace:r.namespace,attribute:s.attribute.clone(),value_type:s.value_type.clone(),value:s.value.clone(),limit:r.limit,cursor:r.cursor};
-            return match verified(rt.clone(),request,true,permit.clone()).await {Ok(mut result)=>{result["classification"]=json!(classification);result["queryText"]=json!(r.query);result["verificationStatus"]=json!({"status":"verified"});Ok(result)},Err(e)=>Ok(json!({"error":e.0,"queryText":r.query,"classification":classification,"verificationStatus":{"status":if matches!(e.0,"ProofLimitExceeded"|"BudgetExceeded"){"resource_limit"}else{"failed"}}}))};
+    let result: Result<Json> = async {
+        if matches!(
+            path.as_str(),
+            "query/range/resolve" | "query/range/verified" | "query/range/inspect"
+        ) {
+            return range_api::handle(rt.clone(), &path, body, permit.clone()).await;
         }
-        if path=="query/verified"||path=="query/inspect" {let request=parse(body,REQUEST_CAP).await?;return verified(rt.clone(),request,path=="query/inspect",permit.clone()).await;}
-        let cap=if path=="transactions"{2*super::protocol::TX_CAP as usize+4096}else{REQUEST_CAP};
-        let bytes=tokio::time::timeout(Duration::from_secs(5),to_bytes(body,cap)).await.map_err(|_|Error("InvalidRequest"))?.map_err(|_|Error("InvalidRequest"))?;
-        let worker_permit=permit.clone();
-        tokio::task::spawn_blocking(move||{let _permit=worker_permit;
-            if path=="transactions" {
-                let r:Submission=serde_json::from_slice(&bytes).map_err(|_|Error("InvalidRequest"))?;
-                let tx:SignedTx=unpack(&r.transaction_bytes,super::protocol::TX_CAP as usize)?;
-                let genesis=rt.read_node()?.genesis().clone();tx.validate(&genesis)?;
-                let mut node=rt.read_node()?;
-                let Node::Full(h)=&mut*node else{return Err(Error("ProducerOnly"));};return h.submit(tx);
+        if path == "query/account" {
+            let request: AccountQuery = parse(body, REQUEST_CAP).await?;
+            return verified_account(rt.clone(), request, permit.clone()).await;
+        }
+        if path == "query/classify" {
+            let r: Classify = parse(body, REQUEST_CAP).await?;
+            return Ok(json!(query_language::classify(&r.query)));
+        }
+        if path == "query/text" {
+            let r: TextQuery = parse(body, REQUEST_CAP).await?;
+            let classification = query_language::classify(&r.query);
+            let fail = if classification.language.status != "valid" {
+                Some("QueryLanguageError")
+            } else if r.require_proof && classification.proof.status != "supported" {
+                Some("UnsupportedProof")
+            } else if classification.execution.status != "supported" {
+                Some("UnsupportedQueryExecution")
+            } else {
+                None
+            };
+            if let Some(code) = fail {
+                return Ok(json!({
+                    "error": code,
+                    "queryText": r.query,
+                    "classification": classification,
+                    "verificationStatus": {"status": "not_executed"},
+                }));
             }
-            if path=="query/resolve" {let r:VerifiedRequest=serde_json::from_slice(&bytes).map_err(|_|Error("InvalidRequest"))?;if r.cursor.is_some(){return Err(Error("CursorMismatch"));}let node=rt.read_node()?;let header=node.certificate(number(&r.height)?)?.header;return Ok(json!({"request":pack(&resolve(node.identity(),&header,&r)?)}));}
+            let s = classification
+                .selection
+                .as_ref()
+                .ok_or(Error("UnsupportedQueryExecution"))?;
+            let request = VerifiedRequest {
+                height: r.height,
+                namespace: r.namespace,
+                attribute: s.attribute.clone(),
+                value_type: s.value_type.clone(),
+                value: s.value.clone(),
+                limit: r.limit,
+                cursor: r.cursor,
+            };
+            return match verified(rt.clone(), request, true, permit.clone()).await {
+                Ok(mut result) => {
+                    result["classification"] = json!(classification);
+                    result["queryText"] = json!(r.query);
+                    result["verificationStatus"] = json!({"status": "verified"});
+                    Ok(result)
+                }
+                Err(e) => {
+                    let status = if matches!(e.0, "ProofLimitExceeded" | "BudgetExceeded") {
+                        "resource_limit"
+                    } else {
+                        "failed"
+                    };
+                    Ok(json!({
+                        "error": e.0,
+                        "queryText": r.query,
+                        "classification": classification,
+                        "verificationStatus": {"status": status},
+                    }))
+                }
+            };
+        }
+        if path == "query/verified" || path == "query/inspect" {
+            let request = parse(body, REQUEST_CAP).await?;
+            return verified(rt.clone(), request, path == "query/inspect", permit.clone()).await;
+        }
+        let cap = if path == "transactions" {
+            2 * super::protocol::TX_CAP as usize + 4096
+        } else {
+            REQUEST_CAP
+        };
+        let bytes = tokio::time::timeout(Duration::from_secs(5), to_bytes(body, cap))
+            .await
+            .map_err(|_| Error("InvalidRequest"))?
+            .map_err(|_| Error("InvalidRequest"))?;
+        let worker_permit = permit.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = worker_permit;
+            if path == "transactions" {
+                let r: Submission =
+                    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))?;
+                let tx: SignedTx = unpack(&r.transaction_bytes, super::protocol::TX_CAP as usize)?;
+                let genesis = rt.read_node()?.genesis().clone();
+                tx.validate(&genesis)?;
+                let mut node = rt.read_node()?;
+                let Node::Full(h) = &mut *node else {
+                    return Err(Error("ProducerOnly"));
+                };
+                return h.submit(tx);
+            }
+            if path == "query/resolve" {
+                let r: VerifiedRequest =
+                    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))?;
+                if r.cursor.is_some() {
+                    return Err(Error("CursorMismatch"));
+                }
+                let node = rt.read_node()?;
+                let header = node.certificate(number(&r.height)?)?.header;
+                let request = resolve(node.identity(), &header, &r)?;
+                return Ok(json!({"request": pack(&request)}));
+            }
             Err(Error("InvalidRequest"))
-        }).await.map_err(|_|Error("StorageUnavailable"))?
-    }.await;
+        })
+        .await
+        .map_err(|_| Error("StorageUnavailable"))?
+    }
+    .await;
     drop(permit);
     respond(&shared, result)
 }
+
 /// `query/eq` on a full node, a detached read (see [`super::reads`]).
 async fn eq_proof(
     rt: Shared,
@@ -807,6 +1012,7 @@ async fn eq_proof(
         })
         .await
 }
+
 async fn verified_account(
     rt: Shared,
     request: AccountQuery,
@@ -852,10 +1058,20 @@ async fn verified_account(
     if accepted.await? != header {
         return Err(Error("ChainConflict"));
     }
-    Ok(
-        json!({"actor":hex(actor.as_bytes()),"height":height.to_string(),"blockHash":hex(header.hash().as_slice()),"balanceWei":account.balance.to_string(),"nextNonce":account.nonce.to_string(),"gasPriceWei":crate::accounts::GAS_PRICE_WEI.to_string(),"initialSupplyWei":initial.to_string(),"burnedWei":burned.to_string(),"totalSupplyWei":(initial-burned).to_string(),"verificationStatus":{"status":"verified","profile":"glm-account-v1"}}),
-    )
+    Ok(json!({
+        "actor": hex(actor.as_bytes()),
+        "height": height.to_string(),
+        "blockHash": hex(header.hash().as_slice()),
+        "balanceWei": account.balance.to_string(),
+        "nextNonce": account.nonce.to_string(),
+        "gasPriceWei": crate::accounts::GAS_PRICE_WEI.to_string(),
+        "initialSupplyWei": initial.to_string(),
+        "burnedWei": burned.to_string(),
+        "totalSupplyWei": (initial-burned).to_string(),
+        "verificationStatus": {"status": "verified", "profile": "glm-account-v1"},
+    }))
 }
+
 async fn verified(
     rt: Shared,
     r: VerifiedRequest,
@@ -914,26 +1130,115 @@ async fn verified(
             RESPONSE_CAP / 2
         },
     )?;
-    tokio::task::spawn_blocking(move||{let _permit=permit;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         // Verified outside the node lock against the captured header, which
         // the catalog must still hold afterwards.
-        let verified=super::light::verify_eq_at(&genesis,&header,&request,previous.as_ref(),&bytes)?;
-        if rt.read_node()?.certificate(header.height)?.header!=header{return Err(Error("ChainConflict"));}
-        let VerifiedEq::Page(page)=verified else{return Err(Error("NamespaceNotFound"));};
-        let rows=page.rows.iter().cloned().map(|r|crate::simulator::metadata::record_change(request.query.namespace,r)).collect::<Result<Vec<_>>>()?;
-        let entities=if request.query.namespace.ordinal()==1 {page.rows.iter().map(|row|{let p=crate::arkiv::project(row).map_err(|_|Error("InvalidProof"))?;if p.created_at>header.height||p.updated_at>header.height||(p.expires_at!=u64::MAX&&p.expires_at<=header.height){return Err(Error("InvalidProof"));}Ok(json!({"key":hex(&p.key),"owner":hex(&p.owner),"creator":hex(&p.creator),"creationFlags":{"raw":p.creation_flags,"readonly":p.creation_flags & 1 != 0,"permissionlessExtension":p.creation_flags & 2 != 0},"createdAt":p.created_at.to_string(),"updatedAt":p.updated_at.to_string(),"expiresAt":p.expires_at.to_string(),"attributes":super::rpc_reads::verified_attributes(&p)?}))}).collect::<Result<Vec<_>>>()?}else{vec![]};
-        let continuation=if let Some(token)=page.next {let mut input=encode(token.cursor());input.extend_from_slice(&request.limit.to_be_bytes());let id=hex(arkiv_db::digest("arkiv/signed-cursor/v1",&input).as_slice());let mut cache=rt.continuations.lock().map_err(|_|Error("StorageUnavailable"))?;if cache.len()>=64{cache.pop_front();}cache.push_back((id.clone(),request.clone(),token));Some(id)}else{None};
-        let mut result=json!({"verification":"proof verified against authenticated single-proposer header","identity":identity,"query":{"namespace":r.namespace,"attribute":r.attribute,"valueType":r.value_type,"value":r.value,"limit":r.limit},"snapshot":snapshot(&header),"certificateBytes":pack(&certificate),"rows":rows,"entities":entities,"continuation":continuation,"postingCount":page.posting_count,"profile":"arkiv-entity-v3"});
-        if inspect {let mut caps=proof_limits();caps.max_proof_bytes=crate::simulator::inspection::INSPECT_PROOF_CAP;let (_,inspection)=arkiv_db::proof::verify_eq_inspected(&request,previous.as_ref(),&bytes,caps,genesis.genesis.limits)?;result["canonicalRequest"]=json!(pack(&request));result["canonicalProof"]=json!(hex(&bytes));result["inspection"]=crate::simulator::inspection::json(&request,&inspection);}
+        let verified =
+            super::light::verify_eq_at(&genesis, &header, &request, previous.as_ref(), &bytes)?;
+        if rt.read_node()?.certificate(header.height)?.header != header {
+            return Err(Error("ChainConflict"));
+        }
+        let VerifiedEq::Page(page) = verified else {
+            return Err(Error("NamespaceNotFound"));
+        };
+        let rows = page
+            .rows
+            .iter()
+            .cloned()
+            .map(|r| crate::simulator::metadata::record_change(request.query.namespace, r))
+            .collect::<Result<Vec<_>>>()?;
+        let entities = if request.query.namespace.ordinal() == 1 {
+            page.rows
+                .iter()
+                .map(|row| {
+                    let p = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
+                    if p.created_at > header.height
+                        || p.updated_at > header.height
+                        || (p.expires_at != u64::MAX && p.expires_at <= header.height)
+                    {
+                        return Err(Error("InvalidProof"));
+                    }
+                    Ok(json!({
+                        "key": hex(&p.key),
+                        "owner": hex(&p.owner),
+                        "creator": hex(&p.creator),
+                        "creationFlags": {
+                            "raw": p.creation_flags,
+                            "readonly": p.creation_flags & 1 != 0,
+                            "permissionlessExtension": p.creation_flags & 2 != 0,
+                        },
+                        "createdAt": p.created_at.to_string(),
+                        "updatedAt": p.updated_at.to_string(),
+                        "expiresAt": p.expires_at.to_string(),
+                        "attributes": super::rpc_reads::verified_attributes(&p)?,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        let continuation = if let Some(token) = page.next {
+            let mut input = encode(token.cursor());
+            input.extend_from_slice(&request.limit.to_be_bytes());
+            let id = hex(arkiv_db::digest("arkiv/signed-cursor/v1", &input).as_slice());
+            let mut cache = rt
+                .continuations
+                .lock()
+                .map_err(|_| Error("StorageUnavailable"))?;
+            if cache.len() >= 64 {
+                cache.pop_front();
+            }
+            cache.push_back((id.clone(), request.clone(), token));
+            Some(id)
+        } else {
+            None
+        };
+        let mut result = json!({
+            "verification": "proof verified against authenticated single-proposer header",
+            "identity": identity,
+            "query": {
+                "namespace": r.namespace,
+                "attribute": r.attribute,
+                "valueType": r.value_type,
+                "value": r.value,
+                "limit": r.limit,
+            },
+            "snapshot": snapshot(&header),
+            "certificateBytes": pack(&certificate),
+            "rows": rows,
+            "entities": entities,
+            "continuation": continuation,
+            "postingCount": page.posting_count,
+            "profile": "arkiv-entity-v3",
+        });
+        if inspect {
+            let mut caps = proof_limits();
+            caps.max_proof_bytes = crate::simulator::inspection::INSPECT_PROOF_CAP;
+            let (_, inspection) = arkiv_db::proof::verify_eq_inspected(
+                &request,
+                previous.as_ref(),
+                &bytes,
+                caps,
+                genesis.genesis.limits,
+            )?;
+            result["canonicalRequest"] = json!(pack(&request));
+            result["canonicalProof"] = json!(hex(&bytes));
+            result["inspection"] = crate::simulator::inspection::json(&request, &inspection);
+        }
         Ok(result)
-    }).await.map_err(|_|Error("StorageUnavailable"))?
+    })
+    .await
+    .map_err(|_| Error("StorageUnavailable"))?
 }
+
 fn authorized(rt: &Runtime, headers: &HeaderMap) -> bool {
     rt.token.as_deref().is_some_and(|token| {
         headers.get("authorization").and_then(|v| v.to_str().ok())
             == Some(format!("Bearer {token}").as_str())
     })
 }
+
 async fn private(
     State(rt): State<Shared>,
     Path(path): Path<String>,
@@ -991,6 +1296,7 @@ async fn private(
     .await;
     response(result)
 }
+
 pub fn public_router(rt: Shared) -> Router {
     Router::new()
         .route("/docs", get(state_docs::html))
@@ -1004,11 +1310,13 @@ pub fn public_router(rt: Shared) -> Router {
         .route("/signed/v1/{*path}", get(http_read).post(http_post))
         .with_state(rt)
 }
+
 pub fn private_router(rt: Shared) -> Router {
     Router::new()
         .route("/signed/v1/{*path}", get(private).post(private))
         .with_state(rt)
 }
+
 pub async fn fetch<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     peer: &str,
@@ -1036,6 +1344,7 @@ pub async fn fetch<T: serde::de::DeserializeOwned>(
     .await
     .map_err(|_| Error("StorageUnavailable"))?
 }
+
 async fn fetch_once<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     peer: &str,
@@ -1088,6 +1397,7 @@ async fn fetch_once<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
 }
+
 /// One follower poll. Its lock sections are writes ([`Runtime::write_node`]):
 /// reads never starve a follower's sync.
 pub async fn sync_once(rt: Shared) -> Result<()> {
@@ -1108,14 +1418,15 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
             "/signed/v1/headers?afterHeight={}&afterHash={}&limit={}",
             head.height,
             hex(head.hash().as_slice()),
-            if is_light { 64 } else { 1 }
+            if is_light { HEADER_BATCH } else { 1 }
         ),
         None,
         None,
         REQUEST_CAP,
     )
     .await?;
-    if response.identity != identity || response.certificates.len() > if is_light { 64 } else { 1 }
+    if response.identity != identity
+        || response.certificates.len() > if is_light { HEADER_BATCH } else { 1 }
     {
         return Err(Error("IdentityMismatch"));
     }

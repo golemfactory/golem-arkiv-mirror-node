@@ -1,29 +1,14 @@
 //! Stored links: staging, committing, reopening from a root and lazy,
 //! fallible operation through a loader.
 //!
-//! Establishes, with the `HashMap`-backed `MemoryNodeStore` and loaders
-//! written here: staging a map emits exactly the objects the independent
-//! reference construction says the trie consists of (the root, whatever
-//! its size, and every node of 32 bytes or more), each once; a map reopened
-//! from `(root, len)` answers every read like the in-memory original while
-//! loading only the nodes each operation visits, with identical visit
-//! counts (so counts do not depend on what is cached); updates on the
-//! reopened map load only their paths (plus one collapse sibling), and
-//! staging afterwards emits only nodes of the new trie, including every one
-//! the store lacks, at most 2·LEN + 2 per update; an insert that creates
-//! exactly 2·LEN + 2 nodes and a removal that creates exactly 2·LEN exist
-//! (the per-update bounds); stored history stays readable; missing,
-//! corrupt and unreadable objects surface as errors from reads, iteration,
-//! updates and proofs, never as absent keys, and a host loader's own error
-//! type passes through unchanged; a caching loader that overrides `load`
-//! serves decoded nodes without store reads and without changing visit
-//! counts; maps nested in leaf values are staged through the value hook
-//! (same space, deduplicated) or `stage_with` (another space) and reopen
-//! lazily, also when a map of another value type staged a byte-identical
-//! leaf into the same sink first; hand-built tries whose hashes are valid
-//! but whose shape is not canonical (an extension over a leaf, a short node
-//! referenced by hash, a leaf at the wrong depth) are reported as
-//! inconsistent by the map and rejected by `walk`.
+//! The store is the `HashMap`-backed `MemoryNodeStore` with loaders written
+//! here. Expected object sets come from the independent reference
+//! construction in `support`, and visit counts are compared with the
+//! in-memory map, so they do not depend on what is cached. Missing, corrupt
+//! and unreadable objects must surface as errors, never as absent keys.
+//! The last test hand-builds tries with valid hashes and a non-canonical
+//! shape; of those, a root leaf shorter than the key reads as absent and
+//! fails only in iteration.
 
 mod support;
 
@@ -35,8 +20,8 @@ use std::{
 
 use alloy_primitives::{B256, keccak256};
 use arkiv_db_trie::{
-    CodecError, EMPTY_ROOT_HASH, MemoryNodeStore, MemoryOnly, MerkleMap, NodeBox, NodeLoader,
-    ObjectId, ObjectSink, Probe, Staged, TrieError, TrieValue, walk,
+    CodecError, MemoryNodeStore, MemoryOnly, MerkleMap, NodeBox, NodeLoader, ObjectId, ObjectSink,
+    Probe, Staged, TrieError, TrieValue, walk,
 };
 use support::{Rng, byte_model, deep_keys, hash_builder_root, reference};
 
@@ -449,7 +434,7 @@ fn missing_and_corrupt_objects_are_errors_not_absence() {
     let items: Vec<_> = map.iter(&store).collect();
     let before = items.iter().take_while(|item| item.is_ok()).count();
     assert_eq!(items.len(), before + 1);
-    assert_eq!(items[before], Err(missing.clone()));
+    assert_eq!(items[before], Err(missing));
     assert!(before <= model.keys().position(|key| key == victim_key).unwrap());
     // Keys that leave the victim's path at the root branch still read.
     let (other_key, other_value) = model
@@ -482,7 +467,7 @@ fn missing_and_corrupt_objects_are_errors_not_absence() {
     );
 
     // A lost root.
-    let mut empty_store = MemoryNodeStore::new();
+    let empty_store = MemoryNodeStore::new();
     assert_eq!(
         map.get(victim_key, &empty_store, &mut probe),
         Err(TrieError::Missing { id: root })
@@ -492,8 +477,6 @@ fn missing_and_corrupt_objects_are_errors_not_absence() {
         map.get(victim_key, &MemoryOnly, &mut probe),
         Err(TrieError::Missing { id: root })
     );
-    empty_store.commit(&Staged::new());
-    assert!(empty_store.is_empty());
 }
 
 /// A host storage error type, as an engine would define it.
@@ -806,12 +789,6 @@ fn stage_with_routes_nested_maps_to_another_space() {
         inner.extend(reference::objects(&posting_model(ids)));
     }
     assert_eq!(staged_ids(&inner_space), inner);
-    assert_eq!(
-        MerkleMap::<[u8; 4], Postings>::from_root(EMPTY_ROOT_HASH, 0)
-            .unwrap()
-            .root_hash(),
-        EMPTY_ROOT_HASH
-    );
 }
 
 /// Maps with different value types share a space, and so a sink. Here a

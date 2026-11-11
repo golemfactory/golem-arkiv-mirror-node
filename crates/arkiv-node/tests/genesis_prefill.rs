@@ -22,6 +22,7 @@ use std::sync::Arc;
 fn signer(n: u8) -> Signer {
     Signer::from_bytes([n; 32]).unwrap()
 }
+
 /// The unprefilled base, validated by `build_genesis` once the prefill is
 /// attached. The proposer intentionally has no allocation: a prefill chain
 /// has no bootstrap transaction to pay for.
@@ -40,6 +41,7 @@ fn base() -> SignedGenesis {
         prefill: None,
     }
 }
+
 fn limits() -> PrefillLimits {
     PrefillLimits {
         max_entities: 256,
@@ -47,6 +49,7 @@ fn limits() -> PrefillLimits {
         max_storage_units: MAX_STORAGE_UNITS,
     }
 }
+
 fn row(n: u64, height: u64) -> PrefillEntity {
     PrefillEntity {
         creator: *signer(2).address().as_bytes(),
@@ -66,9 +69,11 @@ fn row(n: u64, height: u64) -> PrefillEntity {
         ],
     }
 }
+
 fn build(rows: &[PrefillEntity]) -> SignedGenesis {
     build_genesis(base(), limits(), *signer(2).address().as_bytes(), rows).unwrap()
 }
+
 fn host(
     g: &SignedGenesis,
     stream: &[u8],
@@ -88,6 +93,7 @@ fn host(
     )
     .unwrap()
 }
+
 fn account_proof(h: &Host, l: &Light, who: u8, height: u64) -> (accounts::Account, U256, U256) {
     let snap = h
         .engine
@@ -104,6 +110,7 @@ fn account_proof(h: &Host, l: &Light, who: u8, height: u64) -> (accounts::Accoun
     )
     .unwrap()
 }
+
 #[test]
 fn canonical_stream_and_launch_are_order_independent_and_strict() {
     let mut rows = vec![row(0, 4), row(1, 5)];
@@ -146,6 +153,7 @@ fn canonical_stream_and_launch_are_order_independent_and_strict() {
     );
     assert_ne!(changed.hash(), g.hash());
 }
+
 #[test]
 fn invalid_nonces_system_cells_capacity_and_sponsor_fail() {
     assert!(encode_stream(&[row(1, 4)]).is_err());
@@ -161,8 +169,8 @@ fn invalid_nonces_system_cells_capacity_and_sponsor_fail() {
             .is_err()
         );
     }
-    // Beyond max_lifetime is no longer too far, and every finite expiry at
-    // or beyond the rent cap burns the same capped rent.
+    // An expiry beyond `max_lifetime` is accepted; every finite expiry at or
+    // beyond the rent cap burns the same capped rent.
     let cap = arkiv_node::gas::RentClock::of(&base().genesis.params)
         .unwrap()
         .cap_blocks();
@@ -228,8 +236,8 @@ fn invalid_nonces_system_cells_capacity_and_sponsor_fail() {
     assert!(error.contains("exceeds 1 MiB"), "{error}");
     let error = decode_stream(&vec![0; MAX_CANONICAL_BYTES as usize + 1]).unwrap_err();
     assert!(error.contains("exceeds 1 MiB"), "{error}");
-    // Payload-era rows are not a spelling of anything: a stream with the old
-    // codec is refused, and so are the removed system names.
+    // Row codec 1 and the `$payload` / `$contentType` system names are
+    // refused.
     let mut old = encode_stream(&rows).unwrap();
     old[8..12].copy_from_slice(&1u32.to_be_bytes());
     assert!(decode_stream(&old).is_err());
@@ -267,6 +275,7 @@ fn full_small_row_envelope_installs_without_truncation() {
     excess.push(row(256, 17));
     assert!(encode_stream(&excess).is_err());
 }
+
 #[test]
 fn empty_prefill_has_namespace_and_ordinary_block_one() {
     let g = build(&[]);
@@ -324,6 +333,7 @@ fn empty_prefill_has_namespace_and_ordinary_block_one() {
     );
     assert_eq!(h.engine.head_snapshot().try_namespace_count().unwrap(), 2);
 }
+
 #[test]
 fn prefills_replay_proofs_next_create_expiry_and_restart() {
     let rows = vec![row(0, 4), row(1, 5)];
@@ -484,6 +494,7 @@ fn prefills_replay_proofs_next_create_expiry_and_restart() {
 fn permanent_row(n: u64) -> PrefillEntity {
     row(n, PERMANENT_EXPIRY)
 }
+
 fn build_permanent(rows: &[PrefillEntity]) -> SignedGenesis {
     build_genesis_with(
         base(),
@@ -494,6 +505,7 @@ fn build_permanent(rows: &[PrefillEntity]) -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn entity_tx(g: &SignedGenesis, nonce: u64, operation: ArkivOperation) -> SignedTx {
     SignedTx::sign(
         g,
@@ -513,6 +525,7 @@ fn entity_tx(g: &SignedGenesis, nonce: u64, operation: ArkivOperation) -> Signed
     )
     .unwrap()
 }
+
 #[test]
 fn permanent_policy_is_explicit_and_changes_identity_only() {
     // The finite policy keeps rejecting the sentinel; the permanent one
@@ -565,10 +578,12 @@ fn permanent_policy_is_explicit_and_changes_identity_only() {
         "finite reports carry no permanent fields"
     );
 }
+
 fn has_no_permanent_fields(g: &SignedGenesis, stream: &[u8]) -> bool {
     let value = report(g, stream);
     value.get("permanentPrefill").is_none() && value.get("prefillVersion").is_none()
 }
+
 #[test]
 fn permanent_genesis_entities_survive_blocks_and_take_capped_live_updates() {
     let rows = permanent_chain_rows();
@@ -585,6 +600,7 @@ fn permanent_genesis_entities_survive_blocks_and_take_capped_live_updates() {
     };
     exercise_permanent_chain(&g, &rows, make(true), make(false));
 }
+
 /// The same rows as a version-4 (file-backed) launch: bulk construction,
 /// staged installation, then the same live behaviour as version 3.
 #[test]
@@ -650,10 +666,12 @@ fn streaming_permanent_genesis_installs_staged_state_and_behaves_the_same() {
     exercise_permanent_chain(&g, &rows, producer, full);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
 /// Nonce 0 expires at height 3; nonces 1 and 2 never expire.
 fn permanent_chain_rows() -> Vec<PrefillEntity> {
     vec![row(0, 3), permanent_row(1), permanent_row(2)]
 }
+
 fn exercise_permanent_chain(
     g: &SignedGenesis,
     rows: &[PrefillEntity],

@@ -114,7 +114,7 @@ With `E_old` the expiry before and `E_new` after an operation at height `h`:
 **Time passing.** The horizon is recomputed from the current height on every
 operation; nothing like a "paid through" height is stored. An entity created
 permanent at `h0` pays one cap; once `h0 + cap_blocks` passes it simply stays,
-with no further payment (the user-chosen rule: permanent costs the same as one
+with no further payment (the rule: permanent costs the same as one
 cap). Extending it again is a no-op success (`u64::MAX` is the only expiry
 that does not shorten it, and its horizon cannot grow), and a finite expiry is
 refused with `ExpiryShortened`. A finite entity may be extended to permanent:

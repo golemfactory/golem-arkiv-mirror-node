@@ -1,4 +1,5 @@
 //! Optional, private Prometheus exporter. Scrapes never walk redb or lock the node.
+
 use super::{
     Error, Result,
     runtime::{Node, Shared},
@@ -21,6 +22,7 @@ pub struct Database {
     pub path: PathBuf,
     pub store: Arc<RedbStore>,
 }
+
 #[derive(Default)]
 struct Sample {
     data: Option<DataStats>,
@@ -31,6 +33,7 @@ struct Sample {
     success: bool,
     errors: u64,
 }
+
 #[derive(Default)]
 struct NodeSample {
     head: Option<(u64, f64)>,
@@ -39,6 +42,7 @@ struct NodeSample {
     paused: Option<bool>,
     observed: Option<u64>,
 }
+
 #[derive(Default)]
 pub struct Activity {
     calls: AtomicU64,
@@ -47,6 +51,7 @@ pub struct Activity {
     produced: AtomicU64,
     nanos: AtomicU64,
 }
+
 impl Activity {
     pub fn record(&self, elapsed: Duration, result: &Result<bool>) {
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +73,7 @@ impl Activity {
         }
     }
 }
+
 pub struct Metrics {
     databases: Vec<Database>,
     samples: RwLock<Vec<Sample>>,
@@ -76,24 +82,32 @@ pub struct Metrics {
     role: &'static str,
     pub activity: Activity,
 }
+
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
 }
+
 fn gauge(out: &mut String, name: &str, help: &str, labels: &str, value: impl std::fmt::Display) {
     let _ = writeln!(
         out,
-        "# HELP rogue_one_{name} {help}\n# TYPE rogue_one_{name} gauge\nrogue_one_{name}{labels} {value}"
+        "# HELP rogue_one_{name} {help}\n\
+         # TYPE rogue_one_{name} gauge\n\
+         rogue_one_{name}{labels} {value}"
     );
 }
+
 fn counter(out: &mut String, name: &str, help: &str, labels: &str, value: u64) {
     let _ = writeln!(
         out,
-        "# HELP rogue_one_{name} {help}\n# TYPE rogue_one_{name} counter\nrogue_one_{name}{labels} {value}"
+        "# HELP rogue_one_{name} {help}\n\
+         # TYPE rogue_one_{name} counter\n\
+         rogue_one_{name}{labels} {value}"
     );
 }
+
 fn timings(out: &mut String, database: &str, layer: &str, samples: &[OperationTimingSnapshot]) {
     for s in samples {
         let labels = format!(
@@ -112,7 +126,10 @@ fn timings(out: &mut String, database: &str, layer: &str, samples: &[OperationTi
         }
         let _ = writeln!(
             out,
-            "rogue_one_db_operation_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\nrogue_one_db_operation_duration_seconds_count{{{labels}}} {}\nrogue_one_db_operation_duration_seconds_sum{{{labels}}} {}\nrogue_one_db_operation_errors_total{{{labels}}} {}",
+            "rogue_one_db_operation_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\n\
+             rogue_one_db_operation_duration_seconds_count{{{labels}}} {}\n\
+             rogue_one_db_operation_duration_seconds_sum{{{labels}}} {}\n\
+             rogue_one_db_operation_errors_total{{{labels}}} {}",
             s.count,
             s.count,
             s.total_nanoseconds as f64 / 1e9,
@@ -120,6 +137,7 @@ fn timings(out: &mut String, database: &str, layer: &str, samples: &[OperationTi
         );
     }
 }
+
 impl Metrics {
     pub async fn start(
         rt: Shared,
@@ -189,6 +207,7 @@ impl Metrics {
         });
         Ok(metrics)
     }
+
     fn refresh(&self) {
         for (i, db) in self.databases.iter().enumerate() {
             let started = Instant::now();
@@ -212,6 +231,7 @@ impl Metrics {
             }
         }
     }
+
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(20000);
         gauge(
@@ -248,7 +268,8 @@ impl Metrics {
                 gauge(
                     &mut out,
                     "head_timestamp_lag_seconds",
-                    "Wall clock minus sampled head timestamp; includes normal block interval and sample age.",
+                    "Wall clock minus sampled head timestamp; includes normal block interval and \
+                     sample age.",
                     "",
                     now() - timestamp,
                 );
@@ -327,10 +348,20 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
-            "# HELP rogue_one_node_tick_duration_seconds_total Total elapsed producer attempt or follower poll time.\n# TYPE rogue_one_node_tick_duration_seconds_total counter\nrogue_one_node_tick_duration_seconds_total {}",
+            "# HELP rogue_one_node_tick_duration_seconds_total Total elapsed producer attempt or \
+             follower poll time.\n\
+             # TYPE rogue_one_node_tick_duration_seconds_total counter\n\
+             rogue_one_node_tick_duration_seconds_total {}",
             self.activity.nanos.load(Ordering::Relaxed) as f64 / 1e9
         );
-        out.push_str("# HELP rogue_one_db_operation_duration_seconds Wall time of storage contract calls or backend I/O, including failures.\n# TYPE rogue_one_db_operation_duration_seconds histogram\n# HELP rogue_one_db_operation_errors_total Failed operation calls including indeterminate commits.\n# TYPE rogue_one_db_operation_errors_total counter\n");
+        out.push_str(
+            "# HELP rogue_one_db_operation_duration_seconds Wall time of storage contract calls or \
+         backend I/O, including failures.\n\
+         # TYPE rogue_one_db_operation_duration_seconds histogram\n\
+         # HELP rogue_one_db_operation_errors_total Failed operation calls including \
+         indeterminate commits.\n\
+         # TYPE rogue_one_db_operation_errors_total counter\n",
+        );
         for db in &self.databases {
             timings(&mut out, db.name, "store", &db.store.operation_timings());
             timings(
@@ -368,7 +399,8 @@ impl Metrics {
                 gauge(
                     &mut out,
                     "db_stats_timestamp_seconds",
-                    "Last successful storage sample Unix timestamp; old samples are retained on failure.",
+                    "Last successful storage sample Unix timestamp; old samples are retained on \
+                     failure.",
                     &labels,
                     t,
                 );
@@ -395,14 +427,16 @@ impl Metrics {
                 gauge(
                     &mut out,
                     "db_stored_bytes",
-                    "Encoded keys and values across redb user tables; includes application indexes and history, not payload-only bytes.",
+                    "Encoded keys and values across redb user tables; includes application \
+                     indexes and history, not payload-only bytes.",
                     &labels,
                     data.stored_bytes,
                 );
                 gauge(
                     &mut out,
                     "db_table_metadata_bytes",
-                    "B-tree metadata within user tables; excludes database directory and allocator.",
+                    "B-tree metadata within user tables; excludes database directory and \
+                     allocator.",
                     &labels,
                     data.metadata_bytes,
                 );
@@ -431,7 +465,8 @@ impl Metrics {
                     gauge(
                         &mut out,
                         "db_disk_overhead_bytes",
-                        "Allocated filesystem bytes minus encoded table bytes, floored at zero; includes free pages and all metadata.",
+                        "Allocated filesystem bytes minus encoded table bytes, floored at zero; \
+                         includes free pages and all metadata.",
                         &labels,
                         bytes.saturating_sub(data.stored_bytes),
                     );
@@ -518,6 +553,7 @@ fn group_families(text: &str) -> String {
     }
     output
 }
+
 async fn scrape(
     State(metrics): State<Arc<Metrics>>,
 ) -> ([(&'static str, &'static str); 1], String) {
@@ -602,6 +638,7 @@ mod tests {
         assert_eq!(samples[0].timestamp, previous);
         assert_eq!(samples[0].errors, 1);
     }
+
     #[test]
     fn attempts_distinguish_contention_failure_and_production() {
         let activity = Activity::default();

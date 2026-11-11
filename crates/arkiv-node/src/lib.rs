@@ -1,28 +1,29 @@
 //! The append-only Arkiv pseudo node: block format, deterministic block
-//! execution, request identity, block selection and replay (node step
-//! N0b-3), plus the volatile protocol-2 full/light process demo in [`demo`].
-//! The explicitly unsigned [`simulator`] stores execution state, canonical
-//! bodies, inclusion identities and metadata atomically in one durable file.
+//! execution, request identity, block selection and replay, plus the
+//! volatile full/light process demo in [`demo`]. The explicitly unsigned
+//! [`simulator`] stores execution state, canonical bodies, inclusion
+//! identities and metadata atomically in one durable file.
 //!
-//! - [`block`]: block format version 1 — genesis, headers, block inputs,
-//!   transaction envelopes and outcomes — with canonical encodings and
-//!   domain-separated hashes (see `docs/block-format.md`).
+//! - [`block`]: the block format ([`block::FORMAT_VERSION`]) — genesis,
+//!   headers, block inputs, transaction envelopes and outcomes — with
+//!   canonical encodings and domain-separated hashes (see
+//!   `docs/block-format.md`).
 //! - [`params`]: the genesis invariants, the expiry reservation and the
 //!   expiry sweep's read bound; [`ChainSpec`] is a validated genesis.
 //! - [`validate`]: static validation of requests and blocks, applied to
 //!   each operation as it will execute.
-//! - [`select`]: the producer's selection rules and their replay check.
+//! - [`mod@select`]: the producer's selection rules and their replay check.
 //! - [`identity`]: request identities and the pending/inclusion index.
 //! - [`exec`]: [`execute_block`], the one function that produces and
 //!   replays a block: admin inputs, the expiry sweep, then user
 //!   transactions with per-transaction rollback.
-//! - [`replay`]: [`MemoryChain`], a chain on the memory engine, and
+//! - [`mod@replay`]: [`MemoryChain`], a chain on the memory engine, and
 //!   [`replay`](replay::replay) from genesis.
 //!
 //! The executor reaches the engine only through its fallible `try_` API
 //! (enforced by this crate's `clippy.toml`), so a storage error of the
 //! persistent engine aborts the candidate instead of becoming a rejection or
-//! an empty read. The signed demo remains an independent volatile profile.
+//! an empty read. The signed demo is an independent volatile profile.
 
 pub mod accounts;
 pub mod arkiv;

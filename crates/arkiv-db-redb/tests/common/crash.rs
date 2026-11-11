@@ -13,8 +13,9 @@ use arkiv_db_storage::versioned::{
 
 use super::{assert_absent, assert_applied, block, commit, crash_store};
 
+/// Torn-subset seeds per granularity in the default runs.
 pub const SEEDS: u64 = 8;
-/// The same for the `#[ignore]`d heavy run.
+/// The same in the `#[ignore]`d heavy runs.
 pub const HEAVY_SEEDS: u64 = 64;
 
 pub fn config(quick_repair: bool) -> RedbConfig {

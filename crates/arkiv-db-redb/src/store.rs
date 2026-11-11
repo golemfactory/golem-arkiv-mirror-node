@@ -53,7 +53,7 @@ const BLOCK_INDEX: TableDefinition<&[u8; 32], u64> = TableDefinition::new("block
 /// The redb table holding the objects of `space`: `objects_catalog`,
 /// `objects_host`, or `objects_ns_` followed by the namespace id as 16
 /// lowercase hex digits.
-pub fn object_table_name(space: SpaceId) -> String {
+pub(crate) fn object_table_name(space: SpaceId) -> String {
     match space {
         SpaceId::Catalog => "objects_catalog".to_owned(),
         SpaceId::Host => "objects_host".to_owned(),
@@ -249,14 +249,11 @@ impl RedbStore {
     /// Opens the store in the file at `path`, creating and initializing the
     /// file if it does not exist or is empty.
     ///
-    /// A new store is built in [`initialization_path`]`(path)` — redb's file
-    /// creation and the store's initialization commit, both synced — then
-    /// renamed to `path`, and the directory is synced. A crash during
-    /// creation therefore never leaves a partial file under `path` (redb
-    /// writes its magic number last, and a file without it is refused); it
-    /// leaves at most the temporary file, which the next `create` discards.
-    /// A concurrent `create` of the same path is `Locked` or opens the store
-    /// the other one finished.
+    /// A new store is built in [`initialization_path`]`(path)` and renamed
+    /// to `path` once it is durable, so a crash during creation never leaves
+    /// a partial file under `path`; it leaves at most the temporary file,
+    /// which the next `create` discards. A concurrent `create` of the same
+    /// path is `Locked` or opens the store the other one finished.
     ///
     /// A file holding a redb database without this store's metadata is
     /// initialized in place, in one redb transaction; a file with another
@@ -333,11 +330,6 @@ impl RedbStore {
         })
     }
 
-    /// The configuration.
-    pub fn config(&self) -> RedbConfig {
-        self.config
-    }
-
     /// What the most recent successful open did.
     pub fn last_open(&self) -> OpenReport {
         *lock(&self.last_open)
@@ -348,7 +340,8 @@ impl RedbStore {
         &self.probe
     }
 
-    /// Timings of all attempted store operations, including validation failures.
+    /// Timings of reads, `commit` and `relabel` (one series) and `recover`,
+    /// including validation failures.
     pub fn operation_timings(&self) -> [OperationTimingSnapshot; 5] {
         std::array::from_fn(|i| {
             self.timings[i].snapshot(["read_object", "read_record", "head", "commit", "recover"][i])
@@ -1224,7 +1217,7 @@ impl VersionedStore for RedbStore {
 }
 
 /// The redb value guard is still borrowed here: reject its length before
-/// making the returned value copy. Pager allocations are outside this cap.
+/// making the returned value copy.
 fn copy_bounded(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, Fault> {
     if bytes.len() > max_bytes {
         return Err(Fault::new(

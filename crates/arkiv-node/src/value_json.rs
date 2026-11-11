@@ -20,11 +20,6 @@ use serde_json::{Value as Json, json};
 
 use crate::demo::wire::hex;
 
-/// The value's type name ([`TypeTag::name`]).
-pub fn type_name(value: &Value) -> &'static str {
-    value.tag().name()
-}
-
 /// Two's complement big-endian `bytes` as `(negative, magnitude)`.
 fn signed_magnitude(bytes: [u8; 32]) -> (bool, U256) {
     let value = U256::from_be_bytes(bytes);
@@ -253,7 +248,7 @@ mod tests {
             seen.insert(value.tag());
             let json = to_json(&value);
             assert_eq!(
-                from_json(type_name(&value), &json),
+                from_json(value.tag().name(), &json),
                 Some(value.clone()),
                 "{value:?} as {json}"
             );

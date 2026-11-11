@@ -1,4 +1,5 @@
 //! Bounded HTTP transport and one writer shared by timer and private controls.
+
 use super::{
     Error, Result,
     host::{Control, Host, RunConfig, StoredBlock, identity},
@@ -27,6 +28,7 @@ pub enum Node {
     Full(Box<Host>),
     Light(Box<Light>),
 }
+
 pub struct Runtime {
     pub node: Mutex<Node>,
     pub peer: Option<String>,
@@ -40,7 +42,9 @@ pub struct Runtime {
     pub storage_path: Option<PathBuf>,
     client: reqwest::Client,
 }
+
 pub type Shared = Arc<Runtime>;
+
 impl Runtime {
     pub fn new(
         node: Node,
@@ -72,11 +76,13 @@ impl Runtime {
         }))
     }
 }
+
 pub fn validate_peer(peer: &str) -> Result<()> {
     validate_peer_with_policy(peer, false)
 }
-/// Only an explicit deployment opt-in permits cleartext configured private peers.
-/// This never accepts peer URLs from public HTTP request bodies.
+
+/// Parses `SIMULATOR_ALLOW_PRIVATE_HTTP`: only `true` permits cleartext http
+/// to a non-loopback peer.
 pub fn parse_private_http(value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("false") => Ok(false),
@@ -84,6 +90,7 @@ pub fn parse_private_http(value: Option<&str>) -> Result<bool> {
         _ => Err(Error("InvalidRequest")),
     }
 }
+
 pub fn private_http_from_env() -> Result<bool> {
     match std::env::var("SIMULATOR_ALLOW_PRIVATE_HTTP") {
         Ok(value) => parse_private_http(Some(&value)),
@@ -91,6 +98,7 @@ pub fn private_http_from_env() -> Result<bool> {
         Err(_) => Err(Error("InvalidRequest")),
     }
 }
+
 pub fn validate_peer_with_policy(peer: &str, allow_private_http: bool) -> Result<()> {
     let url = reqwest::Url::parse(peer).map_err(|_| Error("InvalidRequest"))?;
     if !url.username().is_empty()
@@ -110,14 +118,25 @@ pub fn validate_peer_with_policy(peer: &str, allow_private_http: bool) -> Result
     }
     Ok(())
 }
+
 fn head_json(h: &crate::Header) -> Json {
-    json!({"height":h.height.to_string(),"hash":hex(h.hash().as_slice()),"stateRoot":hex(h.state_root.as_slice())})
+    json!({
+        "height": h.height.to_string(),
+        "hash": hex(h.hash().as_slice()),
+        "stateRoot": hex(h.state_root.as_slice()),
+    })
 }
+
 pub fn status(node: &Node) -> Json {
     let retention = match node {
         Node::Full(h) => crate::retention::status(&h.engine),
         Node::Light(_) => {
-            json!({"stateRetention":null,"stateRetentionWindow":null,"stateFloor":null,"receiptFloor":null})
+            json!({
+                "stateRetention": null,
+                "stateRetentionWindow": null,
+                "stateFloor": null,
+                "receiptFloor": null,
+            })
         }
     };
     let (id, head, paused, health, role, revision, workload, observed, memory) = match node {
@@ -132,7 +151,13 @@ pub fn status(node: &Node) -> Json {
                 h.revision,
                 &h.workload,
                 h.observed,
-                json!({"engineCacheBytes":stats.cache.retained_bytes.to_string(),"engineCacheEntries":stats.cache.entries,"engineCacheHits":stats.cache.hits.to_string(),"engineCacheMisses":stats.cache.misses.to_string(),"residentManifests":stats.resident_manifests}),
+                json!({
+                    "engineCacheBytes": stats.cache.retained_bytes.to_string(),
+                    "engineCacheEntries": stats.cache.entries,
+                    "engineCacheHits": stats.cache.hits.to_string(),
+                    "engineCacheMisses": stats.cache.misses.to_string(),
+                    "residentManifests": stats.resident_manifests,
+                }),
             )
         }
         Node::Light(h) => (
@@ -144,15 +169,47 @@ pub fn status(node: &Node) -> Json {
             0,
             &h.run.workload,
             h.observed,
-            json!({"engineCacheBytes":"0","engineCacheEntries":0,"engineCacheHits":"0","engineCacheMisses":"0","residentManifests":0}),
+            json!({
+                "engineCacheBytes": "0",
+                "engineCacheEntries": 0,
+                "engineCacheHits": "0",
+                "engineCacheMisses": "0",
+                "residentManifests": 0,
+            }),
         ),
     };
-    let mut value = json!({"apiVersion":1,"feedVersion":1,"sourceId":id.source_id,"runId":id.run_id,"genesisHash":id.genesis_hash,"chainId":id.chain_id,"sourceKind":"arkiv-native-simulator","authentication":"unsigned-simulator-v1","durability":"durable","head":head_json(head),"paused":paused,"health":health,"role":role,"configRevision":revision.to_string(),"projectionVersion":arkiv_db::LAYOUT_VERSION,"blockFormatVersion":crate::block::FORMAT_VERSION,"protocolVersion":crate::block::PROTOCOL_VERSION,"coverage":{"from":"0","through":head.height.to_string(),"complete":true},"proofProfiles":[super::profile::PROOF_PROFILE],"capabilities":super::profile::capabilities(&crate::demo::workload::genesis(0, 0).limits),"limits":{"feedPageBytes":FEED_CAP.to_string(),"pageItems":HEADER_BATCH},"workload":workload,"memory":memory,"observedPeerHeight":observed.to_string()});
+    let mut value = json!({
+        "apiVersion": 1,
+        "feedVersion": 1,
+        "sourceId": id.source_id,
+        "runId": id.run_id,
+        "genesisHash": id.genesis_hash,
+        "chainId": id.chain_id,
+        "sourceKind": "arkiv-native-simulator",
+        "authentication": "unsigned-simulator-v1",
+        "durability": "durable",
+        "head": head_json(head),
+        "paused": paused,
+        "health": health,
+        "role": role,
+        "configRevision": revision.to_string(),
+        "projectionVersion": arkiv_db::LAYOUT_VERSION,
+        "blockFormatVersion": crate::block::FORMAT_VERSION,
+        "protocolVersion": crate::block::PROTOCOL_VERSION,
+        "coverage": {"from": "0", "through": head.height.to_string(), "complete": true},
+        "proofProfiles": [super::profile::PROOF_PROFILE],
+        "capabilities": super::profile::capabilities(&crate::demo::workload::genesis(0, 0).limits),
+        "limits": {"feedPageBytes": FEED_CAP.to_string(), "pageItems": HEADER_BATCH},
+        "workload": workload,
+        "memory": memory,
+        "observedPeerHeight": observed.to_string(),
+    });
     if let (Some(value), Json::Object(fields)) = (value.as_object_mut(), retention) {
         value.extend(fields);
     }
     value
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenesisResponse {
@@ -164,6 +221,7 @@ pub struct GenesisResponse {
     pub header: String,
     pub durable_identity: String,
 }
+
 impl GenesisResponse {
     pub fn validate(
         &self,
@@ -194,6 +252,7 @@ impl GenesisResponse {
         Ok(stored)
     }
 }
+
 fn genesis(node: &Node) -> Result<GenesisResponse> {
     let (id, run, stored) = match node {
         Node::Full(h) => (&h.identity, &h.run, &h.durable_identity),
@@ -209,6 +268,7 @@ fn genesis(node: &Node) -> Result<GenesisResponse> {
         durable_identity: hex(&stored.envelope()?),
     })
 }
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadQuery {
@@ -217,6 +277,7 @@ pub struct ReadQuery {
     pub from_height: Option<String>,
     pub limit: Option<usize>,
 }
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Headers {
@@ -235,6 +296,7 @@ fn storage_json(storage: Option<&std::path::Path>) -> Option<Json> {
     let bytes = std::fs::metadata(storage?).ok()?.len();
     Some(json!({"fileBytes":bytes.to_string()}))
 }
+
 fn read(node: &Node, path: &str, q: &ReadQuery, storage: Option<&std::path::Path>) -> Result<Json> {
     if path == "status" {
         let mut current = status(node);
@@ -302,6 +364,7 @@ fn read(node: &Node, path: &str, q: &ReadQuery, storage: Option<&std::path::Path
     }
     Err(Error("InvalidRequest"))
 }
+
 /// Details of this request's `HistoryPruned` refusal, recorded on the host
 /// while the request held the node lock.
 fn refusal(rt: &Shared, result: &Result<Json>) -> Option<(u64, u64)> {
@@ -313,13 +376,16 @@ fn refusal(rt: &Shared, result: &Result<Json>) -> Option<(u64, u64)> {
         Node::Light(_) => None,
     }
 }
+
 fn respond(rt: &Shared, result: Result<Json>, cap: usize) -> Response {
     let refusal = refusal(rt, &result);
     response_with(result, cap, refusal)
 }
+
 fn response(result: Result<Json>, cap: usize) -> Response {
     response_with(result, cap, None)
 }
+
 fn response_with(result: Result<Json>, cap: usize, refusal: Option<(u64, u64)>) -> Response {
     match result.and_then(|v| json_bytes(&v, cap)) {
         Ok(bytes) => (
@@ -333,13 +399,8 @@ fn response_with(result: Result<Json>, cap: usize, refusal: Option<(u64, u64)>) 
                 "Unauthorized" => StatusCode::UNAUTHORIZED,
                 "HistoryPruned" => StatusCode::GONE,
                 "UnknownRun" | "UnknownBlock" | "NamespaceNotFound" => StatusCode::NOT_FOUND,
-                "IdentityMismatch"
-                | "BlockNotSynced"
-                | "CoverageUnavailable"
-                | "CursorMismatch"
-                | "ChainConflict"
-                | "RequestConflict"
-                | "CapacityReached" => StatusCode::CONFLICT,
+                "IdentityMismatch" | "BlockNotSynced" | "CursorMismatch" | "ChainConflict"
+                | "RequestConflict" | "CapacityReached" => StatusCode::CONFLICT,
                 "UnsupportedProof" | "ProofLimitExceeded" | "BudgetExceeded" => {
                     StatusCode::UNPROCESSABLE_ENTITY
                 }
@@ -358,6 +419,7 @@ fn response_with(result: Result<Json>, cap: usize, refusal: Option<(u64, u64)>) 
         }
     }
 }
+
 async fn http_read(
     State(rt): State<Shared>,
     Path(path): Path<String>,
@@ -368,6 +430,7 @@ async fn http_read(
     }
     http_read_allowed(rt, path, q).await
 }
+
 async fn http_read_allowed(rt: Shared, path: String, q: ReadQuery) -> Response {
     let permit = match rt.reads.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -387,6 +450,7 @@ async fn http_read_allowed(rt: Shared, path: String, q: ReadQuery) -> Response {
     .unwrap_or(Err(Error("StorageUnavailable")));
     response(result, cap)
 }
+
 async fn parse_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T> {
     let bytes = tokio::time::timeout(Duration::from_secs(5), to_bytes(body, REQUEST_CAP))
         .await
@@ -394,6 +458,7 @@ async fn parse_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T> {
         .map_err(|_| Error("InvalidRequest"))?;
     serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
 }
+
 async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Body) -> Response {
     let permit = match rt.reads.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -456,7 +521,7 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
             if r.cursor.is_some() {
                 return Err(Error("CursorMismatch"));
             }
-            return Ok(json!({"request":pack(&resolve(id,&h,&r)?)}));
+            return Ok(json!({"request": pack(&resolve(id, &h, &r)?)}));
         }
         Err(Error("InvalidRequest"))
     })
@@ -464,6 +529,7 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
     .unwrap_or(Err(Error("StorageUnavailable")));
     respond(&shared, result, RESPONSE_CAP)
 }
+
 fn authorized(rt: &Runtime, headers: &HeaderMap) -> bool {
     let Some(expected) = rt.admin_token.as_deref().filter(|s| s.len() >= 32) else {
         return false;
@@ -473,6 +539,7 @@ fn authorized(rt: &Runtime, headers: &HeaderMap) -> bool {
         .and_then(|h| h.to_str().ok())
         .is_some_and(|h| h.strip_prefix("Bearer ") == Some(expected))
 }
+
 async fn http_control(State(rt): State<Shared>, headers: HeaderMap, body: Body) -> Response {
     if !authorized(&rt, &headers) {
         return response(Err(Error("Unauthorized")), 1024);
@@ -485,19 +552,36 @@ async fn http_control(State(rt): State<Shared>, headers: HeaderMap, body: Body) 
         Ok(c) => c,
         Err(e) => return response(Err(e), 1024),
     };
-    let result=tokio::task::spawn_blocking(move||{
-        let _permit=permit;let mut n=rt.node.try_lock().map_err(|_|Error("ServerBusy"))?;
-        let Node::Full(h)=&mut*n else{return Err(Error("InvalidRequest"))};
-        let command_id=c.command_id.clone();let result=h.control(c)?;
-        Ok(json!({"commandId":command_id,"runId":h.identity.run_id,"configRevision":h.revision.to_string(),"head":head_json(&h.head),"paused":h.paused,"health":h.health,"status":result["status"],"resultHeight":result.get("height").or_else(||result.get("effectiveHeight")).cloned()}))
-    }).await.unwrap_or(Err(Error("StorageUnavailable")));
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut n = rt.node.try_lock().map_err(|_| Error("ServerBusy"))?;
+        let Node::Full(h) = &mut *n else {
+            return Err(Error("InvalidRequest"));
+        };
+        let command_id = c.command_id.clone();
+        let result = h.control(c)?;
+        Ok(json!({
+            "commandId": command_id,
+            "runId": h.identity.run_id,
+            "configRevision": h.revision.to_string(),
+            "head": head_json(&h.head),
+            "paused": h.paused,
+            "health": h.health,
+            "status": result["status"],
+            "resultHeight": result.get("height").or_else(||result.get("effectiveHeight")).cloned(),
+        }))
+    })
+    .await
+    .unwrap_or(Err(Error("StorageUnavailable")));
     response(result, REQUEST_CAP)
 }
+
 pub fn public_router(rt: Shared) -> Router {
     Router::new()
         .route("/sim/v1/{*path}", get(http_read).post(http_post))
         .with_state(rt)
 }
+
 async fn http_body(
     State(rt): State<Shared>,
     Path(height): Path<String>,
@@ -513,6 +597,7 @@ async fn http_body(
     )
     .await
 }
+
 pub fn control_router(rt: Shared) -> Router {
     Router::new()
         .route("/sim/v1/control", post(http_control))
@@ -529,6 +614,7 @@ pub async fn fetch<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     fetch_authorized(client, peer, path, body, cap, None, false).await
 }
+
 pub async fn fetch_with_policy<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     peer: &str,
@@ -539,6 +625,7 @@ pub async fn fetch_with_policy<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     fetch_authorized(client, peer, path, body, cap, None, allow_private_http).await
 }
+
 async fn fetch_authorized<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     peer: &str,
@@ -599,6 +686,7 @@ async fn fetch_authorized<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
 }
+
 /// A text query never bypasses the established Eq verifier. `require_proof`
 /// is explicit on the wire; false permits proofs too, but never a silent fallback.
 #[derive(Deserialize)]
@@ -611,13 +699,14 @@ struct TextQueryRequest {
     limit: u32,
     cursor: Option<String>,
 }
+
 async fn text_query(rt: Shared, r: TextQueryRequest) -> Response {
     let classification = super::query_language::classify(&r.query);
     let reject = |code: &str, status: &str| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(json!({
-                "error":code,"queryText":r.query,"classification":classification,
+                "error":code, "queryText":r.query, "classification":classification,
                 "verificationStatus":{"status":status}
             })),
         )
@@ -680,6 +769,7 @@ async fn verified(rt: Shared, r: VerifiedRequest, inspect: bool) -> Result<Json>
         };
         h.request(&r)?
     };
+
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Proof {
@@ -721,7 +811,12 @@ async fn verified(rt: Shared, r: VerifiedRequest, inspect: bool) -> Result<Json>
         if let Some(object) = page.as_object_mut() {
             object.insert(
                 "diagnostics".into(),
-                json!({"verifier":"light-follower","proofBytes":bytes.len().to_string(),"fetchMs":fetch_ms.to_string(),"verifyMs":verify_started.elapsed().as_millis().to_string()}),
+                json!({
+                    "verifier": "light-follower",
+                    "proofBytes": bytes.len().to_string(),
+                    "fetchMs": fetch_ms.to_string(),
+                    "verifyMs": verify_started.elapsed().as_millis().to_string(),
+                }),
             );
         }
         Ok(page)
@@ -729,6 +824,7 @@ async fn verified(rt: Shared, r: VerifiedRequest, inspect: bool) -> Result<Json>
     .await
     .map_err(|_| Error("StorageUnavailable"))?
 }
+
 pub async fn sync_once(rt: Shared) -> Result<()> {
     let (head, id, light, paused) = {
         let n = rt.node.try_lock().map_err(|_| Error("ServerBusy"))?;
@@ -807,7 +903,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
             }
         }
     }
-    // Fetch one bounded full envelope only for a full follower. No light path reaches here.
+    // Fetch one bounded full envelope only for a full follower.
     for header in headers {
         if header.height > head.height
             && (header.height != head.height.checked_add(1).ok_or(Error("CapacityReached"))?
@@ -861,6 +957,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
     }
     Ok(())
 }
+
 pub async fn run_loop(rt: Shared, interval: Duration) {
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

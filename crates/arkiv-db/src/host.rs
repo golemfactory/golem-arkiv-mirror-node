@@ -120,7 +120,7 @@ impl std::error::Error for ExpiryHalt {}
 /// expiry (run it first, or size the block budget for it); a halted run
 /// leaves the remaining rows live until a later block, where the smallest
 /// live height is read first again.
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub fn expire_records(
     branch: &mut Branch,
     namespace: NamespaceId,
@@ -147,7 +147,6 @@ pub fn expire_records(
 /// deterministic outcome and the host must discard the branch, never record
 /// a partial expiry. The inner result is exactly what [`expire_records`]
 /// returns. The in-memory engine never fails.
-#[allow(clippy::result_large_err)]
 pub fn try_expire_records(
     branch: &mut Branch,
     namespace: NamespaceId,
@@ -171,7 +170,6 @@ pub fn try_expire_records(
 /// The key comes from the existing query; observing adds no reads or charges.
 /// An observer failure requires discarding the entire branch, just like an I/O failure.
 /// Hosts must bound any collection they retain in the observer.
-#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub fn try_expire_records_observed(
     branch: &mut Branch,
     namespace: NamespaceId,
@@ -253,7 +251,6 @@ pub struct BlockMap {
 }
 
 impl BlockMap {
-    /// Creates an empty table.
     pub const fn new() -> Self {
         Self {
             first: None,
@@ -311,12 +308,10 @@ impl BlockMap {
             .map(|block| (BlockNumber(block), last))
     }
 
-    /// Number of recorded blocks.
     pub fn len(&self) -> usize {
         self.snapshots.len()
     }
 
-    /// Whether no block has been recorded.
     pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }

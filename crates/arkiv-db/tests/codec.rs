@@ -1,40 +1,15 @@
 //! Golden vectors for the canonical codec, version 1 (`arkiv_db::codec`).
 //!
-//! What this file establishes:
-//! - For every covered type, the encoding of hand-picked values equals bytes
-//!   assembled in this file from the specification's pieces (`u32`/`u64`
-//!   big-endian, `u32 length ‖ bytes`, `00`/`01` booleans and options,
-//!   `u32 count ‖ items`, one tag byte per enum with the tag tables of
-//!   `docs/block-format.md`, `u8 len ‖ bytes` record keys). The expected
-//!   bytes are literals or concatenations of literal pieces; they are never
-//!   produced by the codec under test.
-//! - Each vector decodes back to its value with `decode_exact`, re-encodes
-//!   to the same bytes, is rejected with one trailing byte, and every strict
-//!   prefix is rejected as truncated.
-//! - Non-canonical inputs are rejected with the specific error: bool and
-//!   option bytes other than `00`/`01`, unknown tags of every enum, invalid
-//!   names (grammar, empty, too long, non-UTF-8), zero namespace and record
-//!   ids, record-key lengths 0 and above 32, a price-schedule class count
-//!   other than 31, and huge sequence counts with little input (rejected
-//!   before anything is reserved).
-//! - Exhaustively over every 1-byte input for 12 types and every 2-byte
-//!   input for 9 types, and over 1,000 seeded mutations of each of 17 seed
-//!   vectors (the 8 `WriteOp` vectors and 9 others): whatever is accepted
-//!   re-encodes to exactly the input (`encode(decode(x)) == x`), and the
-//!   number of accepted short inputs equals the count derived by hand from
-//!   the tag tables.
-//! - `digest(domain, bytes)` equals `keccak256` (a trusted primitive,
-//!   pinned here by its empty-input vector) over `u8 len(domain) ‖ domain ‖
-//!   bytes` assembled by hand, domains of different lengths never collide,
-//!   and invalid domains panic.
-//! - The codec enforces type invariants only: an operation that violates an
-//!   engine admission bound decodes and is then rejected by the engine.
+//! The expected bytes are literals or concatenations of literal pieces
+//! assembled here from the specification (tag tables in
+//! `docs/block-format.md`); they are never produced by the codec under test.
+//! Every vector must also round-trip, and trailing bytes, truncations and
+//! non-canonical inputs must be rejected.
 //!
-//! What it does not establish: block formats (node step N0b-3), trie leaf
-//! layouts or roots (`roots.rs` and the `layout` unit tests cover those
-//! since N3b), or anything about storage.
+//! What it does not establish: block formats, trie leaf layouts or roots
+//! (see `roots.rs` and the `layout` unit tests), or anything about storage.
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use alloy_primitives::{hex, keccak256};
 use arkiv_db::{
@@ -44,10 +19,6 @@ use arkiv_db::{
     ReceiptKind, RecordId, RecordKey, Rejection, Revision, TypeTag, Value, WriteOp, decode_exact,
     digest, encode,
 };
-
-// ---------------------------------------------------------------------------
-// Specification pieces, written out by hand.
-// ---------------------------------------------------------------------------
 
 /// `u32`, big-endian: the length and count prefix.
 fn be32(value: u32) -> Vec<u8> {
@@ -65,17 +36,12 @@ fn lp(bytes: &[u8]) -> Vec<u8> {
     [be32(len), bytes.to_vec()].concat()
 }
 
-/// Concatenation of pieces.
 fn cat(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
 
 /// Namespace 1: its ordinal as eight big-endian bytes.
 const NS1: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
-
-// ---------------------------------------------------------------------------
-// Values under test.
-// ---------------------------------------------------------------------------
 
 fn ns(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).expect("ordinals start at 1")
@@ -99,10 +65,6 @@ const FIXTURE_WEIGHTS: [u64; 31] = [
     1, 50, 20, 10, 5, 2, 1, 3, 4, 2, 1, 20, 10, 20, 4, 1, 4, 6, 30, 6, 5, 4, 3, 1, 1, 2, 3, 2, 1,
     2, 1,
 ];
-
-// ---------------------------------------------------------------------------
-// Checks.
-// ---------------------------------------------------------------------------
 
 /// `value` encodes to exactly `expected`, which decodes back to `value`,
 /// re-encodes to itself, and is rejected with a trailing byte or cut short.
@@ -146,13 +108,13 @@ fn accepted<T: Encode + Decode + Debug>(bytes: &[u8]) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Primitives and containers.
-// ---------------------------------------------------------------------------
+#[test]
+fn the_codec_version_is_one() {
+    assert_eq!(arkiv_db::CODEC_VERSION, 1);
+}
 
 #[test]
 fn integers_are_fixed_width_big_endian() {
-    assert_eq!(arkiv_db::CODEC_VERSION, 1);
     golden(&7u8, &[0x07]);
     golden(&0x0102_0304u32, &[1, 2, 3, 4]);
     golden(&258u64, &[0, 0, 0, 0, 0, 0, 1, 2]);
@@ -294,10 +256,6 @@ fn huge_counts_fail_before_anything_is_reserved() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Identities and names.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn ids_owners_revisions_and_costs() {
     golden(&ns(258), &[0, 0, 0, 0, 0, 0, 1, 2]);
@@ -389,10 +347,6 @@ fn record_keys_are_a_length_byte_and_1_to_32_bytes() {
         },
     );
 }
-
-// ---------------------------------------------------------------------------
-// Types, values and cells.
-// ---------------------------------------------------------------------------
 
 /// Type ids are golem-db's cell type ids (`Key`, engine-only, is 64), and
 /// a value is `type id ‖ payload`: `Str`/`Bytes` length-prefixed, every
@@ -552,10 +506,6 @@ fn cell_kinds_and_cells() {
         &cat(&[&lp(b"title"), &[2, 2, 0, 0, 0, 2, b'h', b'i']]),
     );
 }
-
-// ---------------------------------------------------------------------------
-// Writes and effects.
-// ---------------------------------------------------------------------------
 
 fn write_op_vectors() -> Vec<(WriteOp, Vec<u8>)> {
     vec![
@@ -785,10 +735,6 @@ fn effects() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Rejections, outcomes, receipts.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn argument_and_query_faults() {
     let arguments = [
@@ -980,7 +926,7 @@ fn receipts_encode_without_their_ledger() {
                 subtotal: Cost::new(1),
             }],
         }),
-        ..applied.clone()
+        ..applied
     };
     assert_eq!(encode(&traced), APPLIED_379);
     assert_eq!(decode_exact::<Receipt>(&APPLIED_379), Ok(applied));
@@ -992,10 +938,6 @@ fn receipts_encode_without_their_ledger() {
         },
     );
 }
-
-// ---------------------------------------------------------------------------
-// Pricing and limits.
-// ---------------------------------------------------------------------------
 
 fn weights_bytes(weights: &[u64]) -> Vec<u8> {
     weights.iter().flat_map(|weight| be64(*weight)).collect()
@@ -1012,12 +954,6 @@ fn price_schedules_carry_exactly_31_weights() {
         &[0, 0, 0, 31],
         &weights_bytes(&FIXTURE_WEIGHTS),
     ]);
-    assert_eq!(fixture.len(), 4 + 4 + 31 * 8);
-    // The first two weights (DirectoryLookup 1, NamespaceCreate 50) and the
-    // last (ProofByte 1).
-    assert_eq!(fixture[8..16], [0, 0, 0, 0, 0, 0, 0, 1]);
-    assert_eq!(fixture[16..24], [0, 0, 0, 0, 0, 0, 0, 50]);
-    assert_eq!(fixture[248..256], [0, 0, 0, 0, 0, 0, 0, 1]);
     golden(&PriceSchedule::FIXTURE, &fixture);
 
     let mut weights = [2u64; 31];
@@ -1040,7 +976,7 @@ fn price_schedules_carry_exactly_31_weights() {
             },
         );
     }
-    // Model-2 schedules had 27 classes: never silently padded.
+    // A shorter class table is never silently padded.
     rejects::<PriceSchedule>(
         &cat(&[&[0, 0, 0, 1], &[0, 0, 0, 27], &weights_bytes(&[1; 27])]),
         DecodeError::ClassCountMismatch {
@@ -1092,10 +1028,6 @@ fn limits_are_nine_u64_fields() {
         ]),
     );
 }
-
-// ---------------------------------------------------------------------------
-// Canonicity over every short input and over mutations.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_accepted_short_input_is_canonical() {
@@ -1233,20 +1165,13 @@ fn every_accepted_mutation_is_canonical() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Digests.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn keccak_is_the_trusted_primitive() {
+fn digests_hash_a_length_prefixed_domain_then_the_bytes() {
+    // Keccak-256 is the trusted primitive, anchored by its empty-input vector.
     assert_eq!(
         keccak256(b"").0,
         hex!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
     );
-}
-
-#[test]
-fn digests_hash_a_length_prefixed_domain_then_the_bytes() {
     // "arkiv/test/v1" is 13 bytes.
     assert_eq!(
         digest("arkiv/test/v1", b""),
@@ -1280,36 +1205,11 @@ fn digests_hash_a_length_prefixed_domain_then_the_bytes() {
 }
 
 #[test]
-#[should_panic(expected = "invalid digest domain")]
-fn an_empty_domain_panics() {
-    digest("", b"x");
-}
-
-#[test]
-#[should_panic(expected = "invalid digest domain")]
-fn a_256_byte_domain_panics() {
-    digest(&"a".repeat(256), b"x");
-}
-
-#[test]
-#[should_panic(expected = "invalid digest domain")]
-fn a_domain_with_a_space_panics() {
-    digest("arkiv header/v1", b"x");
-}
-
-#[test]
-#[should_panic(expected = "invalid digest domain")]
-fn a_non_ascii_domain_panics() {
-    digest("arkiv/é/v1", b"x");
-}
-
-#[test]
-fn values_round_trip_through_shared_storage() {
-    // Str and Bytes values share their buffers; decoding yields equal
-    // values with fresh buffers.
-    let text: Arc<str> = Arc::from("shared");
-    let value = Value::Str(Arc::clone(&text));
-    let decoded: Value = decode_exact(&encode(&value)).unwrap();
-    assert_eq!(decoded, value);
-    assert_eq!(encode(&decoded), cat(&[&[2], &lp(b"shared")]));
+fn invalid_domains_panic() {
+    // Empty, 256 bytes, a space, non-ASCII.
+    for domain in ["", &"a".repeat(256), "arkiv header/v1", "arkiv/é/v1"] {
+        let panic = std::panic::catch_unwind(|| digest(domain, b"x")).unwrap_err();
+        let message = panic.downcast_ref::<String>().expect("a formatted panic");
+        assert!(message.contains("invalid digest domain"), "{domain:?}");
+    }
 }

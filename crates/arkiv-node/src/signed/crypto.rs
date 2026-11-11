@@ -1,4 +1,5 @@
 //! Strict secp256k1 prehash signing for the native signed profile.
+
 use alloy_primitives::{Address, B256, Signature};
 use arkiv_db::OwnerId;
 use k256::ecdsa::{Signature as ScalarSignature, SigningKey};

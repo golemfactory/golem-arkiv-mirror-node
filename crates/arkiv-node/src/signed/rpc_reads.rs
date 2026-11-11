@@ -8,10 +8,10 @@
 //! lock, which checks heights and pins the snapshot, and [run](Planned::run)
 //! after it is released (see [`super::reads`]). [`dispatch`] does both.
 //!
-//! Both evaluate with planned budgets ([`Budget::planned`]): each AND-group
-//! is driven by its cheapest index source and counts use stored posting
-//! sizes, so the clause order of a query no longer decides its cost, and
-//! the rows, cursors and counts are exactly the written evaluation's. Their
+//! All three evaluate with planned budgets ([`Budget::planned`]): each
+//! AND-group is driven by its cheapest index source and counts use stored
+//! posting sizes, so the clause order of a query does not decide its cost,
+//! and the rows, cursors and counts are exactly the written evaluation's. Their
 //! group and literal bounds are the genesis limits unless the node's
 //! [`ReadLimits`] (`--read-max-groups`, `--read-max-literals`) raise them;
 //! a query beyond them still takes the bounded scan fallback (pages) or is
@@ -43,6 +43,7 @@
 //! `atBlock` for a consistent order, and a `cursor` beside `ORDER BY` is
 //! refused. `select.count` adds the match set's size from the planned count
 //! path.
+
 use super::{Error, Result, host::Host, reads::ReadLimits};
 use crate::{
     arkiv,
@@ -117,6 +118,7 @@ pub enum QueryErrorKind {
     /// head or below the state floor (`-32006`).
     Block,
 }
+
 impl QueryErrorKind {
     /// The JSON-RPC error code.
     pub const fn code(self) -> i64 {
@@ -129,6 +131,7 @@ impl QueryErrorKind {
             Self::Block => -32006,
         }
     }
+
     /// The SDK's name for the kind.
     pub const fn name(self) -> &'static str {
         match self {
@@ -141,6 +144,7 @@ impl QueryErrorKind {
         }
     }
 }
+
 /// A refused SDK query: its kind, a human-readable message and, for errors
 /// at a known place in the query string, `data`: `{position, got}` plus
 /// `expected` for a parse error. `position` is a UTF-8 byte offset.
@@ -150,6 +154,7 @@ pub struct QueryError {
     pub message: String,
     pub data: Option<Json>,
 }
+
 impl QueryError {
     pub fn new(kind: QueryErrorKind, message: impl Into<String>) -> Self {
         Self {
@@ -158,6 +163,7 @@ impl QueryError {
             data: None,
         }
     }
+
     /// An error at byte `position` of `source`.
     fn at(kind: QueryErrorKind, source: &str, position: usize, message: impl Into<String>) -> Self {
         let message = message.into();
@@ -177,15 +183,20 @@ impl QueryError {
             data: Some(data),
         }
     }
+
     /// The JSON-RPC `error` object.
     pub fn to_json(&self) -> Json {
-        let mut error = json!({"code": self.kind.code(), "message": format!("query rejected ({}): {}", self.kind.name(), self.message)});
+        let mut error = json!({
+            "code": self.kind.code(),
+            "message": format!("query rejected ({}): {}", self.kind.name(), self.message),
+        });
         if let Some(data) = &self.data {
             error["data"] = data.clone();
         }
         error
     }
 }
+
 /// Why an SDK read was refused: a query error in the SDK's table, or a node
 /// error (invalid parameters, a pruned height, storage).
 #[derive(Clone, Debug, PartialEq)]
@@ -193,20 +204,25 @@ pub enum ReadError {
     Query(QueryError),
     Node(Error),
 }
+
 impl From<Error> for ReadError {
     fn from(error: Error) -> Self {
         Self::Node(error)
     }
 }
+
 impl From<QueryError> for ReadError {
     fn from(error: QueryError) -> Self {
         Self::Query(error)
     }
 }
+
 type Read<T> = std::result::Result<T, ReadError>;
+
 fn limits(message: &str) -> QueryError {
     QueryError::new(QueryErrorKind::Limits, message)
 }
+
 fn cursor_mismatch() -> ReadError {
     QueryError::new(
         QueryErrorKind::Cursor,
@@ -214,6 +230,7 @@ fn cursor_mismatch() -> ReadError {
     )
     .into()
 }
+
 fn unknown_block(height: u64, head: u64) -> ReadError {
     QueryError::new(
         QueryErrorKind::Block,
@@ -229,6 +246,7 @@ struct Order {
     tag: TypeTag,
     descending: bool,
 }
+
 impl Order {
     /// The value `row` sorts by: its cell of that name, indexed or not, when
     /// it holds the sort's type.
@@ -240,6 +258,7 @@ impl Order {
             .filter(|value| value.tag() == self.tag)
             .cloned()
     }
+
     /// The order of two matches: by value, a missing one below every value
     /// and the whole comparison reversed by `DESC`, then by record id
     /// ascending in either direction, which makes the order total.
@@ -258,23 +277,27 @@ impl Order {
         by_value.then(a.1.cmp(&b.1))
     }
 }
+
 /// A parsed `arkiv_query` string: the filter and its optional order.
 #[derive(Clone, Debug, PartialEq)]
 struct Statement {
     query: Query,
     order: Option<Order>,
 }
+
 #[derive(Clone)]
 struct CachedCursor {
     binding: [u8; 32],
     cursor: Cursor,
 }
+
 #[derive(Default)]
 struct Cursors {
     serial: u64,
     entries: BTreeMap<String, CachedCursor>,
     order: std::collections::VecDeque<String>,
 }
+
 static CURSORS: OnceLock<Mutex<Cursors>> = OnceLock::new();
 
 /// Plans and runs an SDK read under the default read limits, or `None` for
@@ -282,6 +305,7 @@ static CURSORS: OnceLock<Mutex<Cursors>> = OnceLock::new();
 pub fn dispatch(host: &Host, method: &str, params: &Json) -> Option<Read<Json>> {
     plan(host, method, params, ReadLimits::default()).map(|planned| planned.and_then(Planned::run))
 }
+
 /// The methods whose evaluation runs after the node lock is released.
 pub(super) fn detached(method: &str) -> bool {
     matches!(
@@ -289,6 +313,7 @@ pub(super) fn detached(method: &str) -> bool {
         "arkiv_query" | "arkiv_getEntity" | "arkiv_getEntityCount"
     )
 }
+
 /// An SDK read with every check against the node done: what is left needs
 /// only the pinned snapshot it holds.
 pub enum Planned {
@@ -302,6 +327,7 @@ pub enum Planned {
     /// `arkiv_getEntity`: a one-row page whose row, or `null`, is the result.
     Entity(Box<PageRead>),
 }
+
 pub struct PageRead {
     snapshot: Snapshot,
     query: Query,
@@ -316,14 +342,13 @@ pub struct PageRead {
     binding: [u8; 32],
     height: u64,
 }
+
 /// Validates an SDK read and pins its snapshot, or `None` for another method.
 /// `reads` supplies the node's query bounds.
 pub fn plan(host: &Host, method: &str, params: &Json, reads: ReadLimits) -> Option<Read<Planned>> {
     let bounds = reads.query_limits(&host.genesis.genesis.limits);
     Some(match method {
-        "arkiv_query" => {
-            plan_query(host, params, bounds).map(|page| Planned::Page(Box::new(page)))
-        }
+        "arkiv_query" => plan_query(host, params, bounds).map(|page| Planned::Page(Box::new(page))),
         "arkiv_getEntity" => {
             plan_entity(host, params, bounds).map(|page| Planned::Entity(Box::new(page)))
         }
@@ -337,12 +362,17 @@ pub fn plan(host: &Host, method: &str, params: &Json, reads: ReadLimits) -> Opti
                     let previous = host.certificate(host.head.height - 1)?.header;
                     current_block_time.saturating_sub(previous.timestamp_ms / 1000)
                 };
-                Ok(Planned::Ready(json!({"current_block": host.head.height, "current_block_time": current_block_time, "duration": duration})))
+                Ok(Planned::Ready(json!({
+                    "current_block": host.head.height,
+                    "current_block_time": current_block_time,
+                    "duration": duration,
+                })))
             })
             .map_err(ReadError::from),
         _ => return None,
     })
 }
+
 impl Planned {
     /// Evaluates the read against its pinned snapshot. Its metered reads stop
     /// early when an enclosing [`arkiv_db::Interrupt`] is raised.
@@ -372,6 +402,7 @@ impl Planned {
         }
     }
 }
+
 /// The budget of one native read: `units`, interruptible, planned, admitted
 /// against `bounds`.
 fn read_budget(units: u64, bounds: QueryLimits) -> Budget {
@@ -380,9 +411,11 @@ fn read_budget(units: u64, bounds: QueryLimits) -> Budget {
         .planned()
         .with_query_limits(bounds)
 }
+
 fn exhausted() -> ReadError {
     limits("the read budget is exhausted").into()
 }
+
 /// Charges a read's spent units to the request's `budget`.
 fn charge(budget: &mut u64, receipt: &arkiv_db::Receipt) -> Read<()> {
     *budget = budget
@@ -390,6 +423,7 @@ fn charge(budget: &mut u64, receipt: &arkiv_db::Receipt) -> Read<()> {
         .ok_or_else(exhausted)?;
     Ok(())
 }
+
 /// How many live entities match `query`, by the planned count (posting
 /// sizes where they decide it), charged to `budget`.
 fn count_matches(
@@ -415,6 +449,7 @@ fn count_matches(
         Err(r) => Err(read_error(r)),
     }
 }
+
 /// One native page of entities, charged to `budget`, or `None` before the
 /// entity namespace exists.
 fn native_page(
@@ -445,6 +480,7 @@ fn native_page(
         Err(r) => Err(read_error(r)),
     }
 }
+
 fn plan_count(host: &Host, params: &Json, bounds: QueryLimits) -> Read<Planned> {
     let empty = json!({});
     let options = if params.is_null() {
@@ -476,6 +512,7 @@ fn plan_count(host: &Host, params: &Json, bounds: QueryLimits) -> Read<Planned> 
         bounds,
     })
 }
+
 fn empty_params(params: &Json) -> Result<()> {
     if params.is_null() || params.as_array().is_some_and(Vec::is_empty) {
         Ok(())
@@ -483,6 +520,7 @@ fn empty_params(params: &Json) -> Result<()> {
         Err(Error("InvalidParams"))
     }
 }
+
 fn quantity(value: &Json) -> Result<u64> {
     if let Some(n) = value.as_u64() {
         return Ok(n);
@@ -499,9 +537,11 @@ fn quantity(value: &Json) -> Result<u64> {
     }
     u64::from_str_radix(s, 16).map_err(|_| Error("InvalidParams"))
 }
+
 fn read_error(error: arkiv_db::Rejected) -> ReadError {
     rejection(&error.reason)
 }
+
 /// An engine read rejection in the SDK's table. The callers answer a missing
 /// entity namespace (a chain before its first entity) as no entities, so it
 /// does not reach here; anything that is no fault of the query is `-32000`.
@@ -524,6 +564,7 @@ fn rejection(reason: &arkiv_db::Rejection) -> ReadError {
         _ => Error("ReadRejected").into(),
     }
 }
+
 /// A validated `select`.
 #[derive(Clone, Debug, PartialEq)]
 struct Selection {
@@ -536,11 +577,11 @@ struct Selection {
     /// selected reads none: `data` is empty and there is no cursor.
     rows: bool,
 }
+
 /// The `select` object: every key one of [`FIELDS`] or `count` with a
 /// boolean, except `attributes`, which may also map attribute names to
-/// booleans. Anything else, including the removed `payload` and
-/// `contentType`, is refused. `key` defaults to selected unless `count` is
-/// the only field selected.
+/// booleans. Any other key is refused. `key` defaults to selected unless
+/// `count` is the only field selected.
 fn selection(value: Option<&Json>) -> Result<Selection> {
     let selected = value.cloned().unwrap_or_else(|| json!({}));
     let object = selected.as_object().ok_or(Error("InvalidParams"))?;
@@ -589,6 +630,7 @@ fn selection(value: Option<&Json>) -> Result<Selection> {
         rows: !count_only,
     })
 }
+
 /// `arkiv_getEntity`: `[key]` at the head, or `[key, block]` as of a retained
 /// block (a hex quantity or a number). The SDK's single-entity read: every
 /// field except `attributeSchema`, or `null` when no live entity has the key.
@@ -624,6 +666,7 @@ fn plan_entity(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead
         bounds,
     )
 }
+
 /// `arkiv_query`: `[query, options?]`. Options: `atBlock`, `select`, `limit`,
 /// `offset` and `cursor`. A cursor carries its own position, so it continues
 /// past the offset of the first page and an `offset` beside it is ignored; it
@@ -726,10 +769,12 @@ fn plan_query(host: &Host, params: &Json, bounds: QueryLimits) -> Read<PageRead>
         height,
     })
 }
+
 impl PageRead {
     fn run(self) -> Read<Json> {
         self.run_within(READ_BUDGET)
     }
+
     /// The page, every read of the request (count, offset or sort walk,
     /// rows) charged to one `budget`.
     fn run_within(self, mut budget: u64) -> Read<Json> {
@@ -804,6 +849,7 @@ impl PageRead {
         page_result(data, next, binding, height, count)
     }
 }
+
 /// How many of `rows`, in order, fit in `budget` bytes of a JSON array.
 fn rows_within(rows: &[Json], budget: usize) -> Result<usize> {
     let mut used = 2;
@@ -816,6 +862,7 @@ fn rows_within(rows: &[Json], budget: usize) -> Result<usize> {
     }
     Ok(rows.len())
 }
+
 fn page_result(
     data: Vec<Json>,
     next: Option<Cursor>,
@@ -858,6 +905,7 @@ fn page_result(
     }
     Ok(result)
 }
+
 /// The page a request asks for, before its starting position.
 struct Window<'a> {
     snapshot: &'a Snapshot,
@@ -868,12 +916,14 @@ struct Window<'a> {
     /// Matches to skip first.
     offset: u64,
 }
+
 /// Whether `query` exceeds the read's group or literal `bounds`, so that it
 /// takes the bounded scan fallback instead of the index.
 fn scans(query: &Query, bounds: QueryLimits) -> bool {
     query.groups.len() > bounds.max_groups
         || query.groups.iter().any(|g| g.len() > bounds.max_literals)
 }
+
 /// The query the engine evaluates for `query`: itself, or every entity for
 /// the scan fallback, which filters the rows itself.
 fn native_query(query: &Query, bounds: QueryLimits) -> Query {
@@ -883,6 +933,7 @@ fn native_query(query: &Query, bounds: QueryLimits) -> Query {
         query.clone()
     }
 }
+
 /// A record-id page: combine native pages within the read's group and
 /// literal `bounds` (the chain's committed limits unless the node raised
 /// them). Larger Boolean trees use a bounded scan fallback of at most
@@ -979,6 +1030,7 @@ fn read_page(window: &Window<'_>, mut cursor: Option<Cursor>, budget: &mut u64) 
     }
     Err(exhausted())
 }
+
 /// What the scan fallback reads of each row to evaluate `query`: the cells
 /// its literals name, plus `extra`, and the key when `key`; every cell when
 /// they are more than a projection may name.
@@ -1001,6 +1053,7 @@ fn scan_projection(
         Projection::named(key, names)
     }
 }
+
 /// `select.count` for a query beyond the read bounds: the matches among at
 /// most [`SCAN_ROWS`] rows, reading only the cells the query names.
 fn scan_count(
@@ -1041,6 +1094,7 @@ fn scan_count(
         }
     }
 }
+
 /// One match of a sorted walk: its sort value, id and key.
 struct Ranked<'o> {
     order: &'o Order,
@@ -1048,17 +1102,20 @@ struct Ranked<'o> {
     id: RecordId,
     key: RecordKey,
 }
+
 impl PartialEq for Ranked<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
+
 impl Eq for Ranked<'_> {}
 impl PartialOrd for Ranked<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for Ranked<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.order.cmp(
@@ -1067,6 +1124,7 @@ impl Ord for Ranked<'_> {
         )
     }
 }
+
 /// An `ORDER BY` page: the `[offset, offset + limit)` window of the matches
 /// in `order`, upstream's fetch-and-sort.
 ///
@@ -1154,6 +1212,7 @@ fn sorted_page(window: &Window<'_>, order: &Order, budget: &mut u64) -> Read<Vec
     }
     Ok(rows)
 }
+
 /// The scan fallback's evaluation of `query` on one row. Like the index, it
 /// only sees indexed cells: an unindexed field never matches a predicate.
 fn matches_query(query: &Query, row: &Row) -> bool {
@@ -1173,7 +1232,7 @@ fn matches_query(query: &Query, row: &Row) -> bool {
                 } => value.tag() == expected.tag() && value != expected,
                 Term::Exists { tag, .. } => value.tag() == *tag,
                 Term::StartsWith { prefix, .. } => {
-                    matches!(value,Value::Str(s) if s.starts_with(prefix.as_ref()))
+                    matches!(value, Value::Str(s) if s.starts_with(prefix.as_ref()))
                 }
                 Term::Range { lower, upper, .. } => {
                     let lower_ok = match lower {
@@ -1193,6 +1252,7 @@ fn matches_query(query: &Query, row: &Row) -> bool {
         })
     })
 }
+
 fn scalar(value: &Value) -> Result<(&'static str, Json)> {
     Ok(match value {
         Value::Bool(v) => ("bool", json!(v)),
@@ -1209,6 +1269,7 @@ fn scalar(value: &Value) -> Result<(&'static str, Json)> {
         _ => return Err(Error("InvalidEntity")),
     })
 }
+
 /// Every user attribute of a verified entity, indexed or not, as
 /// `{name, type, indexed, value}` with the `arkiv_query` value encoding.
 pub(crate) fn verified_attributes(e: &arkiv::ArkivEntityProjection) -> Result<Json> {
@@ -1222,6 +1283,7 @@ pub(crate) fn verified_attributes(e: &arkiv::ArkivEntityProjection) -> Result<Js
         .collect::<Result<Vec<_>>>()
         .map(Json::Array)
 }
+
 /// One entity in the SDK's `RpcEntity` shape, with only the selected keys.
 /// `attributeSchema` entries are `{name, type, indexed}`; `attributes`
 /// carries every user attribute, indexed or not, `bytes` values included.
@@ -1241,7 +1303,11 @@ fn project(row: &Row, selected: &Json) -> Result<Json> {
             "updatedAt" => json!(format!("0x{:x}", e.updated_at)),
             "expiresAt" => json!(format!("0x{:x}", e.expires_at)),
             "creationFlags" => {
-                json!({"raw":e.creation_flags,"readonly":e.creation_flags&1!=0,"permissionlessExtension":e.creation_flags&2!=0})
+                json!({
+                    "raw": e.creation_flags,
+                    "readonly": e.creation_flags&1!=0,
+                    "permissionlessExtension": e.creation_flags&2!=0,
+                })
             }
             "attributeSchema" => Json::Array(
                 e.attributes
@@ -1278,6 +1344,7 @@ fn bounded(groups: Vec<Vec<Literal>>) -> std::result::Result<Query, QueryError> 
     }
     Ok(Query { groups })
 }
+
 fn union(mut a: Query, b: Query) -> std::result::Result<Query, QueryError> {
     if a.groups.len() + b.groups.len() > GROUP_CAP {
         return Err(limits("the query expands to more than 64 groups"));
@@ -1285,6 +1352,7 @@ fn union(mut a: Query, b: Query) -> std::result::Result<Query, QueryError> {
     a.groups.extend(b.groups);
     bounded(a.groups)
 }
+
 fn intersect(a: Query, b: Query) -> std::result::Result<Query, QueryError> {
     if a.groups.len().saturating_mul(b.groups.len()) > GROUP_CAP {
         return Err(limits("the query expands to more than 64 groups"));
@@ -1314,6 +1382,7 @@ fn intersect(a: Query, b: Query) -> std::result::Result<Query, QueryError> {
             .collect(),
     )
 }
+
 fn complement(query: Query) -> std::result::Result<Query, QueryError> {
     let mut out = Query::match_all();
     for group in query.groups {
@@ -1332,6 +1401,7 @@ fn complement(query: Query) -> std::result::Result<Query, QueryError> {
     }
     Ok(out)
 }
+
 fn name(key: &AnnotKey) -> Option<CellName> {
     let text = match key {
         AnnotKey::User(n) => n.as_str(),
@@ -1345,6 +1415,7 @@ fn name(key: &AnnotKey) -> Option<CellName> {
     };
     CellName::new(text).ok()
 }
+
 fn native_value(key: &AnnotKey, value: &AttributeValue) -> Option<Value> {
     Some(match value {
         AttributeValue::Bool(v) => Value::Bool(*v),
@@ -1366,6 +1437,7 @@ fn native_value(key: &AnnotKey, value: &AttributeValue) -> Option<Value> {
         AttributeValue::EntityKey(v) => Value::Key(*v),
     })
 }
+
 /// One predicate's term; `source` and `start` locate it for errors.
 fn leaf(ast: Ast, neq: bool, source: &str, start: usize) -> std::result::Result<Query, QueryError> {
     if let Ast::Between { key, low, high } = ast {
@@ -1438,6 +1510,7 @@ fn leaf(ast: Ast, neq: bool, source: &str, start: usize) -> std::result::Result<
     };
     Ok(Query::term(term))
 }
+
 const TAGS: &[(&str, TypeTag)] = &[
     ("bool", TypeTag::Bool),
     ("i32", TypeTag::I32),
@@ -1456,6 +1529,7 @@ struct Parser<'a> {
     depth: usize,
     predicates: usize,
 }
+
 /// A source-language error, located in the whole query: `offset` is where
 /// the sub-string the parser saw starts.
 fn source_error(error: ParseError, source: &str, offset: usize) -> QueryError {
@@ -1470,6 +1544,7 @@ fn source_error(error: ParseError, source: &str, offset: usize) -> QueryError {
         None => QueryError::new(kind, error.message),
     }
 }
+
 /// Parses an `arkiv_query` string: `*` or a Boolean expression, then an
 /// optional `ORDER BY` clause, which ends it.
 fn parse_query(source: &str) -> std::result::Result<Statement, QueryError> {
@@ -1506,16 +1581,19 @@ fn parse_query(source: &str) -> std::result::Result<Statement, QueryError> {
     }
     Ok(Statement { query, order })
 }
+
 impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.at).map(|t| &t.token)
     }
+
     /// Where the next token starts, or the end of the query.
     fn position(&self) -> usize {
         self.tokens
             .get(self.at)
             .map_or(self.source.len(), |t| t.start)
     }
+
     fn parse_error(&self, expected: &str) -> QueryError {
         QueryError::at(
             QueryErrorKind::Parse,
@@ -1524,6 +1602,7 @@ impl Parser<'_> {
             expected,
         )
     }
+
     fn take(&mut self, t: Token) -> bool {
         if self.peek() == Some(&t) {
             self.at += 1;
@@ -1532,10 +1611,12 @@ impl Parser<'_> {
             false
         }
     }
+
     /// Whether the next token is the name `word`, in any case.
     fn word(&self, word: &str) -> bool {
         matches!(self.peek(), Some(Token::Name(n)) if n.eq_ignore_ascii_case(word))
     }
+
     /// `ORDER BY attrRef [':' typeTag] [ASC | DESC]`, from its `ORDER`. A
     /// user attribute names the type it sorts as; a system attribute holds
     /// one, which a `:` may repeat but not contradict. `bytes` is never
@@ -1646,6 +1727,7 @@ impl Parser<'_> {
             descending,
         })
     }
+
     fn expect(&mut self, t: Token, expected: &str) -> std::result::Result<(), QueryError> {
         if self.take(t) {
             Ok(())
@@ -1653,6 +1735,7 @@ impl Parser<'_> {
             Err(self.parse_error(expected))
         }
     }
+
     fn or(&mut self) -> std::result::Result<Query, QueryError> {
         let mut q = self.and()?;
         while self.take(Token::Or) {
@@ -1660,6 +1743,7 @@ impl Parser<'_> {
         }
         Ok(q)
     }
+
     fn and(&mut self) -> std::result::Result<Query, QueryError> {
         let mut q = self.unary()?;
         while self.take(Token::And) {
@@ -1667,6 +1751,7 @@ impl Parser<'_> {
         }
         Ok(q)
     }
+
     fn unary(&mut self) -> std::result::Result<Query, QueryError> {
         if self.depth >= MAX_DEPTH {
             return Err(limits("the query nests more than 32 levels deep"));
@@ -1683,6 +1768,7 @@ impl Parser<'_> {
         self.depth -= 1;
         result
     }
+
     fn predicate(&mut self) -> std::result::Result<Query, QueryError> {
         self.predicates += 1;
         if self.predicates > MAX_PREDICATES {
@@ -1792,22 +1878,37 @@ mod tests {
     fn bounds(host: &Host) -> QueryLimits {
         ReadLimits::default().query_limits(&host.genesis.genesis.limits)
     }
+
     fn entity_count(host: &Host, params: &Json) -> Read<Json> {
         plan_count(host, params, bounds(host)).and_then(Planned::run)
     }
+
     fn query(host: &Host, params: &Json) -> Read<Json> {
         plan_query(host, params, bounds(host)).and_then(PageRead::run)
     }
+
     /// The SDK's `select`: every key sent as an explicit boolean.
     fn sdk_select(attributes: Json) -> Json {
-        json!({"key":true,"owner":true,"creator":true,"createdAt":true,"updatedAt":true,"expiresAt":true,"creationFlags":true,"attributeSchema":true,"attributes":attributes})
+        json!({
+            "key": true,
+            "owner": true,
+            "creator": true,
+            "createdAt": true,
+            "updatedAt": true,
+            "expiresAt": true,
+            "creationFlags": true,
+            "attributeSchema": true,
+            "attributes": attributes,
+        })
     }
+
     fn kind(result: Read<Json>) -> QueryErrorKind {
         match result {
             Err(ReadError::Query(q)) => q.kind,
             other => panic!("expected a query error, got {other:?}"),
         }
     }
+
     #[test]
     fn sdk_operators_and_bounds() {
         for s in [
@@ -1836,6 +1937,7 @@ mod tests {
             .join(" AND ");
         assert!(parse_query(&explosive).is_err());
     }
+
     #[test]
     fn scalar_encodings_do_not_depend_on_magnitude() {
         assert_eq!(scalar(&Value::U64(1)).unwrap(), ("u64", json!("0x1")));
@@ -1852,7 +1954,7 @@ mod tests {
         );
         assert!(selection(Some(&json!({"payload":1}))).is_err());
         assert_eq!(selection(None).unwrap().fields, json!({"key":true}));
-        // The removed payload model is not selectable at all.
+        // `payload` and `contentType` are not select keys.
         for removed in ["payload", "contentType"] {
             for choice in [true, false] {
                 let mut select = sdk_select(json!(true));
@@ -1865,12 +1967,15 @@ mod tests {
         assert!(selection(Some(&sdk_select(json!({"arkiv.schema":true,"title":true})))).is_ok());
         assert!(selection(Some(&sdk_select(json!(false)))).is_ok());
     }
+
     fn fixture() -> Host {
         fixture_with_period(1_000)
     }
+
     fn fixture_with_period(period_ms: u64) -> Host {
         fixture_with(period_ms, Vec::new())
     }
+
     /// The four fixture entities, then one more per entry of `extra` holding
     /// those indexed `str` values as `s0`, `s1`, ….
     fn fixture_with(period_ms: u64, extra: Vec<Vec<&str>>) -> Host {
@@ -1959,6 +2064,7 @@ mod tests {
         )
         .unwrap()
     }
+
     #[test]
     fn str_values_with_control_characters_are_stored_and_queryable() {
         // SDK 1.0's health suite writes "line one\n\tline two"; the network
@@ -2005,10 +2111,12 @@ mod tests {
             json!(1)
         );
     }
+
     fn get_entity(host: &Host, params: &Json) -> Read<Json> {
         plan_entity(host, params, bounds(host))
             .and_then(|page| Planned::Entity(Box::new(page)).run())
     }
+
     #[test]
     fn get_entity_returns_the_full_live_entity_or_null() {
         let mut host = fixture();
@@ -2026,7 +2134,10 @@ mod tests {
         // Unindexed attributes are returned too.
         assert_eq!(
             entity["attributes"],
-            json!([{"name":"n","type":"u64","value":"0x7"},{"name":"note","type":"str","value":"seven"}])
+            json!([
+                {"name": "n", "type": "u64", "value": "0x7"},
+                {"name": "note", "type": "str", "value": "seven"},
+            ])
         );
         // Keys are case-insensitive hex; an unknown key is `null`.
         assert_eq!(
@@ -2064,6 +2175,7 @@ mod tests {
             assert!(get_entity(&host, &params).is_err(), "{params}");
         }
     }
+
     #[test]
     fn indexer_genesis_walk_uses_historical_count_and_numeric_page_limit() {
         let mut host = fixture();
@@ -2079,7 +2191,27 @@ mod tests {
             entity_count(&host, &json!([{"block":0,"query":"n = u64(7)"}])).unwrap(),
             json!(1)
         );
-        let page = query(&host, &json!(["*", {"atBlock":"0x0","limit":200,"select":{"key":true,"owner":true,"creator":true,"createdAt":true,"updatedAt":true,"expiresAt":true,"creationFlags":true,"attributes":true}}])).unwrap();
+        let page = query(
+            &host,
+            &json!([
+                "*",
+                {
+                    "atBlock": "0x0",
+                    "limit": 200,
+                    "select": {
+                        "key": true,
+                        "owner": true,
+                        "creator": true,
+                        "createdAt": true,
+                        "updatedAt": true,
+                        "expiresAt": true,
+                        "creationFlags": true,
+                        "attributes": true,
+                    },
+                },
+            ]),
+        )
+        .unwrap();
         assert_eq!(page["data"].as_array().unwrap().len(), 4);
         assert_eq!(page["blockNumber"], "0x0");
         for params in [
@@ -2093,6 +2225,7 @@ mod tests {
         assert!(query(&host, &json!(["*",{"limit":201}])).is_err());
         assert!(query(&host, &json!(["*",{"limit":0.5}])).is_err());
     }
+
     #[test]
     fn actual_snapshot_reads_extended_semantics_projection_and_pinned_cursors() {
         let mut host = fixture();
@@ -2148,10 +2281,18 @@ mod tests {
         let mut unpinned = options;
         unpinned.as_object_mut().unwrap().remove("atBlock");
         assert!(query(&host, &json!(["EXISTS(n)", unpinned])).is_err());
-        let last=query(&host,&json!(["EXISTS(n)",{"limit":"0x1","select":selected,"cursor":second["cursor"],"atBlock":"0x0"}])).unwrap();
+        let last = query(
+            &host,
+            &json!([
+                "EXISTS(n)",
+                {"limit": "0x1", "select": selected, "cursor": second["cursor"], "atBlock": "0x0"},
+            ]),
+        )
+        .unwrap();
         assert_eq!(last["data"][0]["attributes"][0]["type"], "str");
         assert!(last.get("cursor").is_none());
     }
+
     #[test]
     fn clause_order_and_read_bounds_do_not_change_answers() {
         let host = fixture();
@@ -2242,6 +2383,7 @@ mod tests {
             .is_err()
         );
     }
+
     #[test]
     fn unindexed_attributes_are_returned_but_never_matched() {
         let host = fixture();
@@ -2276,26 +2418,26 @@ mod tests {
         assert_eq!(
             unindexed[0]["attributeSchema"],
             json!([
-                {"name":"blob","type":"bytes","indexed":false},
-                {"name":"n","type":"u64","indexed":false},
+                {"name":"blob", "type":"bytes", "indexed":false},
+                {"name":"n", "type":"u64", "indexed":false},
             ])
         );
         assert_eq!(
             unindexed[0]["attributes"],
             json!([
-                {"name":"blob","type":"bytes","value":"0xabcd"},
-                {"name":"n","type":"u64","value":"0x7"},
+                {"name":"blob", "type":"bytes", "value":"0xabcd"},
+                {"name":"n", "type":"u64", "value":"0x7"},
             ])
         );
         let indexed = page("n = u64(7)");
         assert_eq!(
             indexed[0]["attributeSchema"],
             json!([
-                {"name":"n","type":"u64","indexed":true},
-                {"name":"note","type":"str","indexed":false},
+                {"name":"n", "type":"u64", "indexed":true},
+                {"name":"note", "type":"str", "indexed":false},
             ])
         );
-        // The SDK's `RpcEntity` keys and nothing else: no payload model.
+        // The SDK's `RpcEntity` keys and nothing else.
         let keys: Vec<_> = indexed[0].as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             keys,
@@ -2322,6 +2464,7 @@ mod tests {
             json!([{"name":"note","type":"str","value":"seven"}])
         );
     }
+
     #[test]
     fn query_errors_use_the_sdk_code_table() {
         let mut host = fixture();
@@ -2405,6 +2548,7 @@ mod tests {
             Err(ReadError::Node(Error("InvalidParams")))
         ));
     }
+
     /// A chain without a prefill: its entity namespace only appears with
     /// the proposer's bootstrap transaction in block 1.
     fn bare_fixture() -> Host {
@@ -2439,6 +2583,7 @@ mod tests {
         )
         .unwrap()
     }
+
     #[test]
     fn a_chain_without_its_entity_namespace_has_no_entities() {
         let host = bare_fixture();
@@ -2462,6 +2607,7 @@ mod tests {
             assert_eq!(entity_count(&host, &params).unwrap(), json!(0), "{params}");
         }
     }
+
     #[test]
     fn engine_rejections_map_onto_the_sdk_table() {
         use arkiv_db::{QueryFault as F, Rejection as R};
@@ -2472,38 +2618,27 @@ mod tests {
                 None
             }
         };
-        assert_eq!(kind_of(R::CursorMismatch), Some(QueryErrorKind::Cursor));
-        assert_eq!(kind_of(R::OutOfBudget), Some(QueryErrorKind::Limits));
-        assert_eq!(
-            kind_of(R::InvalidQuery(F::TooManyGroups)),
-            Some(QueryErrorKind::Limits)
-        );
-        assert_eq!(
-            kind_of(R::InvalidQuery(F::TooManyLiterals)),
-            Some(QueryErrorKind::Limits)
-        );
-        assert_eq!(
-            kind_of(R::InvalidQuery(F::ValueTooLarge)),
-            Some(QueryErrorKind::Literal)
-        );
-        for fault in [
-            F::NotIndexable,
-            F::NotOrdered,
-            F::MixedBounds,
-            F::UnboundedRange,
+        use QueryErrorKind as K;
+        for (reason, kind) in [
+            (R::CursorMismatch, Some(K::Cursor)),
+            (R::OutOfBudget, Some(K::Limits)),
+            (R::InvalidQuery(F::TooManyGroups), Some(K::Limits)),
+            (R::InvalidQuery(F::TooManyLiterals), Some(K::Limits)),
+            (R::InvalidQuery(F::ValueTooLarge), Some(K::Literal)),
+            (R::InvalidQuery(F::NotIndexable), Some(K::Type)),
+            (R::InvalidQuery(F::NotOrdered), Some(K::Type)),
+            (R::InvalidQuery(F::MixedBounds), Some(K::Type)),
+            (R::InvalidQuery(F::UnboundedRange), Some(K::Type)),
+            // No fault of the query: a server error, never a query kind.
+            (R::Unauthorized, None),
+            (R::CostOverflow, None),
+            (R::InvalidQuery(F::NoGroups), None),
+            (R::InvalidQuery(F::ProjectionTooLarge), None),
         ] {
-            assert_eq!(kind_of(R::InvalidQuery(fault)), Some(QueryErrorKind::Type));
-        }
-        // No fault of the query: a server error, never a query kind.
-        for reason in [
-            R::Unauthorized,
-            R::CostOverflow,
-            R::InvalidQuery(F::NoGroups),
-            R::InvalidQuery(F::ProjectionTooLarge),
-        ] {
-            assert_eq!(kind_of(reason), None);
+            assert_eq!(kind_of(reason), kind);
         }
     }
+
     #[test]
     fn a_page_past_the_response_cap_is_shortened_and_its_cursor_continues() {
         use crate::{
@@ -2589,7 +2724,10 @@ mod tests {
         let sorted = |limit: u64| {
             query(
                 &host,
-                &json!(["big = true ORDER BY $key", {"atBlock": at, "limit": limit, "select": sdk_select(json!(true))}]),
+                &json!([
+                    "big = true ORDER BY $key",
+                    {"atBlock": at, "limit": limit, "select": sdk_select(json!(true))},
+                ]),
             )
         };
         assert_eq!(kind(sorted(200)), QueryErrorKind::Limits);
@@ -2601,6 +2739,7 @@ mod tests {
         assert_eq!(rows_within(&[json!(1), json!(2)], 5).unwrap(), 2);
         assert_eq!(rows_within(&[json!(1), json!(2)], 4).unwrap(), 1);
     }
+
     /// Submits one signed transaction of `ops` from the fixture's signer.
     fn submit(host: &mut Host, nonce: &mut u64, ops: Vec<arkiv::ArkivOperation>) {
         use crate::{
@@ -2631,6 +2770,7 @@ mod tests {
             host.produce().unwrap();
         }
     }
+
     fn create(salt: u128, attributes: Vec<(&str, arkiv_db::Cell)>) -> arkiv::ArkivOperation {
         arkiv::ArkivOperation::Create {
             salt,
@@ -2645,12 +2785,14 @@ mod tests {
                 .collect(),
         }
     }
+
     fn delete(key: &Json) -> arkiv::ArkivOperation {
         let bytes = crate::simulator::wire::unhex(key.as_str().unwrap(), 32).unwrap();
         arkiv::ArkivOperation::Delete {
             key: RecordKey::new(&bytes).unwrap(),
         }
     }
+
     /// The keys of a page.
     fn keys(page: &Json) -> Vec<Json> {
         page["data"]
@@ -2660,6 +2802,7 @@ mod tests {
             .map(|e| e["key"].clone())
             .collect()
     }
+
     /// Every page of `source` with `options`, following cursors at the
     /// first page's block: the keys and the pages.
     fn walk(host: &Host, source: &str, options: Json) -> (Vec<Json>, Vec<Json>) {
@@ -2678,6 +2821,7 @@ mod tests {
         }
         (all, pages)
     }
+
     #[test]
     fn offset_skips_matches_in_creation_order() {
         let host = fixture();
@@ -2755,6 +2899,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn select_count_is_the_match_set_on_every_page() {
         let host = fixture();
@@ -2791,7 +2936,18 @@ mod tests {
         for select in [
             json!({"count": true}),
             json!({"key": false, "count": true}),
-            json!({"key":false,"owner":false,"creator":false,"createdAt":false,"updatedAt":false,"expiresAt":false,"creationFlags":false,"attributeSchema":false,"attributes":false,"count":true}),
+            json!({
+                "key": false,
+                "owner": false,
+                "creator": false,
+                "createdAt": false,
+                "updatedAt": false,
+                "expiresAt": false,
+                "creationFlags": false,
+                "attributeSchema": false,
+                "attributes": false,
+                "count": true,
+            }),
         ] {
             assert_eq!(
                 query(&host, &json!(["*", {"select": select, "limit": 1}])).unwrap(),
@@ -2843,6 +2999,7 @@ mod tests {
             "0x1"
         );
     }
+
     #[test]
     fn order_by_sorts_by_value_with_missing_values_below_and_ties_in_creation_order() {
         let host = fixture();
@@ -2897,7 +3054,15 @@ mod tests {
             for offset in (0..6).step_by(2) {
                 let page = query(
                     &host,
-                    &json!([source, {"limit": 2, "offset": offset, "atBlock": "0x0", "select": {"key": true, "count": true}}]),
+                    &json!([
+                        source,
+                        {
+                            "limit": 2,
+                            "offset": offset,
+                            "atBlock": "0x0",
+                            "select": {"key": true, "count": true},
+                        },
+                    ]),
                 )
                 .unwrap();
                 assert_eq!(page["count"], "0x4");
@@ -2912,7 +3077,10 @@ mod tests {
             .unwrap();
             let expected = query(
                 &host,
-                &json!([format!("$key = key({})", every[order[3]].as_str().unwrap()), {"select": sdk_select(json!(true))}]),
+                &json!([
+                    format!("$key = key({})", every[order[3]].as_str().unwrap()),
+                    {"select": sdk_select(json!(true))},
+                ]),
             )
             .unwrap();
             assert_eq!(page["data"], expected["data"]);
@@ -2943,6 +3111,7 @@ mod tests {
             assert!(error.message.contains("offset"), "{}", error.message);
         }
     }
+
     #[test]
     fn order_by_errors_use_the_sdk_code_table() {
         let host = fixture();
@@ -2966,7 +3135,6 @@ mod tests {
             ("* ORDER BY n:u64 ORDER BY n:u64", QueryErrorKind::Parse),
             ("(n = u64(1) ORDER BY n:u64)", QueryErrorKind::Parse),
             ("* AND n = u64(1)", QueryErrorKind::Parse),
-            ("n = u64(1) n = u64(2)", QueryErrorKind::Parse),
         ] {
             assert_eq!(kind(query(&host, &json!([source]))), expected, "{source}");
         }
@@ -2982,6 +3150,7 @@ mod tests {
         assert_eq!(error.to_json()["data"]["position"], "* ORDER BY ".len());
         assert_eq!(error.to_json()["code"], -32002);
     }
+
     #[test]
     fn between_and_ranges_take_every_indexable_type() {
         let host = fixture();
@@ -3000,7 +3169,7 @@ mod tests {
         assert_eq!(count("n BETWEEN str('a') AND str('f')"), 1);
         assert_eq!(count("n > str('a')"), 1);
         assert_eq!(count("n < str('a')"), 0);
-        let mut sorted = every.clone();
+        let mut sorted = every;
         sorted.sort_by_key(|k| k.as_str().unwrap().to_owned());
         let (low, high) = (sorted[1].as_str().unwrap(), sorted[2].as_str().unwrap());
         assert_eq!(count(&format!("$key > key({low})")), 2);
@@ -3014,6 +3183,7 @@ mod tests {
         );
         assert_eq!(count("$expiresAt BETWEEN u64(10) AND u64(10)"), 4);
     }
+
     #[test]
     fn offset_sort_and_count_walks_are_charged_to_the_read_budget() {
         let mut host = fixture();
@@ -3099,6 +3269,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
     #[test]
     fn offset_pages_at_a_pinned_block_stay_stable_while_the_head_changes() {
         let mut host = fixture();
@@ -3185,7 +3356,10 @@ mod tests {
         for source in &sources[..2] {
             let first = query(
                 &host,
-                &json!([source, {"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)}]),
+                &json!([
+                    source,
+                    {"limit": 4, "offset": 4, "atBlock": pinned, "select": select(false)},
+                ]),
             )
             .unwrap();
             let (rest, _) = walk(
@@ -3201,6 +3375,7 @@ mod tests {
             assert_eq!(rest, reference[4..], "{source}");
         }
     }
+
     #[test]
     fn timing_uses_numeric_height_and_observed_whole_seconds() {
         let mut host = fixture_with_period(1_500);

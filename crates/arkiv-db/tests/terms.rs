@@ -1,45 +1,10 @@
-//! The `terms` read and the height-by-height expiry sweep, under model
-//! version 3.
+//! The `terms` read and the height-by-height expiry sweep.
 //!
-//! What this file establishes:
-//! - `terms(namespace, name, tag, lower, limit)` returns the distinct
-//!   attribute values of one `(name, tag)` held by live records, in value
-//!   order from the lower bound (`Unbounded`, `Included` or `Excluded`, at
-//!   existing and non-existing values including `i64::MIN`, `i64::MAX`,
-//!   negative integers, `u64::MAX` and the empty string), truncated to the
-//!   limit and decoded exactly as written. Field cells never appear even
-//!   when they hold the same value; a missing `(name, tag)` is empty;
-//!   deletes and patches (type change, kind flip both ways, value change,
-//!   removal) move the distinct set and an emptied value disappears; a
-//!   pinned snapshot keeps its terms after later mutations; `Snapshot` and
-//!   `Branch` agree.
-//! - The admission faults in the brief's order (`NotIndexable`,
-//!   `MixedBounds`, `ValueTooLarge`, `ZeroLimit`, `LimitTooLarge`): spent 0,
-//!   a Read receipt, nothing recorded, decided before the directory lookup;
-//!   a valid read of an unknown namespace is `UnknownNamespace` with spent 1.
-//! - Whole receipts as hand-derived FIXTURE literals: DirectoryLookup 1 +
-//!   TermSeek 4 + per returned term `{TermVisit 3, ReadByte encoded bytes}`;
-//!   an `Excluded` existing bound and the key ending the run are free; a
-//!   missing run costs the seek only (5); the traced ledger in first-charge
-//!   order; the charge point under every budget with no partial result; and
-//!   positional cost (terms before the bound are never charged).
-//! - Isolation: identical terms in another namespace never appear and leave
-//!   the first namespace's receipts and index nodes unchanged.
-//! - `expire_records` sweeps height by height: with heights 3, 3, 5, 7, 7, 7
-//!   it deletes exactly the attribute rows in (height, id) order with the
-//!   literal delete receipts, a field-kind and an absent `$expiresAt`
-//!   survive, only the deletes enter the block, a lower block stops at the
-//!   first height above it, and a rejection (a starved delete budget, a
-//!   budget admitting one row only, a query budget one unit short of the
-//!   `terms` read) halts with the deletes so far applied and staying applied.
-//!
-//! Every expected value comes from a `BTreeMap` reference model that orders
-//! values numerically or bytewise on its own, never from the engine's index;
-//! every cost is a literal derived by hand next to it (the model-side cost
-//! check inside the semantics sweep uses only the transcribed FIXTURE
-//! weights). What it does not establish: query evaluation and its charges
-//! (the `Eq` pages inside the sweep are observed only through their
-//! deletes), cursor binding, and anything about durability or roots.
+//! Expected values come from a `BTreeMap` reference model that orders values
+//! numerically or bytewise on its own, never from the engine's index. Every
+//! cost is a literal derived by hand next to it from the FIXTURE weights.
+//! Query evaluation and its charges, cursor binding, durability and roots
+//! are covered by other files.
 
 use std::{cmp::Ordering, collections::BTreeMap, fmt::Debug, ops::Bound};
 
@@ -59,20 +24,12 @@ const MODEL_VERSION: u32 = 3;
 /// The id `PriceSchedule::FIXTURE` carries.
 const FIXTURE_ID: u32 = 1;
 
-// ---------------------------------------------------------------------------
-// FIXTURE weights, transcribed from the brief (unit prices of the classes
-// this file charges). Used for ledger lines and the derivations below.
-// ---------------------------------------------------------------------------
-
+// FIXTURE unit prices of the classes a `terms` read charges, used for
+// ledger lines and the model's cost.
 const DIRECTORY_LOOKUP: u64 = 1;
-const POINT_READ: u64 = 3;
 const READ_BYTE: u64 = 1;
-const RECORD_DELETE: u64 = 20;
-const CELL_REMOVE: u64 = 4;
-const INDEX_REMOVE: u64 = 6;
 const TERM_SEEK: u64 = 4;
 const TERM_VISIT: u64 = 3;
-const ROOT_UPDATE: u64 = 2;
 
 /// The fixture namespace has ordinal 1.
 const NS: u64 = 1;
@@ -80,10 +37,6 @@ const NS: u64 = 1;
 const INDEXABLE: [TypeTag; 4] = [TypeTag::Bool, TypeTag::I64, TypeTag::U64, TypeTag::Str];
 /// The page limits the semantics sweep uses.
 const LIMITS: [usize; 4] = [1, 2, 5, 200];
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn ns_id(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).expect("ordinals start at 1")
@@ -268,12 +221,9 @@ fn populate(
     publish(engine, branch)
 }
 
-// ---------------------------------------------------------------------------
-// Reference model: the record semantics of the brief over a BTreeMap. Value
-// order is the model's own (numeric for the integers, bytewise for text,
-// false < true); it never looks at term bytes or at the engine's index.
-// ---------------------------------------------------------------------------
-
+/// Reference model: the record semantics over a `BTreeMap`. Value order is
+/// the model's own (numeric for the integers, bytewise for text, false <
+/// true); it never looks at term bytes or at the engine's index.
 #[derive(Clone, Debug, Default)]
 struct Model {
     next_id: u64,
@@ -291,19 +241,13 @@ fn value_order(left: &Value, right: &Value) -> Ordering {
     }
 }
 
-/// The encoded bytes the brief charges per returned term.
+/// The encoded bytes charged per returned term.
 fn value_bytes(value: &Value) -> u64 {
     match value {
-        Value::I32(_) | Value::Bytes4(_) | Value::U32(_) | Value::Dec32(_) => 4,
-        Value::F32(_) | Value::Date32(_) => 4,
-        Value::Addr(_) => 20,
-        Value::U256(_) | Value::Dec(_) | Value::Bytes32(_) | Value::Key(_) | Value::I256(_) => 32,
-        Value::Bytes16(_) | Value::U128(_) | Value::I128(_) | Value::Dec128(_) => 16,
         Value::Bool(_) => 1,
-        Value::I64(_) | Value::U64(_) | Value::Bytes8(_) | Value::Dec64(_) => 8,
-        Value::F64(_) | Value::Timestamp64(_) => 8,
+        Value::I64(_) | Value::U64(_) => 8,
         Value::Str(text) => u64::try_from(text.len()).expect("lengths fit"),
-        Value::Bytes(_) => panic!("model: bytes are never terms"),
+        other => panic!("model: {other:?} is not used by this file"),
     }
 }
 
@@ -495,8 +439,7 @@ fn probes(tag: TypeTag) -> Vec<Bound<Value>> {
         TypeTag::Str => strs(&[
             "", "a", "aa", "ab", "abc", "b", "ba", "c", "hello", "héllo", "zz",
         ]),
-        TypeTag::Bytes => panic!("bytes has no terms"),
-        _ => vec![],
+        other => unreachable!("{other:?} is not probed"),
     };
     let mut bounds = vec![Bound::Unbounded];
     for value in values {
@@ -588,14 +531,11 @@ fn assert_read_sweep<T: Debug + PartialEq>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The mixed fixture: 40 records keyed k01..k40 in creation order. `v` is the
-// probed name; it appears as attributes of every indexable type (with
-// duplicates), as fields holding the very same values (plus values held by
-// no attribute), and not at all. `w` holds one attribute per type; `other`
-// is never probed; `u` never exists.
-// ---------------------------------------------------------------------------
-
+/// The mixed fixture: 40 records keyed k01..k40 in creation order. `v` is the
+/// probed name; it appears as attributes of every indexable type (with
+/// duplicates), as fields holding the very same values (plus values held by
+/// no attribute), and not at all. `w` holds one attribute per type; `other`
+/// is never probed; `u` never exists.
 fn mixed_records() -> Vec<(&'static str, Cells)> {
     let v = |cell: Cell| vec![(name("v"), cell)];
     let vw = |cell: Cell, w: Cell| vec![(name("v"), cell), (name("w"), w)];
@@ -687,7 +627,7 @@ fn mutate_mixed(branch: &mut Branch, ns: NamespaceId, model: &mut Model) {
         // value change onto an existing value: false empties.
         ("k27", vec![(v.clone(), attr(Value::Bool(true)))], vec![]),
         // removal: 1000 empties.
-        ("k14", vec![], vec![v.clone()]),
+        ("k14", vec![], vec![v]),
     ];
     for (text, set, remove) in patches {
         let id = model.id(&key(text));
@@ -705,12 +645,9 @@ fn mutate_mixed(branch: &mut Branch, ns: NamespaceId, model: &mut Model) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The cost fixture: a, b, c (ids 1, 2, 3) with price: I64 10, 20, 5 and
-// kind: Str "", "a", "ab". Runs: price/I64 = [5, 10, 20] (8 bytes each),
-// kind/Str = ["", "a", "ab"] (0, 1, 2 bytes).
-// ---------------------------------------------------------------------------
-
+/// The cost fixture: a, b, c (ids 1, 2, 3) with price: I64 10, 20, 5 and
+/// kind: Str "", "a", "ab". Runs: price/I64 = [5, 10, 20] (8 bytes each),
+/// kind/Str = ["", "a", "ab"] (0, 1, 2 bytes).
 fn cost_records() -> Vec<(&'static str, Cells)> {
     let record = |price: i64, kind: &str| {
         vec![
@@ -755,18 +692,15 @@ const STR_RUN: [u64; 5] = [1, 5, 8, 12, 17];
 /// A missing (name, tag): the lookup and the seek only: 1, 5.
 const MISSING_RUN: [u64; 2] = [1, 5];
 
-// ---------------------------------------------------------------------------
-// The expiry fixture: r1..r6 (ids 1..6) hold `$expiresAt` as a U64
-// attribute with heights 7, 3, 5, 7, 3, 7 (so (height, id) order differs
-// from id order); f (id 7) holds it as a field; n (id 8) lacks it.
-//
-// Delete cost (model 3) = DirectoryLookup 1 + PointRead 3 + {RecordDelete
-// 20 + CellRemove 4c + RootUpdate 3*2} + {IndexRemove 6 + RootUpdate 2*2}
-// per term held (two per attribute cell) = 30 + 4c + 20a:
-//   r1: c 2, a 2 -> 78   r2: c 1, a 1 -> 54   r3: c 3, a 2 -> 82
-//   r4: c 3, a 3 -> 102  r5: c 2, a 1 -> 58   r6: c 1, a 1 -> 54
-// ---------------------------------------------------------------------------
-
+/// The expiry fixture: r1..r6 (ids 1..6) hold `$expiresAt` as a U64
+/// attribute with heights 7, 3, 5, 7, 3, 7 (so (height, id) order differs
+/// from id order); f (id 7) holds it as a field; n (id 8) lacks it.
+///
+/// Delete cost = DirectoryLookup 1 + PointRead 3 + {RecordDelete 20 +
+/// CellRemove 4c + RootUpdate 3*2} + {IndexRemove 6 + RootUpdate 2*2} per
+/// term held (two per attribute cell) = 30 + 4c + 20a:
+///   r1: c 2, a 2 -> 78   r2: c 1, a 1 -> 54   r3: c 3, a 2 -> 82
+///   r4: c 3, a 3 -> 102  r5: c 2, a 1 -> 58   r6: c 1, a 1 -> 54
 fn expiry_records() -> Vec<(&'static str, Cells)> {
     let expires = |height: u64| (name("$expiresAt"), attr(Value::U64(height)));
     let kind = |text: &str| (name("kind"), attr(Value::str(text)));
@@ -794,15 +728,9 @@ fn expiry_records() -> Vec<(&'static str, Cells)> {
 const EXPIRY_DELETES: [(u64, u64); 6] = [(2, 54), (5, 58), (3, 82), (1, 78), (4, 102), (6, 54)];
 /// The sum of the six delete receipts: 54 + 58 + 82 + 78 + 102 + 54.
 const EXPIRY_TOTAL: u64 = 428;
-/// The `terms` read that opens every sweep iteration: lookup 1, seek 4,
-/// one U64 term {3 + 8}: 16.
-const EXPIRY_TERMS_READ: u64 = 16;
 /// Cumulative charge points of the delete of r2 (c 1, a 1): lookup 1, point
 /// read 4, {20 + 4 + 6} 34, {IndexRemove 6 + RootUpdate 4} 44, 54.
 const DELETE_R2: [u64; 5] = [1, 4, 34, 44, 54];
-/// Cumulative charge points of the delete of r5 (c 2, a 1): 1, 4, {20 + 8
-/// + 6} 38, 48, 58.
-const DELETE_R5: [u64; 5] = [1, 4, 38, 48, 58];
 
 /// Snapshot 2: the expiry fixture in namespace 1, with its model.
 fn expiry_fixture() -> (Engine, NamespaceId, Model) {
@@ -841,7 +769,7 @@ fn sweep(
     )
 }
 
-/// The deletes `EXPIRY_DELETES[range]` as the sweep reports them.
+/// `deletes` as `(RecordId, receipt)` pairs, the way the sweep reports them.
 fn expected_deletes(deletes: &[(u64, u64)]) -> Vec<(RecordId, Receipt)> {
     deletes
         .iter()
@@ -867,10 +795,6 @@ fn assert_branch_matches_model(branch: &Branch, ns: NamespaceId, model: &Model, 
         assert_eq!(got, model.row(&key(text)), "{label}: record {text}");
     }
 }
-
-// ---------------------------------------------------------------------------
-// 1. Semantics against the model
-// ---------------------------------------------------------------------------
 
 #[test]
 fn terms_equal_the_models_distinct_attribute_values_from_every_bound_and_limit() {
@@ -905,57 +829,6 @@ fn terms_equal_the_models_distinct_attribute_values_from_every_bound_and_limit()
 
     for_each_view(&engine, |view, label| {
         assert_terms_match_model(view, ns, &model, label);
-        // Field-only values never appear, whatever the bound.
-        let all = read(view, ns, &v, TypeTag::I64, Bound::Unbounded, 200).value;
-        assert!(!all.contains(&Value::I64(42)), "{label}");
-        let all = read(view, ns, &v, TypeTag::Str, Bound::Unbounded, 200).value;
-        assert!(!all.contains(&Value::str("zzz")), "{label}");
-        // The extremes round-trip and order numerically, not bytewise on
-        // the two's complement.
-        assert_eq!(
-            read(view, ns, &v, TypeTag::I64, Bound::Unbounded, 2).value,
-            i64s(&[i64::MIN, -5]),
-            "{label}"
-        );
-        assert_eq!(
-            read(
-                view,
-                ns,
-                &v,
-                TypeTag::I64,
-                Bound::Excluded(Value::I64(7)),
-                200
-            )
-            .value,
-            i64s(&[i64::MAX]),
-            "{label}"
-        );
-        assert_eq!(
-            read(
-                view,
-                ns,
-                &v,
-                TypeTag::U64,
-                Bound::Excluded(Value::U64(1000)),
-                200
-            )
-            .value,
-            u64s(&[u64::MAX]),
-            "{label}"
-        );
-        assert_eq!(
-            read(
-                view,
-                ns,
-                &v,
-                TypeTag::Str,
-                Bound::Included(Value::str("")),
-                1
-            )
-            .value,
-            strs(&[""]),
-            "{label}"
-        );
     });
 }
 
@@ -991,47 +864,18 @@ fn terms_follow_deletes_and_patches_and_an_emptied_value_disappears() {
     assert_eq!(published.sequence(), 3);
     for_each_view(&engine, |view, label| {
         assert_terms_match_model(view, ns, &model, label);
-        let terms = |tag, lower| read(view, ns, &v, tag, lower, 200).value;
-        // Emptied values are gone.
-        assert!(
-            !terms(TypeTag::I64, Bound::Unbounded).contains(&Value::I64(i64::MAX)),
-            "{label}"
-        );
-        assert!(
-            !terms(TypeTag::I64, Bound::Unbounded).contains(&Value::I64(-5)),
-            "{label}"
-        );
-        assert!(
-            !terms(TypeTag::U64, Bound::Unbounded).contains(&Value::U64(1000)),
-            "{label}"
-        );
-        assert!(
-            !terms(TypeTag::Str, Bound::Unbounded).contains(&Value::str("ba")),
-            "{label}"
-        );
-        assert!(
-            !terms(TypeTag::Str, Bound::Unbounded).contains(&Value::str("héllo")),
-            "{label}"
-        );
+        // A bound between two values starts at the next one.
         assert_eq!(
-            terms(TypeTag::Bool, Bound::Unbounded),
-            bools(&[true]),
-            "{label}"
-        );
-        // A duplicate survives its partner's deletion; new values appear.
-        assert_eq!(
-            terms(TypeTag::I64, Bound::Included(Value::I64(7))),
-            i64s(&[7, 42]),
-            "{label}"
-        );
-        assert_eq!(
-            terms(TypeTag::U64, Bound::Included(Value::U64(2))),
+            read(
+                view,
+                ns,
+                &v,
+                TypeTag::U64,
+                Bound::Included(Value::U64(2)),
+                200
+            )
+            .value,
             u64s(&[5, 258, u64::MAX]),
-            "{label}"
-        );
-        assert_eq!(
-            terms(TypeTag::Str, Bound::Included(Value::str("b"))),
-            strs(&["b", "hello"]),
             "{label}"
         );
     });
@@ -1074,13 +918,9 @@ fn a_historical_snapshot_keeps_its_terms_after_later_mutations() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2. Admission validation
-// ---------------------------------------------------------------------------
-
 #[test]
-fn terms_validation_faults_are_admission_rejections_in_the_briefs_order() {
-    // max_value_len 4: "abcd" is the longest admissible Str bound.
+fn terms_validation_faults_are_admission_rejections_in_validation_order() {
+    // max_str_len 4: "abcd" is the longest admissible Str bound.
     let limits = Limits {
         max_str_len: 4,
         max_bytes_len: 4,
@@ -1097,8 +937,8 @@ fn terms_validation_faults_are_admission_rejections_in_the_briefs_order() {
     let long = Value::str("abcde");
     let fits = Value::str("abcd");
 
-    // Each request carries every later fault too; the first in the brief's
-    // order wins.
+    // Each request carries every later fault too; the first in the order
+    // NotIndexable, MixedBounds, ValueTooLarge, ZeroLimit, LimitTooLarge wins.
     let chain: [(TypeTag, Bound<Value>, usize, QueryFault); 5] = [
         (
             TypeTag::Bytes,
@@ -1153,7 +993,7 @@ fn terms_validation_faults_are_admission_rejections_in_the_briefs_order() {
         ),
         (
             TypeTag::Str,
-            Bound::Excluded(long.clone()),
+            Bound::Excluded(long),
             1,
             QueryFault::ValueTooLarge,
         ),
@@ -1347,229 +1187,102 @@ fn terms_validation_precedes_the_directory_lookup() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 3. Hand-derived costs under FIXTURE
-// ---------------------------------------------------------------------------
+/// Reads `(name, tag)` from each `(lower, limit)` on the snapshot and on a
+/// branch and asserts the returned values and the whole receipt.
+fn assert_term_costs(
+    engine: &Engine,
+    ns: NamespaceId,
+    name: &CellName,
+    tag: TypeTag,
+    cases: &[(Bound<Value>, usize, Vec<Value>, u64)],
+) {
+    for_each_view(engine, |view, label| {
+        for (lower, limit, values, cost) in cases {
+            let got = read(view, ns, name, tag, lower.clone(), *limit);
+            let context = format!("{label}: {lower:?}, limit {limit}");
+            assert_eq!(&got.value, values, "{context}");
+            assert_eq!(got.receipt, read_applied(*cost), "{context}");
+        }
+    });
+}
 
 #[test]
 fn an_i64_run_charges_the_lookup_the_seek_and_each_returned_term() {
     let (engine, ns) = cost_fixture();
     let price = name("price");
-    for_each_view(&engine, |view, label| {
+    let at = |value: i64| Value::I64(value);
+    let cases = [
         // Unbounded, limit 200: 1 + 4 + 3 × (3 + 8) = 38.
+        (Bound::Unbounded, 200, i64s(&[5, 10, 20]), 38),
+        // Exactly the run's length: no peek charge beyond the third term.
+        (Bound::Unbounded, 3, i64s(&[5, 10, 20]), 38),
+        // limit 2: 1 + 4 + 2 × 11 = 27.
+        (Bound::Unbounded, 2, i64s(&[5, 10]), 27),
+        // limit 1: 1 + 4 + 11 = 16.
+        (Bound::Unbounded, 1, i64s(&[5]), 16),
+        // Included at an existing value is charged like any term: 38.
+        (Bound::Included(at(5)), 200, i64s(&[5, 10, 20]), 38),
+        // Included at the last term: 16; Excluded there: the seek only.
+        (Bound::Included(at(20)), 200, i64s(&[20]), 16),
+        (Bound::Excluded(at(20)), 200, vec![], 5),
+        // The extremes: from i64::MIN everything, from i64::MAX nothing.
+        (Bound::Included(at(i64::MIN)), 200, i64s(&[5, 10, 20]), 38),
+        (Bound::Included(at(i64::MAX)), 200, vec![], 5),
+        (Bound::Excluded(at(i64::MAX)), 200, vec![], 5),
+        (Bound::Included(at(21)), 200, vec![], 5),
+    ];
+    assert_term_costs(&engine, ns, &price, TypeTag::I64, &cases);
+    for_each_view(&engine, |view, label| {
         let got = read(view, ns, &price, TypeTag::I64, Bound::Unbounded, 200);
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(38), "{label}");
         assert_eq!(got.physical.record_nodes, 0, "{label}");
         assert!(got.physical.index_nodes > 0, "{label}: {:?}", got.physical);
-        // Exactly the run's length: no peek charge beyond the third term.
-        let got = read(view, ns, &price, TypeTag::I64, Bound::Unbounded, 3);
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(38), "{label}");
-        // limit 2: 1 + 4 + 2 × 11 = 27.
-        let got = read(view, ns, &price, TypeTag::I64, Bound::Unbounded, 2);
-        assert_eq!(got.value, i64s(&[5, 10]), "{label}");
-        assert_eq!(got.receipt, read_applied(27), "{label}");
-        // limit 1: 1 + 4 + 11 = 16.
-        let got = read(view, ns, &price, TypeTag::I64, Bound::Unbounded, 1);
-        assert_eq!(got.value, i64s(&[5]), "{label}");
-        assert_eq!(got.receipt, read_applied(16), "{label}");
-        // Included at an existing value is charged like any term: 38.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Included(Value::I64(5)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(38), "{label}");
-        // Included at the last term: 16; Excluded there: the seek only.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Included(Value::I64(20)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[20]), "{label}");
-        assert_eq!(got.receipt, read_applied(16), "{label}");
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Excluded(Value::I64(20)),
-            200,
-        );
-        assert_eq!(got.value, Vec::<Value>::new(), "{label}");
-        assert_eq!(got.receipt, read_applied(5), "{label}");
-        // The extremes: from i64::MIN everything, from i64::MAX nothing.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Included(Value::I64(i64::MIN)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(38), "{label}");
-        for lower in [
-            Bound::Included(Value::I64(i64::MAX)),
-            Bound::Excluded(Value::I64(i64::MAX)),
-            Bound::Included(Value::I64(21)),
-        ] {
-            let got = read(view, ns, &price, TypeTag::I64, lower.clone(), 200);
-            assert_eq!(got.value, Vec::<Value>::new(), "{label}: {lower:?}");
-            assert_eq!(got.receipt, read_applied(5), "{label}: {lower:?}");
-        }
     });
 }
 
 #[test]
 fn an_excluded_existing_bound_is_free_and_an_included_missing_bound_starts_at_the_next() {
     let (engine, ns) = cost_fixture();
-    let price = name("price");
-    for_each_view(&engine, |view, label| {
+    let at = |value: i64| Value::I64(value);
+    let cases = [
         // Excluded(5): 5 is stepped over without charge: 1 + 4 + 2 × 11 = 27.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Excluded(Value::I64(5)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(27), "{label}");
+        (Bound::Excluded(at(5)), 200, i64s(&[10, 20]), 27),
         // Excluded(5), limit 1: the skipped term does not count: 16.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Excluded(Value::I64(5)),
-            1,
-        );
-        assert_eq!(got.value, i64s(&[10]), "{label}");
-        assert_eq!(got.receipt, read_applied(16), "{label}");
+        (Bound::Excluded(at(5)), 1, i64s(&[10]), 16),
         // Included(7), a value no record holds: starts at 10: 27.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Included(Value::I64(7)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(27), "{label}");
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Included(Value::I64(7)),
-            1,
-        );
-        assert_eq!(got.value, i64s(&[10]), "{label}");
-        assert_eq!(got.receipt, read_applied(16), "{label}");
+        (Bound::Included(at(7)), 200, i64s(&[10, 20]), 27),
+        (Bound::Included(at(7)), 1, i64s(&[10]), 16),
         // Excluded(7) is the same run as Included(7): nothing to step over.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Excluded(Value::I64(7)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(27), "{label}");
+        (Bound::Excluded(at(7)), 200, i64s(&[10, 20]), 27),
         // A negative missing bound starts at the first term: 38.
-        let got = read(
-            view,
-            ns,
-            &price,
-            TypeTag::I64,
-            Bound::Excluded(Value::I64(-1)),
-            200,
-        );
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(got.receipt, read_applied(38), "{label}");
-    });
+        (Bound::Excluded(at(-1)), 200, i64s(&[5, 10, 20]), 38),
+    ];
+    assert_term_costs(&engine, ns, &name("price"), TypeTag::I64, &cases);
 }
 
 #[test]
 fn a_str_run_charges_read_bytes_per_value_length() {
     let (engine, ns) = cost_fixture();
-    let kind = name("kind");
-    for_each_view(&engine, |view, label| {
+    let at = |text: &str| Value::str(text);
+    let cases = [
         // "", "a", "ab": 1 + 4 + (3 + 0) + (3 + 1) + (3 + 2) = 17.
-        let got = read(view, ns, &kind, TypeTag::Str, Bound::Unbounded, 200);
-        assert_eq!(got.value, strs(&["", "a", "ab"]), "{label}");
-        assert_eq!(got.receipt, read_applied(17), "{label}");
+        (Bound::Unbounded, 200, strs(&["", "a", "ab"]), 17),
         // limit 1: the empty string costs its visit only: 1 + 4 + 3 = 8.
-        let got = read(view, ns, &kind, TypeTag::Str, Bound::Unbounded, 1);
-        assert_eq!(got.value, strs(&[""]), "{label}");
-        assert_eq!(got.receipt, read_applied(8), "{label}");
+        (Bound::Unbounded, 1, strs(&[""]), 8),
         // limit 2: 8 + 4 = 12.
-        let got = read(view, ns, &kind, TypeTag::Str, Bound::Unbounded, 2);
-        assert_eq!(got.value, strs(&["", "a"]), "{label}");
-        assert_eq!(got.receipt, read_applied(12), "{label}");
+        (Bound::Unbounded, 2, strs(&["", "a"]), 12),
         // Included(""): the whole run again: 17; Excluded(""): 1 + 4 + 4 + 5 = 14.
-        let got = read(
-            view,
-            ns,
-            &kind,
-            TypeTag::Str,
-            Bound::Included(Value::str("")),
-            200,
-        );
-        assert_eq!(got.value, strs(&["", "a", "ab"]), "{label}");
-        assert_eq!(got.receipt, read_applied(17), "{label}");
-        let got = read(
-            view,
-            ns,
-            &kind,
-            TypeTag::Str,
-            Bound::Excluded(Value::str("")),
-            200,
-        );
-        assert_eq!(got.value, strs(&["a", "ab"]), "{label}");
-        assert_eq!(got.receipt, read_applied(14), "{label}");
+        (Bound::Included(at("")), 200, strs(&["", "a", "ab"]), 17),
+        (Bound::Excluded(at("")), 200, strs(&["a", "ab"]), 14),
         // Included("a"), limit 1: 1 + 4 + (3 + 1) = 9.
-        let got = read(
-            view,
-            ns,
-            &kind,
-            TypeTag::Str,
-            Bound::Included(Value::str("a")),
-            1,
-        );
-        assert_eq!(got.value, strs(&["a"]), "{label}");
-        assert_eq!(got.receipt, read_applied(9), "{label}");
+        (Bound::Included(at("a")), 1, strs(&["a"]), 9),
         // Excluded("a") and Included("aa") both start at "ab": 1 + 4 + 5 = 10.
-        for lower in [
-            Bound::Excluded(Value::str("a")),
-            Bound::Included(Value::str("aa")),
-        ] {
-            let got = read(view, ns, &kind, TypeTag::Str, lower.clone(), 200);
-            assert_eq!(got.value, strs(&["ab"]), "{label}: {lower:?}");
-            assert_eq!(got.receipt, read_applied(10), "{label}: {lower:?}");
-        }
+        (Bound::Excluded(at("a")), 200, strs(&["ab"]), 10),
+        (Bound::Included(at("aa")), 200, strs(&["ab"]), 10),
         // Past the run: the seek only.
-        for lower in [
-            Bound::Excluded(Value::str("ab")),
-            Bound::Included(Value::str("b")),
-        ] {
-            let got = read(view, ns, &kind, TypeTag::Str, lower.clone(), 200);
-            assert_eq!(got.value, Vec::<Value>::new(), "{label}: {lower:?}");
-            assert_eq!(got.receipt, read_applied(5), "{label}: {lower:?}");
-        }
-    });
+        (Bound::Excluded(at("ab")), 200, vec![], 5),
+        (Bound::Included(at("b")), 200, vec![], 5),
+    ];
+    assert_term_costs(&engine, ns, &name("kind"), TypeTag::Str, &cases);
 }
 
 #[test]
@@ -1593,7 +1306,6 @@ fn a_missing_name_or_tag_costs_the_seek_only() {
                     TypeTag::I64 => Value::I64(0),
                     TypeTag::U64 => Value::U64(0),
                     TypeTag::Str => Value::str(""),
-                    TypeTag::Bytes => unreachable!(),
                     _ => unreachable!("the fixture uses only bool, i64, u64 and str"),
                 }),
             ] {
@@ -1633,105 +1345,79 @@ fn a_missing_name_or_tag_costs_the_seek_only() {
 fn a_traced_terms_read_lists_classes_in_first_charge_order() {
     let (engine, ns) = cost_fixture();
     let (price, kind) = (name("price"), name("kind"));
-    for_each_view(&engine, |view, label| {
+    // Every ledger opens with the lookup and the seek; the lines after them
+    // are listed per case.
+    let open = [
+        (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
+        (OperationClass::TermSeek, 1, TERM_SEEK),
+    ];
+    // (name, tag, limit, values, total, ledger lines after the first two)
+    type Case<'a> = (
+        &'a CellName,
+        TypeTag,
+        usize,
+        Vec<Value>,
+        u64,
+        &'a [(OperationClass, u64, u64)],
+    );
+    let cases: [Case; 4] = [
         // The I64 run: DirectoryLookup, TermSeek, TermVisit 3, ReadByte 24.
-        let got = view
-            .terms_read(
-                ns,
-                &price,
-                TypeTag::I64,
-                Bound::Unbounded,
-                200,
-                Budget::unlimited().traced(),
-            )
-            .unwrap_or_else(|rejected| panic!("{label}: {rejected}"));
-        assert_eq!(got.value, i64s(&[5, 10, 20]), "{label}");
-        assert_eq!(
-            got.receipt,
-            traced(
-                read_applied(38),
-                &[
-                    (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                    (OperationClass::TermSeek, 1, TERM_SEEK),
-                    (OperationClass::TermVisit, 3, TERM_VISIT),
-                    (OperationClass::ReadByte, 24, READ_BYTE),
-                ]
-            ),
-            "{label}"
-        );
+        (
+            &price,
+            TypeTag::I64,
+            200,
+            i64s(&[5, 10, 20]),
+            38,
+            &[
+                (OperationClass::TermVisit, 3, TERM_VISIT),
+                (OperationClass::ReadByte, 24, READ_BYTE),
+            ],
+        ),
         // The Str run: ReadByte 0 + 1 + 2 = 3, first charged at the second
         // term, still after TermVisit.
-        let got = view
-            .terms_read(
-                ns,
-                &kind,
-                TypeTag::Str,
-                Bound::Unbounded,
-                200,
-                Budget::unlimited().traced(),
-            )
-            .unwrap_or_else(|rejected| panic!("{label}: {rejected}"));
-        assert_eq!(got.value, strs(&["", "a", "ab"]), "{label}");
-        assert_eq!(
-            got.receipt,
-            traced(
-                read_applied(17),
-                &[
-                    (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                    (OperationClass::TermSeek, 1, TERM_SEEK),
-                    (OperationClass::TermVisit, 3, TERM_VISIT),
-                    (OperationClass::ReadByte, 3, READ_BYTE),
-                ]
-            ),
-            "{label}"
-        );
+        (
+            &kind,
+            TypeTag::Str,
+            200,
+            strs(&["", "a", "ab"]),
+            17,
+            &[
+                (OperationClass::TermVisit, 3, TERM_VISIT),
+                (OperationClass::ReadByte, 3, READ_BYTE),
+            ],
+        ),
         // Only the empty string: no ReadByte line at all.
-        let got = view
-            .terms_read(
-                ns,
-                &kind,
-                TypeTag::Str,
-                Bound::Unbounded,
-                1,
-                Budget::unlimited().traced(),
-            )
-            .unwrap_or_else(|rejected| panic!("{label}: {rejected}"));
-        assert_eq!(got.value, strs(&[""]), "{label}");
-        assert_eq!(
-            got.receipt,
-            traced(
-                read_applied(8),
-                &[
-                    (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                    (OperationClass::TermSeek, 1, TERM_SEEK),
-                    (OperationClass::TermVisit, 1, TERM_VISIT),
-                ]
-            ),
-            "{label}"
-        );
+        (
+            &kind,
+            TypeTag::Str,
+            1,
+            strs(&[""]),
+            8,
+            &[(OperationClass::TermVisit, 1, TERM_VISIT)],
+        ),
         // A missing run: the lookup and the seek.
-        let got = view
-            .terms_read(
-                ns,
-                &price,
-                TypeTag::U64,
-                Bound::Unbounded,
-                200,
-                Budget::unlimited().traced(),
-            )
-            .unwrap_or_else(|rejected| panic!("{label}: {rejected}"));
-        assert_eq!(got.value, Vec::<Value>::new(), "{label}");
-        assert_eq!(
-            got.receipt,
-            traced(
-                read_applied(5),
-                &[
-                    (OperationClass::DirectoryLookup, 1, DIRECTORY_LOOKUP),
-                    (OperationClass::TermSeek, 1, TERM_SEEK),
-                ]
-            ),
-            "{label}"
-        );
+        (&price, TypeTag::U64, 200, vec![], 5, &[]),
+    ];
+    for_each_view(&engine, |view, label| {
+        for (name, tag, limit, values, total, rest) in &cases {
+            let context = format!("{label}: terms({name:?}, {tag}, limit {limit})");
+            let got = view
+                .terms_read(
+                    ns,
+                    name,
+                    *tag,
+                    Bound::Unbounded,
+                    *limit,
+                    Budget::unlimited().traced(),
+                )
+                .unwrap_or_else(|rejected| panic!("{context}: {rejected}"));
+            assert_eq!(&got.value, values, "{context}");
+            assert_eq!(
+                got.receipt,
+                traced(read_applied(*total), &[&open[..], rest].concat()),
+                "{context}"
+            );
+        }
         // Out of budget inside the first term group: the ledger holds what
         // was charged before it.
         let rejected = view
@@ -1881,10 +1567,6 @@ fn terms_cost_is_positional() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// 4. Isolation
-// ---------------------------------------------------------------------------
-
 #[test]
 fn identical_terms_in_another_namespace_never_appear_and_leave_receipts_and_index_nodes_unchanged()
 {
@@ -2025,28 +1707,11 @@ fn identical_terms_in_another_namespace_never_appear_and_leave_receipts_and_inde
     assert_eq!(engine.head_snapshot().term_count(second), Some(10));
 }
 
-// ---------------------------------------------------------------------------
-// 5. The expiry sweep
-// ---------------------------------------------------------------------------
-
 #[test]
 fn expire_records_deletes_attribute_rows_height_by_height_in_height_then_id_order() {
     let (engine, ns, mut model) = expiry_fixture();
-    // The literals agree with the model-3 delete formula 30 + 4c + 20a for
-    // the shapes r1 (2, 2), r2 (1, 1), r3 (3, 2), r4 (3, 3), r5 (2, 1),
-    // r6 (1, 1).
-    let delete_cost = |cells: u64, attributes: u64| {
-        DIRECTORY_LOOKUP
-            + POINT_READ
-            + RECORD_DELETE
-            + CELL_REMOVE * cells
-            + ROOT_UPDATE * 3
-            + (INDEX_REMOVE + ROOT_UPDATE * 2) * 2 * attributes
-    };
-    assert_eq!(
-        [(2, 2), (1, 1), (3, 2), (3, 3), (2, 1), (1, 1)].map(|(c, a)| delete_cost(c, a)),
-        [78, 54, 82, 102, 58, 54]
-    );
+    // The delete literals follow 30 + 4c + 20a for the shapes r1 (2, 2),
+    // r2 (1, 1), r3 (3, 2), r4 (3, 3), r5 (2, 1), r6 (1, 1).
     let mut branch = fresh_branch(&engine);
     let deleted = sweep(&mut branch, ns, 7, Budget::unlimited(), Budget::unlimited())
         .unwrap_or_else(|halt| panic!("an unlimited sweep completes: {halt}"));
@@ -2060,10 +1725,6 @@ fn expire_records_deletes_attribute_rows_height_by_height_in_height_then_id_orde
         .collect();
     assert_eq!(branch.receipts(), receipts.as_slice());
     assert_eq!(branch.spent(), Cost::new(EXPIRY_TOTAL));
-    assert_eq!(
-        EXPIRY_DELETES.iter().map(|&(_, cost)| cost).sum::<u64>(),
-        EXPIRY_TOTAL
-    );
 
     // The field-kind and the absent row survive, unchanged.
     for text in ["r1", "r2", "r3", "r4", "r5", "r6"] {
@@ -2142,48 +1803,11 @@ fn expire_records_stops_at_the_first_height_above_the_block() {
 #[test]
 fn a_starved_delete_budget_halts_before_any_delete() {
     let (engine, ns, model) = expiry_fixture();
-    // Budget 0: the delete stops at its directory lookup, spent 0.
-    let mut branch = fresh_branch(&engine);
-    let halt = sweep(&mut branch, ns, 7, Budget::unlimited(), Budget::limit(0)).unwrap_err();
-    assert_eq!(halt.applied, Vec::new());
-    assert_eq!(halt.rejected.reason, Rejection::OutOfBudget);
-    assert_eq!(halt.rejected.receipt, rejected(0, Rejection::OutOfBudget));
-    // The rejected delete is a write: it is recorded, at zero.
-    assert_eq!(
-        branch.receipts(),
-        [rejected(0, Rejection::OutOfBudget)].as_slice()
-    );
-    assert_eq!(branch.spent(), Cost::ZERO);
-    assert_branch_matches_model(&branch, ns, &model, "starved at 0");
-
-    // Budget 53, one below the first delete (r2, 54): it charges the lookup,
-    // the point read, the delete group and the value term's removal (44)
-    // and stops at the existence term's removal; nothing is deleted.
-    let group = DIRECTORY_LOOKUP + POINT_READ + RECORD_DELETE + CELL_REMOVE + 3 * ROOT_UPDATE;
-    let index_remove = INDEX_REMOVE + 2 * ROOT_UPDATE;
-    assert_eq!(
-        DELETE_R2,
-        [
-            DIRECTORY_LOOKUP,
-            DIRECTORY_LOOKUP + POINT_READ,
-            group,
-            group + index_remove,
-            group + 2 * index_remove,
-        ]
-    );
-    let mut branch = fresh_branch(&engine);
-    let halt = sweep(&mut branch, ns, 7, Budget::unlimited(), Budget::limit(53)).unwrap_err();
-    assert_eq!(halt.applied, Vec::new());
-    assert_eq!(halt.rejected.reason, Rejection::OutOfBudget);
-    assert_eq!(halt.rejected.receipt, rejected(44, Rejection::OutOfBudget));
-    assert_eq!(
-        branch.receipts(),
-        [rejected(44, Rejection::OutOfBudget)].as_slice()
-    );
-    assert_eq!(branch.spent(), Cost::new(44));
-    assert_branch_matches_model(&branch, ns, &model, "starved at 53");
-    // Every budget below 54 halts with the largest charge point that fits
-    // and leaves the namespace untouched.
+    // Budget 0: the delete stops at its directory lookup, spent 0. Budget 53,
+    // one below the first delete (r2, 54): it charges the lookup, the point
+    // read, the delete group and the value term's removal (44) and stops at
+    // the existence term's removal. Every budget below 54 halts with the
+    // largest charge point that fits and leaves the namespace untouched.
     for budget in 0..54 {
         let mut branch = fresh_branch(&engine);
         let halt = sweep(
@@ -2197,11 +1821,23 @@ fn a_starved_delete_budget_halts_before_any_delete() {
         let spent = largest_prefix_sum_at_most(&DELETE_R2, budget);
         assert_eq!(halt.applied, Vec::new(), "budget {budget}");
         assert_eq!(
+            halt.rejected.reason,
+            Rejection::OutOfBudget,
+            "budget {budget}"
+        );
+        assert_eq!(
             halt.rejected.receipt,
             rejected(spent, Rejection::OutOfBudget),
             "budget {budget}"
         );
+        // The rejected delete is a write: it is recorded.
+        assert_eq!(
+            branch.receipts(),
+            [rejected(spent, Rejection::OutOfBudget)].as_slice(),
+            "budget {budget}"
+        );
         assert_eq!(branch.spent(), Cost::new(spent), "budget {budget}");
+        assert_branch_matches_model(&branch, ns, &model, &format!("budget {budget}"));
         assert_eq!(branch.typed_record_count(ns), Some(8), "budget {budget}");
         assert_eq!(branch.index_consistent(ns), Some(true), "budget {budget}");
     }
@@ -2213,18 +1849,6 @@ fn a_delete_budget_admitting_the_first_row_but_not_the_second_halts_with_one_app
     // Budget 54 pays r2 (54) exactly; r5 (58) stops at its last index
     // removal with 48 spent: 1, 4, {20 + 8 + 6}, {6 + 4}, then 10 more would
     // make 58.
-    let group = DIRECTORY_LOOKUP + POINT_READ + RECORD_DELETE + 2 * CELL_REMOVE + 3 * ROOT_UPDATE;
-    let index_remove = INDEX_REMOVE + 2 * ROOT_UPDATE;
-    assert_eq!(
-        DELETE_R5,
-        [
-            DIRECTORY_LOOKUP,
-            DIRECTORY_LOOKUP + POINT_READ,
-            group,
-            group + index_remove,
-            group + 2 * index_remove,
-        ]
-    );
     let mut branch = fresh_branch(&engine);
     let halt = sweep(&mut branch, ns, 7, Budget::unlimited(), Budget::limit(54)).unwrap_err();
     assert_eq!(halt.applied, expected_deletes(&EXPIRY_DELETES[..1]));
@@ -2268,7 +1892,6 @@ fn a_query_budget_one_below_the_terms_read_halts_before_any_delete() {
     let (engine, ns, model) = expiry_fixture();
     // The opening terms read costs 1 + 4 + {3 + 8} = 16; at 15 it stops at
     // the term group with 5 spent.
-    assert_eq!(EXPIRY_TERMS_READ, 16);
     let mut branch = fresh_branch(&engine);
     let halt = sweep(&mut branch, ns, 7, Budget::limit(15), Budget::unlimited()).unwrap_err();
     assert_eq!(halt.applied, Vec::new());

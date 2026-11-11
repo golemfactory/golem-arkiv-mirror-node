@@ -2,64 +2,21 @@
 //!
 //! A page walk reads every page from one pinned handle with the cursor the
 //! previous page issued. The cursor is a record id, never a count, so a page
-//! is the first `limit` matches with a larger id. Every expectation about
-//! rows comes from an independent reference: a `BTreeMap` model of the
-//! records and a full-scan evaluator of the query semantics in the
-//! milestone-2 brief. Every expected cost is a literal derived by hand from
-//! the FIXTURE weights (DirectoryLookup 1, ReadByte 1, QueryGroup 5, TermSeek
-//! 4, PostingEntry 1, RecordProbe 2, ResultRow 3) and the model-version-3
-//! charge points (the read charge points are those of version 2); nothing
-//! here asks the engine what a page should cost.
-//!
-//! What this file establishes:
-//! - A full walk with limit 1, 3, 7 and `max_page` over a namespace of 64
-//!   records (50 of them matching the primary query) is the reference set for
-//!   eight query shapes (posting, run, row-domain, probed and multi-group
-//!   sources), whether or not new snapshots are published between the pages:
-//!   creates, deletes of already-paged and not-yet-paged rows, patches that
-//!   stop rows matching, namespace transfers, a competing candidate that loses
-//!   publication and empty blocks. The disturbed walk's pages (rows, cursors
-//!   and receipts) are identical to the quiet walk's.
-//! - `next` is `Some` iff a further match exists: an exactly-full last page
-//!   has `next == None`; a continuation's `after()` is the last row's id; the
-//!   limit is not bound, so pages of one walk may differ in size.
-//! - Replaying a page on the same snapshot, through the same or another
-//!   handle, gives identical rows and receipts.
-//! - Hand-derived costs: a two-page `Eq` walk charges `limit + 1`
-//!   `PostingEntry` on the non-final page and exactly the remaining entries on
-//!   the final page; in an OR of two groups, a group whose head lies beyond
-//!   the page end does no further work until that head is emitted.
-//! - Cursor binding: a cursor presented to another snapshot (even one with
-//!   identical contents), to a branch, to another engine at the same
-//!   `SnapshotId`, with another namespace, a different query or a different
-//!   projection is `CursorMismatch` with spent 0 and an empty ledger; the
-//!   cursor check comes after query and projection validation.
-//! - Branch cursors continue on the same untouched branch, across estimates,
-//!   checkpoints and rejected writes, and are invalidated by an applied
-//!   `execute`, an `execute_host`, a `rollback_to` (even one that discards
-//!   nothing), a `set_pricing`, another branch and publication.
-//! - The host-side pattern: a request that omits the block resolves
-//!   `BlockMap::latest()` once and pages that snapshot while the head and the
-//!   committed pricing advance; the total is a separate `count` read.
-//!
-//! What it does not establish: the costs of the walk over the 64-record
-//! namespace (its pages are compared between runs, not derived), query
-//! semantics beyond what the reference evaluator needs, budget-limited
-//! pages, or anything about the physical trace.
+//! is the first `limit` matches with a larger id. Expected rows come from an
+//! independent reference: a `BTreeMap` model of the records and a full-scan
+//! evaluator of the query semantics. Expected costs are literals derived by
+//! hand from the FIXTURE weights; the pages of the 64-record walk are
+//! compared between runs, not priced.
 
 use std::{collections::BTreeMap, ops::Bound};
 
 use arkiv_db::{
     BlockMap, BlockNumber, Branch, Budget, Cell, CellName, CellSelect, Cost, Cursor, Effect,
-    Engine, EngineError, Executed, Ledger, LedgerEntry, Literal, NamespaceId, OperationClass,
-    Outcome, OwnerId, PriceSchedule, Projection, Query, QueryFault, QueryPage, ReadResult, Receipt,
-    ReceiptKind, RecordId, RecordKey, Rejected, Rejection, Revision, Row, Snapshot, SnapshotId,
-    Term, TypeTag, Value, WriteOp,
+    Engine, EngineError, Executed, Ledger, LedgerEntry, Limits, Literal, NamespaceId,
+    OperationClass, Outcome, OwnerId, PriceSchedule, Projection, Query, QueryFault, QueryPage,
+    ReadResult, Receipt, ReceiptKind, RecordId, RecordKey, Rejected, Rejection, Revision, Row,
+    Snapshot, SnapshotId, Term, TypeTag, Value, WriteOp,
 };
-
-// ---------------------------------------------------------------------------
-// Actors and fixture shape
-// ---------------------------------------------------------------------------
 
 const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 const BOB: OwnerId = OwnerId::new([0xb0; 20]);
@@ -68,8 +25,7 @@ const BOB: OwnerId = OwnerId::new([0xb0; 20]);
 const MODEL_VERSION: u32 = 3;
 /// The id `PriceSchedule::FIXTURE` carries.
 const FIXTURE_ID: u32 = 1;
-/// `Limits::DEFAULT.max_page`.
-const MAX_PAGE: usize = 200;
+const MAX_PAGE: usize = Limits::DEFAULT.max_page;
 /// The page limits every full walk is run with.
 const LIMITS: [usize; 4] = [1, 3, 7, MAX_PAGE];
 
@@ -91,54 +47,28 @@ const COST_RECORDS: [(&str, &str, i64); 6] = [
     ("f", "lamp", 8),
 ];
 
-// ---------------------------------------------------------------------------
-// Hand-computed read costs under PriceSchedule::FIXTURE (id 1). The charge
-// table is transcribed from the brief; every total is a literal, and the
-// `const _` lines re-add it from the table at compile time.
-// ---------------------------------------------------------------------------
-
-const DIRECTORY_LOOKUP: u64 = 1;
-const READ_BYTE: u64 = 1;
-const QUERY_GROUP: u64 = 5;
-const TERM_SEEK: u64 = 4;
-const POSTING_ENTRY: u64 = 1;
-const RECORD_PROBE: u64 = 2;
-const RESULT_ROW: u64 = 3;
+// Hand-computed read costs under `PriceSchedule::FIXTURE`: DirectoryLookup 1,
+// ReadByte 1, QueryGroup 5, TermSeek 4, PostingEntry 1, RecordProbe 2,
+// ResultRow 3. Every total is a literal with its sum beside it.
 
 /// `Eq(kind, book)` over the posting `[1, 2, 4]`, `ID_ONLY`, limit 2, no
 /// cursor: 1 + 5 + 4, PostingEntry 3 (rows 1 and 2 plus the head 4 beyond
 /// the page, which makes `next` exact), ResultRow 2 = 19.
 const EQ_PAGE_ONE: u64 = 19;
-const _: () = assert!(
-    EQ_PAGE_ONE == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 3 * POSTING_ENTRY + 2 * RESULT_ROW
-);
 /// Page 2 after 2: 1 + 5 + 4, PostingEntry 1 (exactly the remaining entry;
 /// the exhausted posting is not charged), ResultRow 1 = 14.
 const EQ_PAGE_TWO: u64 = 14;
-const _: () =
-    assert!(EQ_PAGE_TWO == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + POSTING_ENTRY + RESULT_ROW);
 /// Limit 3 or more over the same posting: 1 + 5 + 4, PostingEntry 3,
 /// ResultRow 3 = 22; the page is exactly full and `next` is `None`.
 const EQ_FULL_PAGE: u64 = 22;
-const _: () = assert!(
-    EQ_FULL_PAGE == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 3 * POSTING_ENTRY + 3 * RESULT_ROW
-);
 /// Limit 1 walk over the same posting: pages 1 and 2 charge PostingEntry 2
 /// (the row and the head beyond it), ResultRow 1: 1 + 5 + 4 + 2 + 3 = 15.
 const EQ_LIMIT_ONE_PAGE: u64 = 15;
-const _: () = assert!(
-    EQ_LIMIT_ONE_PAGE
-        == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 2 * POSTING_ENTRY + RESULT_ROW
-);
 /// A value term nobody holds: the seek only. 1 + 5 + 4 = 10.
 const EQ_MISSING_TERM: u64 = 10;
-const _: () = assert!(EQ_MISSING_TERM == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK);
-/// `Projection::ALL` of a cost record: key 1 + kind (4 + 4) + price (5 + 8)
-/// = 22 bytes.
-const COST_ROW_BYTES: u64 = 22;
-/// Limit 2 with `Projection::ALL`: 19 + ReadByte 2 × 22 = 63.
+/// Limit 2 with `Projection::ALL`: a cost record is key 1 + kind (4 + 4) +
+/// price (5 + 8) = 22 bytes, so 19 + ReadByte 2 × 22 = 63.
 const EQ_PAGE_ONE_ALL: u64 = 63;
-const _: () = assert!(EQ_PAGE_ONE_ALL == EQ_PAGE_ONE + 2 * COST_ROW_BYTES * READ_BYTE);
 /// `[Eq(kind, book)] OR [Eq(kind, lamp), Exists(price, I64)]`, `ID_ONLY`,
 /// limit 2, no cursor. Group 1 (posting `[1, 2, 4]`) and group 2 (posting
 /// `[5, 6]` probed by the existence literal): 1 + 2 × (5 + 4); heads:
@@ -146,61 +76,24 @@ const _: () = assert!(EQ_PAGE_ONE_ALL == EQ_PAGE_ONE + 2 * COST_ROW_BYTES * READ
 /// and 2 (ResultRow 2) each advance group 1 (PostingEntry 2); group 2's head
 /// 5 lies beyond the page end and is never advanced: 1 + 18 + 4 + 2 + 6 = 31.
 const OR_PAGE_ONE: u64 = 31;
-const _: () = assert!(
-    OR_PAGE_ONE
-        == DIRECTORY_LOOKUP
-            + 2 * (QUERY_GROUP + TERM_SEEK)
-            + 4 * POSTING_ENTRY
-            + RECORD_PROBE
-            + 2 * RESULT_ROW
-);
 /// Page 2 after 2: heads 4 (PostingEntry 1) and 5 (PostingEntry 1 +
 /// RecordProbe 1); row 4 exhausts group 1 for free; row 5 advances group 2
 /// to 6 (PostingEntry 1 + RecordProbe 1): 1 + 18 + 3 + 4 + 6 = 32.
 const OR_PAGE_TWO: u64 = 32;
-const _: () = assert!(
-    OR_PAGE_TWO
-        == DIRECTORY_LOOKUP
-            + 2 * (QUERY_GROUP + TERM_SEEK)
-            + 3 * POSTING_ENTRY
-            + 2 * RECORD_PROBE
-            + 2 * RESULT_ROW
-);
 /// Page 3 after 5: group 1's posting is empty past 5 (no entry charged);
 /// group 2's head 6 (PostingEntry 1 + RecordProbe 1); row 6 exhausts it:
 /// 1 + 18 + 1 + 2 + 3 = 25.
 const OR_PAGE_THREE: u64 = 25;
-const _: () = assert!(
-    OR_PAGE_THREE
-        == DIRECTORY_LOOKUP
-            + 2 * (QUERY_GROUP + TERM_SEEK)
-            + POSTING_ENTRY
-            + RECORD_PROBE
-            + RESULT_ROW
-);
 /// A branch whose working state adds a fourth book (id 7): page 2 after 2
 /// charges PostingEntry 2 (4 and 7) and ResultRow 2: 1 + 5 + 4 + 2 + 6 = 18.
 const EQ_BRANCH_PAGE_TWO: u64 = 18;
-const _: () = assert!(
-    EQ_BRANCH_PAGE_TWO
-        == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 2 * POSTING_ENTRY + 2 * RESULT_ROW
-);
 /// `count(Eq(kind, book))` over the 50 books: 1 + 5 + 4 + PostingEntry 50 =
 /// 60 (a count emits no row).
 const COUNT_BOOKS: u64 = 60;
-const _: () =
-    assert!(COUNT_BOOKS == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 50 * POSTING_ENTRY);
 /// The same count after seven books were deleted at head: 1 + 5 + 4 + 43 = 53.
 const COUNT_BOOKS_AFTER_DELETES: u64 = 53;
-const _: () = assert!(
-    COUNT_BOOKS_AFTER_DELETES == DIRECTORY_LOOKUP + QUERY_GROUP + TERM_SEEK + 43 * POSTING_ENTRY
-);
 
 const CURSOR_MISMATCH: Outcome = Outcome::Rejected(Rejection::CursorMismatch);
-
-// ---------------------------------------------------------------------------
-// Value helpers
-// ---------------------------------------------------------------------------
 
 fn name(text: &str) -> CellName {
     CellName::new(text).expect("fixture cell names follow the grammar")
@@ -353,10 +246,6 @@ fn shapes() -> Vec<(&'static str, Query)> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Receipt helpers
-// ---------------------------------------------------------------------------
-
 fn receipt(kind: ReceiptKind, schedule_id: u32, spent: u64, outcome: Outcome) -> Receipt {
     Receipt {
         kind,
@@ -441,10 +330,8 @@ fn assert_mismatch(result: ReadResult<QueryPage>, what: &str) {
     assert_zero_cost(result, Rejection::CursorMismatch, what);
 }
 
-// ---------------------------------------------------------------------------
-// The reference: a BTreeMap model of one namespace's live records and a
-// full-scan evaluator of the brief's query semantics.
-// ---------------------------------------------------------------------------
+// The reference: a `BTreeMap` model of one namespace's live records and a
+// full-scan evaluator of the query semantics.
 
 #[derive(Clone, Debug)]
 struct Record {
@@ -608,10 +495,6 @@ fn within(held: &Value, lower: &Bound<Value>, upper: &Bound<Value>) -> bool {
     above && below
 }
 
-// ---------------------------------------------------------------------------
-// Fixture
-// ---------------------------------------------------------------------------
-
 fn apply(branch: &mut Branch, actor: OwnerId, op: WriteOp) -> Executed {
     match branch.execute(actor, op, Budget::unlimited()) {
         Ok(executed) => executed,
@@ -697,10 +580,6 @@ fn fixture() -> Fixture {
         model,
     }
 }
-
-// ---------------------------------------------------------------------------
-// The page walk
-// ---------------------------------------------------------------------------
 
 /// One page as the engine returned it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -792,10 +671,6 @@ fn walk(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// The advancing head during a disturbed walk
-// ---------------------------------------------------------------------------
 
 /// Publishes one disturbance per call and mirrors the published state in a
 /// model of the head, so later disturbances pick rows that are still live
@@ -1001,10 +876,6 @@ impl<'e> Head<'e> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Walks against the reference
-// ---------------------------------------------------------------------------
-
 #[test]
 fn pinned_walks_match_the_reference_whether_or_not_the_head_advances() {
     let Fixture {
@@ -1127,10 +998,6 @@ fn a_walk_may_change_its_limit_between_pages() {
     assert_eq!(rest.value.rows, reference[3..]);
     assert_eq!(rest.value.next, None);
 }
-
-// ---------------------------------------------------------------------------
-// Hand-derived costs on the cost namespace
-// ---------------------------------------------------------------------------
 
 #[test]
 fn eq_walk_charges_limit_plus_one_entries_then_exactly_the_remainder() {
@@ -1379,62 +1246,6 @@ fn a_group_whose_head_is_beyond_the_page_end_does_no_further_work() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Replay
-// ---------------------------------------------------------------------------
-
-#[test]
-fn replaying_a_page_on_the_same_snapshot_is_identical() {
-    let Fixture {
-        engine,
-        walk_ns,
-        model,
-        ..
-    } = fixture();
-    let pinned = engine.head_snapshot();
-    let query = books();
-    let projection = Projection::ALL;
-    let reference = model.evaluate(&query, &projection);
-    let traced_budget = Budget::unlimited().traced();
-    let read = |snapshot: &Snapshot, cursor: Option<&Cursor>| {
-        snapshot
-            .query(walk_ns, &query, &projection, 7, cursor, traced_budget)
-            .expect("the walk namespace exists")
-    };
-
-    let first = read(&pinned, None);
-    assert_eq!(first.value.rows, reference[..7]);
-    let cursor = first.value.next.clone().expect("43 books remain");
-    assert_eq!(cursor.after(), reference[6].id);
-    let second = read(&pinned, Some(&cursor));
-    assert_eq!(second.value.rows, reference[7..14]);
-    assert_eq!(second.receipt.kind, ReceiptKind::Read);
-    assert_eq!(second.receipt.model_version, MODEL_VERSION);
-    assert_eq!(second.receipt.schedule_id, FIXTURE_ID);
-    assert!(second.receipt.ledger.is_some());
-
-    // The same page twice: identical rows, continuation and receipt.
-    let replay = read(&pinned, Some(&cursor));
-    assert_eq!(replay.value, second.value);
-    assert_eq!(replay.receipt, second.receipt);
-    let first_again = read(&pinned, None);
-    assert_eq!(first_again.value, first.value);
-    assert_eq!(first_again.receipt, first.receipt);
-
-    // Another handle to the same snapshot is the same snapshot: the cursor
-    // is accepted there and the page is the same.
-    let again = engine
-        .snapshot(pinned.id())
-        .expect("published snapshots resolve");
-    let through_again = read(&again, Some(&cursor));
-    assert_eq!(through_again.value, second.value);
-    assert_eq!(through_again.receipt, second.receipt);
-}
-
-// ---------------------------------------------------------------------------
-// Cursor binding
-// ---------------------------------------------------------------------------
-
 #[test]
 fn cursor_from_another_snapshot_or_a_branch_is_a_mismatch() {
     let Fixture {
@@ -1527,6 +1338,23 @@ fn cursor_from_another_snapshot_or_a_branch_is_a_mismatch() {
         )
         .expect("bound to snapshot 2");
     assert_eq!(home_one.value.rows, home_two.value.rows);
+    // Another handle to snapshot 1 is the same snapshot: the cursor is
+    // accepted there and the page is the same.
+    let one_again = engine
+        .snapshot(one.id())
+        .expect("published snapshots resolve");
+    let through_again = one_again
+        .query(
+            walk_ns,
+            &query,
+            &projection,
+            7,
+            Some(&cursor_one),
+            Budget::unlimited(),
+        )
+        .expect("bound to snapshot 1");
+    assert_eq!(through_again.value, home_one.value);
+    assert_eq!(through_again.receipt, home_one.receipt);
 
     // A branch refuses a snapshot cursor, its base refuses the branch's
     // cursor, and so does the snapshot the branch publishes.
@@ -1898,10 +1726,6 @@ fn cursor_check_comes_after_query_and_projection_validation() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Branch cursors
-// ---------------------------------------------------------------------------
-
 /// A fresh branch on the fixture head with the first page (limit 2) of the
 /// cost namespace's books read: rows `[1, 2]`, cursor after 2.
 fn branch_with_cursor(engine: &Engine, cost_ns: NamespaceId) -> (Branch, Cursor) {
@@ -2161,10 +1985,6 @@ fn branch_cursor_is_invalidated_by_every_applied_mutation() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The host-side pattern
-// ---------------------------------------------------------------------------
-
 #[test]
 fn host_resolves_an_omitted_block_once_and_pages_that_snapshot() {
     let Fixture {
@@ -2193,13 +2013,13 @@ fn host_resolves_an_omitted_block_once_and_pages_that_snapshot() {
     let total = pinned
         .count(walk_ns, &query, Budget::unlimited())
         .expect("the walk namespace exists");
-    assert_eq!(total.value, 50);
+    assert_eq!(total.value, BOOKS as u64);
     assert_eq!(total.receipt, read_applied(COUNT_BOOKS));
 
     // Between pages the chain produces a block: it deletes the next book at
     // head (the very row the pinned walk returns next) and the first one
     // also commits a new pricing schedule.
-    let mut at_head = model.clone();
+    let mut at_head = model;
     let mut deleted: Vec<RecordId> = Vec::new();
     let pages = walk(
         &pinned,
@@ -2256,7 +2076,7 @@ fn host_resolves_an_omitted_block_once_and_pages_that_snapshot() {
             .count(walk_ns, &query, Budget::unlimited())
             .expect("the walk namespace exists")
             .value,
-        50
+        BOOKS as u64
     );
 
     // The head moved on: a fresh resolution names block 107, prices reads

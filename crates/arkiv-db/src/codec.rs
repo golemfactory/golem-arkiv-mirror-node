@@ -496,9 +496,6 @@ pub fn digest(domain: &str, bytes: &[u8]) -> B256 {
     hasher.finalize()
 }
 
-// ---------------------------------------------------------------------------
-// Primitives and containers.
-
 impl Encode for u8 {
     fn encode_to(&self, encoder: &mut Encoder) {
         encoder.u8(*self);
@@ -687,9 +684,6 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Identities and names.
-
 /// The ordinal as 8 big-endian bytes; zero is rejected.
 impl Encode for NamespaceId {
     fn encode_to(&self, encoder: &mut Encoder) {
@@ -790,8 +784,7 @@ impl Decode for CellName {
     }
 }
 
-/// `u8 len ‖ bytes`, length 1 to 32. This is the codec's variable-width
-/// form; the fixed 33-byte [`RecordKey::encoded`] form is for ordered keys.
+/// `u8 len ‖ bytes`, length 1 to 32.
 impl Encode for RecordKey {
     fn encode_to(&self, encoder: &mut Encoder) {
         let bytes = self.as_bytes();
@@ -827,9 +820,6 @@ impl Decode for RecordId {
         Self::from_ordinal(decoder.u64()?).ok_or(DecodeError::ZeroId { kind: "RecordId" })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Typed values and cells.
 
 /// The type id as one byte ([`TypeTag::id`], golem-db's cell type id).
 impl Encode for TypeTag {
@@ -935,9 +925,6 @@ impl Decode for Cell {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Writes and their effects.
 
 /// `tag ‖ fields` in declaration order; raw keys and values are
 /// length-prefixed bytes, record keys `u8 len ‖ bytes`, cell lists
@@ -1128,9 +1115,6 @@ impl Decode for Effect {
         Ok(effect)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Rejections, outcomes and receipts.
 
 /// One tag byte.
 impl Encode for ArgumentFault {
@@ -1371,7 +1355,7 @@ impl Decode for Receipt {
 
 /// `id u32 ‖ u32 class count ‖ one u64 weight per class` in
 /// [`OperationClass::ALL`] order. Decoding rejects a count other than
-/// `OperationClass::ALL.len()` (31 under counting-rule version 3).
+/// `OperationClass::ALL.len()`.
 impl Encode for PriceSchedule {
     fn encode_to(&self, encoder: &mut Encoder) {
         encoder.u32(self.id());
@@ -1452,14 +1436,6 @@ impl Decode for Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn value_tags_are_the_type_ids() {
-        for tag in TypeTag::ALL {
-            assert_eq!(encode(&tag), [tag.id()], "{tag}");
-            assert_eq!(TypeTag::from_id(tag.id()), Some(tag));
-        }
-    }
 
     /// A hostile count that passes the item check (one-byte-minimum items
     /// filling the input) still reserves no more bytes than the input

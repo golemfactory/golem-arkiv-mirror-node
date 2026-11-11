@@ -264,8 +264,7 @@ pub struct ArkivDb {
 /// golem refuses settings its backend cannot hold. golem's three cell limits
 /// map one to one. golem indexes a `str` attribute up to `max_str_len`, so
 /// that is also the engine's indexed-string limit; a value above the
-/// engine's caps (32-byte names, 512-byte indexed values: the generic profile
-/// ceiling of state layout 2) is refused rather
+/// engine's caps (32-byte names, 512-byte indexed values) is refused rather
 /// than silently narrowed. golem has no per-record cell count: the engine's
 /// default (64) applies.
 pub fn engine_genesis(genesis: &Genesis) -> OpenResult<EngineGenesis> {

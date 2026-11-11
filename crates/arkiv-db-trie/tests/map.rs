@@ -1,18 +1,9 @@
 //! `MerkleMap` against independent models: contents from a `BTreeMap`,
 //! roots from `alloy_trie::HashBuilder` (keys ≤ 32 bytes) or the reference
-//! construction in `support` (any length), and hand-derived visit counts.
-//!
-//! Establishes: replacement and removal results and lengths agree with the
-//! model after every step of random insert/remove histories, roots every
-//! ten steps, and point reads, ordered and lower-bounded iteration every
-//! fifty steps and at the end; the root depends
-//! only on the key/value set (permuted insertion orders and different
-//! histories reaching one set give one root); earlier handles are
-//! unaffected by later updates; the path of any key visits at most
-//! 2·LEN + 1 nodes, reached exactly by crafted deep-path key sets; removal
-//! adds at most one visit (the collapse sibling); a value with an empty
-//! encoding is rejected by `insert` before anything is visited or read.
-//! Everything here runs in memory; stored links are covered by `store.rs`.
+//! construction in `support` (any length), and hand-derived visit counts
+//! (at most 2·LEN + 1 on a key path, one more for a removal's collapse
+//! sibling). Everything here runs in memory; stored links are covered by
+//! `store.rs`.
 
 mod support;
 
@@ -133,8 +124,7 @@ fn handles_are_shareable_across_threads() {
         .insert(&1, vec![1], &MemoryOnly, &mut Probe::new())
         .unwrap()
         .0;
-    let reader = map.clone();
-    let value = std::thread::spawn(move || reader.get(&1, &MemoryOnly, &mut Probe::new()))
+    let value = std::thread::spawn(move || map.get(&1, &MemoryOnly, &mut Probe::new()))
         .join()
         .unwrap()
         .unwrap();
@@ -406,27 +396,21 @@ fn from_root_validates_the_handle() {
 }
 
 #[test]
-fn replacing_a_value_keeps_the_length_and_old_versions() {
+fn same_root_follows_the_contents() {
     let mut probe = Probe::new();
     let first: MerkleMap<u64, Vec<u8>> = MerkleMap::new()
         .insert(&7, vec![1], &MemoryOnly, &mut probe)
         .unwrap()
         .0;
-    let (second, replaced) = first.insert(&7, vec![2], &MemoryOnly, &mut probe).unwrap();
-    assert_eq!(replaced, Some(vec![1]));
-    assert_eq!(second.len(), 1);
-    assert_eq!(
-        first.get(&7, &MemoryOnly, &mut probe).unwrap(),
-        Some(vec![1])
-    );
-    assert_eq!(
-        second.get(&7, &MemoryOnly, &mut probe).unwrap(),
-        Some(vec![2])
-    );
+    let (second, _) = first.insert(&7, vec![2], &MemoryOnly, &mut probe).unwrap();
     assert!(!first.same_root(&second));
     let (third, _) = second.insert(&7, vec![1], &MemoryOnly, &mut probe).unwrap();
     assert!(third.same_root(&first), "same contents, same root");
-    // u64 keys iterate in numeric order (big-endian encoding).
+}
+
+#[test]
+fn u64_keys_iterate_in_numeric_order() {
+    let mut probe = Probe::new();
     let mut map: MerkleMap<u64, Vec<u8>> = MerkleMap::new();
     for key in [300u64, 2, 1 << 40, 70_000, 1] {
         map = map

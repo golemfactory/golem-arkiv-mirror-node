@@ -29,8 +29,9 @@
 //!   prefix-free whole: two tuples first differ inside one field, before
 //!   either field's encoding ends.
 //!
-//! [`KeyWriter`] and [`KeyReader`] compose these; the tests check the order
-//! claims against Rust's own slice and tuple ordering on random inputs.
+//! [`KeyWriter`] and [`KeyReader`] compose these; `tests/encoding.rs` checks
+//! the order claims against Rust's own slice and tuple ordering on random
+//! inputs.
 
 use crate::codec::CodecError;
 
@@ -39,10 +40,9 @@ const TERMINATOR: u8 = 0x00;
 /// The escape byte of [`encode_bytes`]: `01 01` is `00`, `01 02` is `01`.
 const ESCAPE: u8 = 0x01;
 
-/// Appends the escaped form of `value` without a terminator.
-///
-/// It is a prefix of [`encode_bytes`] of every string starting with `value`
-/// and of no other encoding, and it is the smallest such string.
+/// Appends the escaped form of `value` without a terminator: the smallest
+/// prefix shared by the [`encode_bytes`] forms of exactly the strings that
+/// start with `value`.
 pub fn escape_bytes(value: &[u8], out: &mut Vec<u8>) {
     for &byte in value {
         match byte {
@@ -62,9 +62,6 @@ pub fn encode_bytes(value: &[u8], out: &mut Vec<u8>) {
 
 /// Appends the shifted form of `value` without a terminator: every byte
 /// plus one. Fails, appending nothing, if `value` holds an `ff` byte.
-///
-/// It is a prefix of [`encode_shifted`] of every string starting with
-/// `value` and of no other encoding, and the smallest such string.
 pub fn shift_bytes(value: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
     if value.contains(&0xff) {
         return Err(CodecError::new("an ff byte cannot be shifted"));
@@ -75,14 +72,8 @@ pub fn shift_bytes(value: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
 
 /// Appends the prefix-free, order-preserving encoding of a byte string that
 /// never contains `ff`: every byte plus one, then a `00` terminator.
-/// Exactly `len + 1` bytes.
-///
-/// For UTF-8 text, which never contains the bytes `f5`–`ff`, this is a
-/// tight alternative to [`encode_bytes`]: no escape can double the length.
-/// The terminator is the smallest byte and occurs nowhere else, and adding
-/// one to every byte keeps their order, so encodings are prefix-free and
-/// order as the strings do (a proper prefix first). Fails, appending
-/// nothing, if `value` holds an `ff` byte.
+/// Exactly `len + 1` bytes. Fails, appending nothing, if `value` holds an
+/// `ff` byte.
 pub fn encode_shifted(value: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
     shift_bytes(value, out)?;
     out.push(TERMINATOR);
@@ -243,10 +234,7 @@ impl<'a> KeyReader<'a> {
 
     /// Reads a big-endian `u64`.
     pub fn u64(&mut self) -> Result<u64, CodecError> {
-        let bytes: [u8; 8] = self
-            .take(8)?
-            .try_into()
-            .map_err(|_| CodecError::new("key is too short"))?;
+        let bytes = self.take(8)?.try_into().expect("take returned 8 bytes");
         Ok(u64::from_be_bytes(bytes))
     }
 
@@ -342,6 +330,8 @@ mod tests {
             assert!(enc(pair[0]) < enc(pair[1]));
             assert!(!enc(pair[1]).starts_with(&enc(pair[0])));
         }
+        // Worst-case escaping doubles the length.
+        assert_eq!(enc(&[0; 64]).len(), 129);
         let mut escaped = Vec::new();
         escape_bytes(b"a\0", &mut escaped);
         assert!(enc(b"a\0b").starts_with(&escaped));

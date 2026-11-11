@@ -1,11 +1,10 @@
 # Engine storage v1
 
-Status: implemented and validated, 2026-09-24. This is the N3c engine-only
-deliverable of the [node and storage roadmap](node-storage-plan.md), after
-the volatile [full/light demo](full-light-demo.md). See the
-[usage/lifecycle guide](engine-storage-run.md) and
-[measured acceptance report](engine-storage-v1-report.md). The contracts
-below remain the implementation requirements; N4 node integration is open.
+Status: implemented. This is the specification of the engine-only durable
+profile (`arkiv_db::durable`). See the
+[usage/lifecycle guide](engine-storage-run.md) and the
+[measurements](engine-storage-v1-report.md). The simulator and the signed
+proposer build their node storage on top of it.
 
 ## Outcome and boundary
 
@@ -23,54 +22,20 @@ garbage collection, compaction, persistent savepoints, export/import, or
 history migration belongs to v1. Disk consumption is deliberately
 unbounded with history; engine-owned resident history is not.
 
-This is an **engine** milestone. It does not persist transaction bodies,
+This is an **engine** profile. It does not persist transaction bodies,
 receipts, node blocks, inclusion identities, producer signing keys, queues,
-or follower checkpoints, and does not wire durable restart into
-`arkiv-node`. Host-map contents are engine state and are persisted, but
-node expiry/replay/signing orchestration remains N4. Do not expose this
+or follower checkpoints. Host-map contents are engine state and are
+persisted, but node expiry/replay/signing orchestration belongs to the
+host. Do not expose this
 engine file as a restartable full node or call its commit identities block
 hashes. Existing equality proofs must work on reopened snapshots; adding
 new proof profiles is outside this change.
 
 Keep `Engine::new`, `Engine::with_limits`, memory `publish`, and all current
-memory-mode semantics. Preserve state-format-1 bytes, roots, canonical
+memory-mode semantics. Preserve the state-format bytes, roots, canonical
 receipts, charges, namespace boundaries and existing golden fixtures.
 Storage resource failures are lifecycle/availability failures, never new
 deterministic user rejections or charged receipts.
-
-## Code findings that constrain the implementation
-
-These preimplementation findings constrain the durable facade; the ordinary
-memory helpers remain available for their original purposes:
-
-- `WorkingState` is a catalog, namespace allocator, pricing schedule and
-  host map. Catalog leaves include descriptors, record allocators and all
-  namespace map handles; term leaves contain posting handles.
-- `StateHeader` is small and contains catalog/host roots and lengths,
-  allocator and full pricing. Its digest is the existing logical state
-  root. Namespace and posting leaf decoding already creates stored nested
-  map handles.
-- `MerkleMap::to_stored` converts a committed map to its root/length without
-  reading anything. `NodeBox::decode_stored` checks the content hash and
-  strict canonical encoding, including inline nodes.
-- Staging stops at `Link::Stored` and `from_store` nodes, visits inline
-  leaves for nested maps, and stores a root even when its encoding is less
-  than 32 bytes. It must continue visiting nested maps even if the same
-  object hash was already emitted under another map kind.
-- Current `Engine::publish` appends `Arc<SnapshotState>` holding the entire
-  candidate into a growing vector. Reusing it would retain history and
-  repeatedly stage nodes that were committed but still marked new.
-  `Engine::from_state` also resets sequence/instance to a fresh genesis;
-  it is a test aid, not the production history opener.
-- `WorkingState::staging` currently collects cloned catalog leaves and
-  postings, deduplicates by `(space, map kind, object id)`, and uses
-  infallible `ObjectSink`. Calling it and checking size afterward is not
-  bounded preparation. Raw `WriteOp::Put` values have no `Limits` byte cap,
-  and trie value/node encoders allocate before handing bytes to the sink.
-- `VersionedStore` has atomic outcomes, health and recovery, but its
-  generic `reconcile` explicitly does not certify durability merely from
-  reading an indeterminate write back. `RedbStore::epoch` is concrete, not
-  part of the generic trait.
 
 ## API and ownership
 
@@ -146,18 +111,20 @@ There are three separate identities:
    identity of one engine publication, including its sequence and parent.
    Equal states published twice still have different commit identities.
 
-Freeze a small canonical `EngineGenesisV1` with: engine-storage profile and
-version, codec version 1, state format 1, counting model version 3,
-record-key encoding version 2, trie-layout version 1, caller-selected
-32-byte deployment identity, complete `Limits`, initial `PriceSchedule`,
-and the persistent maximum encoded object size. Start only from the
-ordinary empty engine state (`next_namespace = 1`, empty catalog/host).
-There is no implicit import of an arbitrary memory snapshot in v1.
+Freeze a small canonical `EngineGenesisV1` with: engine-storage profile,
+six versions (engine layout 2, codec 1, state format 2, counting model 3,
+record-key encoding 2, proof version 2), caller-selected 32-byte deployment
+identity, complete `Limits`, initial `PriceSchedule`, the persistent maximum
+encoded object size, and an optional initial `StateHeader`. Without the
+initial header the engine starts from the ordinary empty state
+(`next_namespace = 1`, empty catalog/host); a prebuilt genesis state supplies
+one, and its pricing must equal the genesis pricing. There is no implicit
+import of an arbitrary memory snapshot.
 
 Freeze the field order just listed. Encode the profile as the eight raw
 bytes `ARKENG01`, all six version fields as `u32`, deployment identity as
-32 raw bytes, `Limits` and pricing with their existing codecs, and the
-maximum object bytes as `u64`. `Meta["engine/profile"]` is
+32 raw bytes, `Limits` and pricing with their existing codecs, the
+maximum object bytes as `u64`, and the optional initial header last. `Meta["engine/profile"]` is
 `ARKENG01 || u32be(1)`; the genesis record is
 `encode(EngineGenesisV1) || EngineGenesisId`, without another length prefix.
 
@@ -186,12 +153,10 @@ Use these existing tables, with no adapter table-format change:
 `Blocks` and `Inclusions` remain unused. This is an explicit **engine
 profile** of the generic commit store: existing fields named height/hash
 and table `BlockIndex` carry a commit sequence/digest, not a protocol block.
-Update the storage-contract documentation to permit this profile without
-changing the existing binary shapes or adapter behavior. Generic
-reconciliation compares the records supplied by the caller; it does not
-require a protocol block. N4 must introduce an explicit node profile and
-atomic block/state contract; it must not open this profile as node storage
-or silently reinterpret these heads. No profile migration is promised.
+Generic reconciliation compares the records supplied by the caller; it does
+not require a protocol block. A node keeps its own block, receipt and
+inclusion records beside this profile and must not reinterpret these heads
+as block hashes. No profile migration is promised.
 
 `EngineManifestV1` contains version, genesis digest, sequence,
 `Option<(parent_sequence, parent_commit_id)>`, the unchanged `StateHeader`,
@@ -423,7 +388,8 @@ must resolve the underlying medium/restart condition and open a fresh
 engine before continuing; the API documentation must distinguish this
 operational recovery from an assertion that mere process reopen cures
 failed-sync data loss. Ordinary startup trusts the adapter's recovery
-contract, with the same platform limitations already recorded by N2.
+contract, with the platform limitations recorded in the
+[redb experiment](redb-experiment.md).
 
 The redb adapter's quick-repair/two-phase recovery evidence is useful but
 limited: it does not establish every kernel/device's failed-sync behavior.
@@ -468,7 +434,7 @@ Foreign namespace objects must never be loaded for a target query/proof.
 Shared metadata depth and backend page I/O may grow; do not call them a
 constant disk-latency or constant physical-I/O guarantee. Cache churn is
 measured behavior and never changes canonical charges. Existing
-[namespace isolation](project-namespaces.md) and N2 limitations remain in
+[namespace isolation](project-namespaces.md) and redb-experiment limitations remain in
 force; update evidence rather than enlarging claims.
 
 ## Proofs and compatibility
@@ -485,96 +451,10 @@ Demonstrate byte-identical supported proofs for equal requests/states in
 memory and durable modes with cache disabled, cold and warm, including
 absence and pagination. Verify with the independent existing verifier.
 The broader historical block-to-snapshot mapping, signing and node serving
-are N4. Existing proof errors may remain their established public
+belong to the host. Existing proof errors may remain their established public
 `StorageUnavailable` form; they must not become valid absence evidence.
 
-## Implementation sequence and validation gates
-
-Implement in reviewable slices; code and meaningful tests travel together.
-
-1. **Format and facade foundations.** New durable config/genesis/manifest
-   codec and golden vectors, explicit profile docs, shared snapshot/branch
-   constructors, sequential lookup, initialization/open validation. No
-   memory `Engine` behavior changes.
-2. **Loader/cache and bounded reads.** Shared context health/generation
-   gate, decoded-node cache, pre-copy size checks in redb and wrappers, counters.
-   Test zero/tiny cache, eviction, DB/space isolation, missing/corrupt bytes,
-   and cached reads after failed-store/recovery transitions.
-3. **Bounded incremental preparation and publication.** Read-free preflight,
-   fallible staging, nested-map dedup, atomic commit, root-only replacement,
-   uncertainty state machine. Exercise all three outcomes and retained
-   candidate ownership. Do not delay release until a later memory project.
-4. **Engine differential/failure suite.** Run identical seeded histories
-   through ordinary `Engine`, the durable facade over
-   `MemoryVersionedStore`, and real redb. Include raw/typed data, every cell
-   type, patch/delete/recreate, large/shared postings, rollback, empty
-   commits, namespace transfer, schedule changes and host state. Compare
-   receipts, state/namespace roots, results, ordering, pagination and proofs
-   at old snapshots after close/reopen. Compare logical probes/charges;
-   physical cache/store counters are measurements, not equality fixtures.
-5. **Crash and measured acceptance.** Add a runnable example/measurement
-   command and a checked-in report with workload/options, environment,
-   counters, timings and observed limitations. Only then mark N3c engine
-   storage v1 done; leave N4 and broad proof work open.
-
-Required failure evidence includes:
-
-- Wrong genesis/limits/profile/version, sequence overflow, truncated/trailing
-  manifest bytes, wrong digest/root/index, absent old manifest, and malformed
-  catalog/host/row/posting objects; no silent empty/unknown fallback.
-- Preparation caps at their boundaries: oversize raw values before hashing,
-  byte/object/visit cap exhaustion before commit, dedup across map kinds,
-  nested inline/root cases, unreachable rollback paths and repeated updates.
-- FaultyStore definite failures, applied/not-applied uncertainty, lost ack,
-  failed recovery, cached reads under a failed health latch, unexpected
-  concurrent head and stale pre-recovery branches/candidates.
-- CrashDisk cuts/failures at actual engine transaction write/growth/sync
-  points, plus process termination before commit and after commit/before
-  publication. Reopen exposes exactly the complete parent or complete new
-  engine snapshot. Every acknowledged commit survives the model's durable
-  cut; uncertainty is allowed either result, never mixed roots/objects.
-- Run the lost-final-sync/page-cache model with quick repair on using engine
-  manifests and reachable namespace/host objects; do not replace it with
-  only mock `CommitOutcome` tests. Keep the existing redb contract, disk-full,
-  creation, latching and recovery suites.
-
-Measured acceptance is deliberately separated from timing assertions:
-
-| Experiment | Hard functional gate | Measurements to record |
-| --- | --- | --- |
-| Cold open at 100, 1,000 and 10,000 snapshots | Bounded metadata/manifest reads; zero trie object reads and no replay/namespace/index scan | Application open reads/time versus redb open/allocator/repair reads/time, file bytes |
-| Old snapshot open/read/proof with 0, 64 KiB and 8 MiB node caches | Manifest lookup only until first walk; exact historical answers/proofs; cache limits never exceeded | Object/cache hits/misses, logical visits, backend reads, proof bytes/time |
-| Fixed small update as live state/history grow by at least 10x | No untouched-space object writes; no stored-subtree staging reads; empty commit has zero object writes | New-node visits/unique bytes, record bytes, physical writes/syncs/amplification; compare with trie path-size growth rather than demand a false fixed byte count |
-| 10,000 bounded publications with external candidates dropped | Only current stored-root head retained; no resident manifest/history vector; old dirty nodes drop | Live trie nodes/bytes, cache payload/entries, staging peak, redb metadata, process RSS at checkpoints |
-| Retain many historical snapshot handles, then read and drop them | Read-only handles retain roots/header/context only; loaded objects reside solely in bounded cache or active call temporaries | Per-handle overhead, node drop evidence, peak live decode memory |
-| Fixed target namespace while another grows by at least 10x | No foreign namespace object reads; same target answers, proofs and canonical charges | Catalog/directory/backend I/O separated from target-table I/O and cache effects |
-
-V1 acceptance note (2026-09-24): the hard functional gates above passed.
-The [reviewed measurement report](engine-storage-v1-report.md#interpretation-and-unavailable-attribution)
-does not measure isolated peak active decode bytes/nodes, private per-handle
-heap overhead, or resident redb metadata heap. Those allocation-attribution
-targets remain deferred observability work, not passed measurements.
-Stored-root ownership and graph-wide weak-reference tests establish the
-committed-tree release contract; process RSS/HWM and disk allocation do not
-substitute for the missing attribution or establish total-process bounds.
-
-Use practical datasets (for example 1,000 versus 10,000 live rows plus the
-10,000 small-commit history run); report exact workload sizes rather than
-claiming production scale. Backend metadata and allocator RSS may grow;
-if measurements show a meaningful unbounded application registry, history
-vector, repeated full-state staging, or read handle retaining loaded trees,
-fix it before acceptance. If redb itself dominates growth, report it
-explicitly and narrow the claim; do not attribute all RSS to the cache or
-silently omit the result. CI asserts structural bounds/counters, not tight
-wall-clock or RSS thresholds tied to one machine.
-
-Run affected crate tests during development, then the repository's existing
-workspace tests, formatting, lint and minimum-toolchain checks as documented
-in [testing](testing.md)/README. Existing memory roots/receipts/proof vectors
-must remain unchanged. The final report must distinguish new measurements
-from N2 adapter-only evidence and list any commands not run.
-
-## Decisions fixed here; implementation details left open
+## Decisions fixed here
 
 Fixed: engine-only profile, separate durable facade, empty explicit genesis,
 stable per-file snapshot sequences, existing state hashes/encodings,
@@ -583,10 +463,6 @@ bounded preparation, root-only publication, no protocol block/body
 persistence, fail-closed uncertain durability, no pruning/compaction, and
 honest separation of caller/adapter/application memory.
 
-The implementer may choose a simple cache eviction structure, precise Rust
-error/ownership type names, placement of private constructors, instrumentation
-mechanism, and a fallible traversal API that preserves these contracts.
-Those are library details, not reasons to weaken the gates. Any proposed
-change to identity, durable acknowledgement, logical bytes/charges,
+Any change to identity, durable acknowledgement, logical bytes/charges,
 namespace isolation or memory-retention claims requires revising this
-specification and reviewing the change before implementation proceeds.
+specification first.

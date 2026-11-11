@@ -7,7 +7,7 @@ Evidence for [engine storage v1](engine-storage-v1.md). The tables below are the
 - rustc 1.90.0 (1159e78c4 2025-09-14)
 - CPU: AMD Ryzen 5 3600 6-Core Processor; logical CPUs available: 12
 - Kernel: 7.0.0-34-generic
-- Filesystem: ext4; path: /home/ubuntu/arkiv-network/arkiv-state-db-experiment/target/perf-bench/esx
+- Filesystem: ext4; path: `target/perf-bench/esx` in the repository
 - redb 4.3.0; quick repair on; redb page cache 8 MiB. Node-cache options are stated per experiment.
 - This measures engine snapshots, not node block/body/signing restart. No pruning or compaction.
 
@@ -187,46 +187,3 @@ queries/counts, pagination, namespace/state roots and host data agree;
 supported historical proof bytes/receipts agree and verify independently.
 Snapshot opening loads no trie objects. This is the real-disk third arm of
 the same history previously exercised with `MemoryVersionedStore`.
-
-## Validation commands
-
-These commands passed for this evidence slice:
-
-```sh
-cargo test --offline -p arkiv-db-redb --test engine_crashes --test engine_process --test engine_history -- --nocapture
-cargo clippy --offline -p arkiv-db-redb --test engine_crashes --test engine_process --test engine_history --example engine_storage_experiment -- -D warnings
-cargo +1.90.0 check --offline -p arkiv-db-redb --test engine_crashes --test engine_process --test engine_history --example engine_storage_experiment
-cargo run --release --offline -p arkiv-db-redb --example engine_storage_experiment
-```
-
-The integration binaries contain eight passing tests including their
-child-process entry point; the helper does no standalone work outside a
-spawned child. These new measurements do not replace the N2 adapter suite.
-
-The measurement expansion reran the release example, example-only Clippy
-with warnings denied, and the example's Rust 1.90.0 MSRV check. All passed.
-It did not rerun unchanged crash tests; the preceding eight-test results
-remain the evidence for those scenarios. Allocation attribution marked
-unavailable above remains outside these measurements, rather than being
-estimated from RSS or disk layout.
-
-Final integration validation, run by the integration lead after the
-cache-disabled edge-case fix, passed with **807 tests, 0 failures, and 3
-existing heavy tests ignored**. The total was checked against the local
-`target/engine-storage-workspace-tests-final.log`. The exact commands were:
-
-```sh
-cargo test --workspace --offline
-cargo clippy --offline --all-targets -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -p reth-trie -- -D warnings
-cargo +1.90.0 check --workspace --all-targets --offline
-cargo fmt -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -p reth-trie -- --check
-git diff --check
-```
-
-The Clippy/format package list covers maintained crates and excludes the
-copied Alloy reference crate; tests and the Rust 1.90.0 check cover the
-workspace. The three ignored tests are the existing expensive N2 adapter
-cases: `every_crash_point_in_steady_state_heavy`,
-`every_crash_point_is_parent_or_candidate_heavy`, and
-`growing_commit_every_crash_point_heavy`. They were not run for this
-milestone; the new engine crash cases above were run and passed.

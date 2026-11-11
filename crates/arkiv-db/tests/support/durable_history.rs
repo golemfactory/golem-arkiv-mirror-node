@@ -327,6 +327,7 @@ pub fn run_seeded_history(
             let snapshot = engine.snapshot(id).unwrap();
             assert_eq!(store.stats().since(&before).object_reads(), 0);
             compare(&memory.snapshot(id).unwrap(), &snapshot);
+            // Again, now through the warm cache.
             compare(&memory.snapshot(id).unwrap(), &snapshot);
             assert!(snapshot.staged_objects().is_empty());
             assert!(engine.stats().cache.retained_bytes <= cap);

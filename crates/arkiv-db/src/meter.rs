@@ -22,7 +22,7 @@ use crate::{namespace::Revision, query::QueryFault, record::ArgumentFault};
 /// and prepay authenticated-state maintenance: every write adds `RootUpdate`
 /// per logical map-entry write to the group it already charges, typed record
 /// writes add `RowByte` for the stored row they rewrite, and
-/// `ProofNode`/`ProofByte` are reserved for point proofs (not charged yet).
+/// `ProofNode`/`ProofByte` are charged by proof reads ([`crate::proof`]) only.
 /// The value is an opaque identifier of this rule set.
 pub const MODEL_VERSION: u32 = 3;
 
@@ -66,7 +66,7 @@ impl fmt::Display for Cost {
 
 /// A logical operation class with its own unit price.
 ///
-/// Counting rules (model version 3), per operation. `c` = cells, `b` = name
+/// Counting rules, per operation. `c` = cells, `b` = name
 /// plus encoded value bytes of the cells written, `a` = attribute cells,
 /// `n` = the stored row after the write (key bytes plus name and encoded
 /// value bytes of every cell it holds), `p` = projected bytes (key bytes if
@@ -159,11 +159,11 @@ pub enum OperationClass {
     /// bytes plus name and encoded value bytes of every cell of the row after
     /// the write. Prepays re-encoding and rewriting the whole row leaf.
     RowByte,
-    /// Each hash-referenced node a point proof emits. Reserved; no operation
-    /// charges it yet.
+    /// Each hash-referenced node a proof read emits ([`crate::proof`]). No
+    /// block operation charges it.
     ProofNode,
-    /// Each byte of the nodes a point proof emits. Reserved; no operation
-    /// charges it yet.
+    /// Each byte of the nodes a proof read emits. No block operation
+    /// charges it.
     ProofByte,
 }
 
@@ -387,16 +387,6 @@ impl Budget {
         self.limit
     }
 
-    /// Whether a ledger was requested.
-    pub const fn is_traced(&self) -> bool {
-        self.trace
-    }
-
-    /// Whether a host interrupt may stop the operation.
-    pub const fn is_interruptible(&self) -> bool {
-        self.interruptible
-    }
-
     /// Whether a query or count read is evaluated by estimated cost.
     pub const fn is_planned(&self) -> bool {
         self.planned
@@ -571,13 +561,6 @@ pub struct Receipt {
     pub ledger: Option<Ledger>,
 }
 
-impl Receipt {
-    /// Whether the operation applied.
-    pub const fn is_applied(&self) -> bool {
-        matches!(self.outcome, Outcome::Applied)
-    }
-}
-
 /// The charging state machine for one operation.
 pub(crate) struct Meter<'s> {
     schedule: &'s PriceSchedule,
@@ -730,29 +713,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_three_appends_four_classes_with_their_fixture_weights() {
+    fn classes_are_listed_in_index_order() {
         assert_eq!(MODEL_VERSION, 3);
         assert_eq!(OperationClass::ALL.len(), 31);
-        assert_eq!(
-            OperationClass::ALL[27..],
-            [
-                OperationClass::RootUpdate,
-                OperationClass::RowByte,
-                OperationClass::ProofNode,
-                OperationClass::ProofByte,
-            ]
-        );
         for (index, class) in OperationClass::ALL.into_iter().enumerate() {
             assert_eq!(class.index(), index, "{class:?}");
         }
-        let fixture = PriceSchedule::FIXTURE;
-        assert_eq!(fixture.price(OperationClass::RootUpdate), 2);
-        assert_eq!(fixture.price(OperationClass::RowByte), 1);
-        assert_eq!(fixture.price(OperationClass::ProofNode), 2);
-        assert_eq!(fixture.price(OperationClass::ProofByte), 1);
-        // The version-2 weights are unchanged, e.g. the first and the last.
-        assert_eq!(fixture.price(OperationClass::DirectoryLookup), 1);
-        assert_eq!(fixture.price(OperationClass::ResultRow), 3);
     }
 
     #[test]

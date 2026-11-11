@@ -2,7 +2,7 @@
 
 How an entity's expiry is set, when the entity is removed, and what bounds
 that work. This page describes the behaviour; the exact rules, encodings and
-error cases are in the [block format](block-format.md#expiry) and are the
+error cases are in the [block format](block-format.md#execution) and are the
 specification. Rent is in [GLM gas](glm-gas-v1.md), the rule's rationale in
 the [spill proposal](proposals/expiry-spill.md).
 

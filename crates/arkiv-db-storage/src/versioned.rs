@@ -4,20 +4,15 @@
 //! leave it unchanged. Durable block production needs a different contract,
 //! which this module defines:
 //!
-//! - **Immutable objects.** Engine state is stored as content-addressed
-//!   objects: an [`ObjectId`] is `keccak256` of the object bytes. Objects are
-//!   grouped in [`SpaceId`]s (the namespace catalog, host state, and one space
-//!   per namespace); a space is one physical table in a disk store, so the
+//! - **Immutable objects**, content-addressed by [`ObjectId`] and grouped in
+//!   [`SpaceId`]s (the namespace catalog, host state, and one space per
+//!   namespace). A space is one physical table in a disk store, so the
 //!   objects of one namespace never share a B-tree with another namespace's.
-//!   A commit puts objects **if absent**: an object never changes once
-//!   committed, so every historical version stays readable as long as it is
-//!   retained (this contract has no deletion).
-//! - **Insert-only records** in five fixed [`Table`]s (metadata, blocks,
-//!   manifests, inclusion identities, block index). A record never changes
-//!   once committed.
-//! - **One durable head** ([`Head`]), changed only by a compare-and-set in
-//!   [`VersionedStore::commit`], together with every object and record of the
-//!   same [`CommitBatch`], atomically.
+//! - **Records** in five fixed [`Table`]s (metadata, blocks, manifests,
+//!   inclusion identities, block index), insert-only under
+//!   [`VersionedStore::commit`].
+//! - **One durable head** ([`Head`]), moved by a compare-and-set together
+//!   with every object and record of the same [`CommitBatch`], atomically.
 //! - **Three commit outcomes** ([`CommitOutcome`]): committed and durable,
 //!   definitely not committed, or indeterminate. An indeterminate outcome is
 //!   never resolved by the store itself; the caller reconciles it from durable
@@ -30,26 +25,17 @@
 //! Storage failures are availability errors. They must never be read as a
 //! missing record, an empty result or a deterministic user rejection.
 //!
-//! Implementations: `MemoryVersionedStore` (crate `arkiv-db-memory`, volatile
-//! reference), `RedbStore` (crate `arkiv-db-redb`, durable) and
-//! [`FaultyStore`](crate::testing::FaultyStore), a fault-injecting wrapper.
-//! The behavioural suite in [`crate::testing::contract`] runs against all of
-//! them.
-//!
-//! The usual node profile identifies heads by block height/hash. Engine
-//! storage v1 explicitly identifies an engine-only profile in metadata and
-//! uses snapshot sequence/manifest digest instead, with manifests and their
-//! digest index in `Manifests`/`BlockIndex`, leaving `Blocks`/`Inclusions`
-//! unused. The adapter's byte shapes do not change; profile validation and
-//! interpretation belong to the caller. An engine commit is not a block.
+//! [`VersionedStore`] states the rules, including the two operations beside
+//! `commit`: [`stage_objects`](VersionedStore::stage_objects) and
+//! [`relabel`](VersionedStore::relabel), the only one that removes records.
 //!
 //! This module uses only the standard library. It does not hash: callers
 //! supply the content address of each object, and a store that reads bytes
 //! back from a medium verifies it.
 
 use std::{
-    collections::{BTreeMap, btree_map},
-    fmt,
+    collections::BTreeMap,
+    fmt::{self, Write as _},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -381,29 +367,15 @@ impl CommitBatch {
         }
         let mut objects: BTreeMap<(SpaceId, &ObjectId), &[u8]> = BTreeMap::new();
         for (space, id, bytes) in &self.objects {
-            match objects.entry((*space, id)) {
-                btree_map::Entry::Vacant(slot) => {
-                    slot.insert(bytes);
-                }
-                btree_map::Entry::Occupied(slot) => {
-                    if *slot.get() != bytes.as_slice() {
-                        return Err(object_conflict(*space, id));
-                    }
-                }
+            if *objects.entry((*space, id)).or_insert(bytes) != bytes.as_slice() {
+                return Err(object_conflict(*space, id));
             }
         }
         let mut records: BTreeMap<(Table, &[u8]), &[u8]> = BTreeMap::new();
         for (table, key, value) in &self.records {
             table.check_record(key, value)?;
-            match records.entry((*table, key)) {
-                btree_map::Entry::Vacant(slot) => {
-                    slot.insert(value);
-                }
-                btree_map::Entry::Occupied(slot) => {
-                    if *slot.get() != value.as_slice() {
-                        return Err(record_conflict(*table, key));
-                    }
-                }
+            if *records.entry((*table, key)).or_insert(value) != value.as_slice() {
+                return Err(record_conflict(*table, key));
             }
         }
         Ok(())
@@ -503,6 +475,16 @@ pub fn head_mismatch(expected: Option<Head>, actual: Option<Head>) -> StorageErr
     )
 }
 
+fn missing_object(space: SpaceId, id: &ObjectId) -> StorageError {
+    StorageError::new(
+        StorageErrorKind::Missing,
+        format!(
+            "referenced object {} is absent from {space:?}",
+            hex_prefix(id)
+        ),
+    )
+}
+
 fn describe_head(head: Option<Head>) -> String {
     match head {
         None => "none".to_owned(),
@@ -513,7 +495,7 @@ fn describe_head(head: Option<Head>) -> String {
 fn hex_prefix(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(18);
     for byte in bytes.iter().take(8) {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     if bytes.len() > 8 {
         out.push('…');
@@ -586,7 +568,6 @@ pub struct StorageError {
 }
 
 impl StorageError {
-    /// Creates an error.
     pub fn new(kind: StorageErrorKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
@@ -638,15 +619,8 @@ pub trait ObjectReader: Send + Sync {
     /// Loads an object that a committed structure references: absence is
     /// [`StorageErrorKind::Missing`], never `None`.
     fn load_object(&self, space: SpaceId, id: &ObjectId) -> Result<Vec<u8>, StorageError> {
-        self.read_object(space, id)?.ok_or_else(|| {
-            StorageError::new(
-                StorageErrorKind::Missing,
-                format!(
-                    "referenced object {} is absent from {space:?}",
-                    hex_prefix(id)
-                ),
-            )
-        })
+        self.read_object(space, id)?
+            .ok_or_else(|| missing_object(space, id))
     }
 
     /// The bounded counterpart of [`load_object`](Self::load_object).
@@ -660,15 +634,7 @@ pub trait ObjectReader: Send + Sync {
         max_bytes: usize,
     ) -> Result<Vec<u8>, StorageError> {
         self.read_object_bounded(space, id, max_bytes)?
-            .ok_or_else(|| {
-                StorageError::new(
-                    StorageErrorKind::Missing,
-                    format!(
-                        "referenced object {} is absent from {space:?}",
-                        hex_prefix(id)
-                    ),
-                )
-            })
+            .ok_or_else(|| missing_object(space, id))
     }
 }
 
@@ -685,7 +651,9 @@ pub trait ObjectReader: Send + Sync {
 ///   bytes again are idempotent, different bytes are `Conflict` and the whole
 ///   batch is `NotCommitted`.
 /// - Records are insert-only: an identical record is idempotent, a different
-///   value is `Conflict`.
+///   value is `Conflict`. Only [`relabel`](Self::relabel) removes records.
+/// - [`stage_objects`](Self::stage_objects) puts objects into a store that
+///   has no head yet, outside any commit.
 /// - The head changes only by compare-and-set; a mismatch is
 ///   `NotCommitted(HeadMismatch)` with nothing applied.
 /// - A store may enter [`Health::Failed`] after an `Io`, `Full` or `Corrupt`
@@ -695,8 +663,7 @@ pub trait ObjectReader: Send + Sync {
 ///   answer — until `recover` succeeds. A failed `recover` latches its own
 ///   error in place of the earlier one. `recover` waits for in-flight calls,
 ///   is idempotent and may be retried after it fails. Which of these
-///   failures latch is up to the store; `RedbStore` latches `Io` and `Full`
-///   on any call, every error of redb's commit, and a failed `recover`.
+///   failures latch is up to the store.
 /// - A referenced object that is absent is `Missing`
 ///   ([`ObjectReader::load_object`]); a stored object whose bytes do not hash
 ///   to its id is `Corrupt`.
@@ -715,11 +682,9 @@ pub trait VersionedStore: ObjectReader {
 
     /// Reads a record only if its stored value is at most `max_bytes`.
     ///
-    /// Like [`ObjectReader::read_object_bounded`], checks length before
-    /// copying and returns `Corrupt` for an oversized stored value. The
-    /// bound applies to the value, not the caller-supplied lookup key or
-    /// backend page buffers. All record tables, including metadata and
-    /// manifests, follow the same inclusive bound and counter semantics.
+    /// The record counterpart of [`ObjectReader::read_object_bounded`], in
+    /// every table: same inclusive limit on the value, `Corrupt` when
+    /// exceeded, same counter rules.
     fn read_record_bounded(
         &self,
         table: Table,
@@ -768,109 +733,71 @@ pub trait VersionedStore: ObjectReader {
     fn stats(&self) -> StoreStats;
 }
 
-impl<T: ObjectReader + ?Sized> ObjectReader for Arc<T> {
-    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_object(space, id)
-    }
-    fn read_object_bounded(
-        &self,
-        space: SpaceId,
-        id: &ObjectId,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_object_bounded(space, id, max_bytes)
-    }
+macro_rules! forward_to_pointee {
+    ($($pointer:ident),+) => {$(
+        impl<T: ObjectReader + ?Sized> ObjectReader for $pointer<T> {
+            fn read_object(
+                &self,
+                space: SpaceId,
+                id: &ObjectId,
+            ) -> Result<Option<Vec<u8>>, StorageError> {
+                (**self).read_object(space, id)
+            }
+            fn read_object_bounded(
+                &self,
+                space: SpaceId,
+                id: &ObjectId,
+                max_bytes: usize,
+            ) -> Result<Option<Vec<u8>>, StorageError> {
+                (**self).read_object_bounded(space, id, max_bytes)
+            }
+        }
+
+        impl<T: VersionedStore + ?Sized> VersionedStore for $pointer<T> {
+            fn database_id(&self) -> DatabaseId {
+                (**self).database_id()
+            }
+            fn head(&self) -> Result<Option<Head>, StorageError> {
+                (**self).head()
+            }
+            fn read_record(
+                &self,
+                table: Table,
+                key: &[u8],
+            ) -> Result<Option<Vec<u8>>, StorageError> {
+                (**self).read_record(table, key)
+            }
+            fn read_record_bounded(
+                &self,
+                table: Table,
+                key: &[u8],
+                max_bytes: usize,
+            ) -> Result<Option<Vec<u8>>, StorageError> {
+                (**self).read_record_bounded(table, key, max_bytes)
+            }
+            fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
+                (**self).commit(batch)
+            }
+            fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
+                (**self).stage_objects(objects)
+            }
+            fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
+                (**self).relabel(relabel)
+            }
+            fn health(&self) -> Health {
+                (**self).health()
+            }
+            fn recover(&self) -> Result<Option<Head>, StorageError> {
+                (**self).recover()
+            }
+            fn stats(&self) -> StoreStats {
+                (**self).stats()
+            }
+        }
+    )+};
 }
 
-impl<T: VersionedStore + ?Sized> VersionedStore for Arc<T> {
-    fn database_id(&self) -> DatabaseId {
-        (**self).database_id()
-    }
-    fn head(&self) -> Result<Option<Head>, StorageError> {
-        (**self).head()
-    }
-    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_record(table, key)
-    }
-    fn read_record_bounded(
-        &self,
-        table: Table,
-        key: &[u8],
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_record_bounded(table, key, max_bytes)
-    }
-    fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
-        (**self).commit(batch)
-    }
-    fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
-        (**self).stage_objects(objects)
-    }
-    fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
-        (**self).relabel(relabel)
-    }
-    fn health(&self) -> Health {
-        (**self).health()
-    }
-    fn recover(&self) -> Result<Option<Head>, StorageError> {
-        (**self).recover()
-    }
-    fn stats(&self) -> StoreStats {
-        (**self).stats()
-    }
-}
-
-impl<T: ObjectReader + ?Sized> ObjectReader for Box<T> {
-    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_object(space, id)
-    }
-    fn read_object_bounded(
-        &self,
-        space: SpaceId,
-        id: &ObjectId,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_object_bounded(space, id, max_bytes)
-    }
-}
-
-impl<T: VersionedStore + ?Sized> VersionedStore for Box<T> {
-    fn database_id(&self) -> DatabaseId {
-        (**self).database_id()
-    }
-    fn head(&self) -> Result<Option<Head>, StorageError> {
-        (**self).head()
-    }
-    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_record(table, key)
-    }
-    fn read_record_bounded(
-        &self,
-        table: Table,
-        key: &[u8],
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        (**self).read_record_bounded(table, key, max_bytes)
-    }
-    fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
-        (**self).commit(batch)
-    }
-    fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
-        (**self).stage_objects(objects)
-    }
-    fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
-        (**self).relabel(relabel)
-    }
-    fn health(&self) -> Health {
-        (**self).health()
-    }
-    fn recover(&self) -> Result<Option<Head>, StorageError> {
-        (**self).recover()
-    }
-    fn stats(&self) -> StoreStats {
-        (**self).stats()
-    }
-}
+forward_to_pointee!(Arc, Box);
 
 /// The result of [`reconcile`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1067,7 +994,6 @@ pub struct StatsRecorder {
 }
 
 impl StatsRecorder {
-    /// Creates zeroed counters.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1291,8 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn random_database_ids_differ() {
-        assert_ne!(DatabaseId::random(), DatabaseId::random());
+    fn database_id_displays_as_lowercase_hex() {
         assert_eq!(DatabaseId([0xa5; 16]).to_string(), "a5".repeat(16));
     }
 }

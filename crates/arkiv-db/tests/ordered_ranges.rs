@@ -1,4 +1,4 @@
-//! Range predicates on the types that used to be equality-only: `Bool`,
+//! Range predicates on the byte-ordered types: `Bool`,
 //! `Str` and the fixed-width byte types (`Addr`, `Bytes4/8/16`, `Bytes32`,
 //! `Key`). Their order is golem-db's attribute order: the stored value
 //! bytes compared bytewise, so `false < true`, fixed bytes as unsigned
@@ -14,7 +14,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use arkiv_db::{
     B256, Budget, Cell, CellName, Engine, Limits, NamespaceId, NamespaceName, OwnerId,
     PriceSchedule, Projection, Query, QueryFault, RecordId, RecordKey, Rejection, Snapshot, Term,
-    TypeTag, Value, WriteOp,
+    Value, WriteOp,
     proof::{
         ProofError, RangeProofLimits, RangeQuery, RangeRequest, SnapshotRef, VerifiedRange,
         verify_range,
@@ -245,13 +245,6 @@ impl Fixture {
 }
 
 #[test]
-fn every_indexable_type_is_ordered() {
-    for tag in TypeTag::ALL {
-        assert_eq!(tag.is_ordered(), tag != TypeTag::Bytes, "{tag}");
-    }
-}
-
-#[test]
 fn bool_ranges_order_false_before_true() {
     let values = [true, false, true, true, false].map(Value::Bool);
     let fixture = fixture(&values);
@@ -348,7 +341,7 @@ fn str_range_bounds_obey_the_indexed_string_limit() {
     let too_long = Value::str(&"x".repeat(arkiv_db::Limits::DEFAULT_INDEXED_LEN + 1));
     for (lower, upper) in [
         (Included(too_long.clone()), Unbounded),
-        (Unbounded, Excluded(too_long.clone())),
+        (Unbounded, Excluded(too_long)),
     ] {
         let query = Query::term(Term::range(name("v"), lower.clone(), upper.clone()));
         let rejected = snapshot

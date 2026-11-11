@@ -47,7 +47,7 @@ pub enum Retention {
     #[default]
     Archive,
     /// Serve only the head and the `w` snapshots before it. `Window(0)` is
-    /// head-only, like golem-db today.
+    /// head-only.
     Window(u64),
 }
 

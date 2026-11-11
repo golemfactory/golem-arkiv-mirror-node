@@ -1,4 +1,5 @@
 //! Closed, payload-free explorer DTOs. Canonical bodies and proofs use separate endpoints.
+
 use super::{Error, Result};
 use arkiv_db::{B256, Decode, Encode, decode_exact, encode};
 use serde::{Deserialize, Serialize};
@@ -13,15 +14,19 @@ pub const READ_CONCURRENCY: usize = 4;
 pub fn hex(bytes: &[u8]) -> String {
     crate::demo::wire::hex(bytes)
 }
+
 pub fn unhex(s: &str, cap: usize) -> Result<Vec<u8>> {
     crate::demo::wire::unhex(s, cap).map_err(|_| Error("InvalidRequest"))
 }
+
 pub fn number(s: &str) -> Result<u64> {
     crate::demo::wire::number(s).map_err(|_| Error("InvalidRequest"))
 }
+
 pub fn pack(v: &impl Encode) -> String {
     hex(&encode(v))
 }
+
 pub fn unpack<T: Decode>(s: &str, cap: usize) -> Result<T> {
     decode_exact(&unhex(s, cap)?).map_err(|e| {
         Error(
@@ -33,6 +38,7 @@ pub fn unpack<T: Decode>(s: &str, cap: usize) -> Result<T> {
         )
     })
 }
+
 pub fn hash(s: &str) -> Result<B256> {
     let b = unhex(s, 32)?;
     if b.len() != 32 {
@@ -40,12 +46,14 @@ pub fn hash(s: &str) -> Result<B256> {
     }
     Ok(B256::from_slice(&b))
 }
+
 pub fn json_bytes(v: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
     // Serialize into a bounded sink, stopping before a candidate can grow beyond policy.
     struct Sink {
         bytes: Vec<u8>,
         cap: usize,
     }
+
     impl std::io::Write for Sink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             if b.len() > self.cap.saturating_sub(self.bytes.len()) {
@@ -74,6 +82,7 @@ pub struct Identity {
     pub genesis_hash: String,
     pub chain_id: String,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HeaderDto {
@@ -86,6 +95,7 @@ pub struct HeaderDto {
     pub outcomes_digest: String,
     pub header_bytes: String,
 }
+
 impl HeaderDto {
     pub fn new(h: &crate::Header) -> Result<Self> {
         Ok(Self {
@@ -99,6 +109,7 @@ impl HeaderDto {
             header_bytes: pack(h),
         })
     }
+
     pub fn validate(&self, chain_id: u64) -> Result<crate::Header> {
         let h: crate::Header = unpack(&self.header_bytes, 156)?;
         if h.chain_id != chain_id || Self::new(&h)? != *self {
@@ -107,6 +118,7 @@ impl HeaderDto {
         Ok(h)
     }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptDto {
@@ -114,6 +126,7 @@ pub struct ReceiptDto {
     pub schedule_id: u32,
     pub spent_units: String,
 }
+
 impl From<&arkiv_db::Receipt> for ReceiptDto {
     fn from(r: &arkiv_db::Receipt) -> Self {
         Self {
@@ -123,6 +136,7 @@ impl From<&arkiv_db::Receipt> for ReceiptDto {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Transaction {
@@ -136,6 +150,7 @@ pub struct Transaction {
     /// Entity rent burned beside the gas fee, in wei (zero when failed).
     pub rent_wei: String,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Operation {
@@ -150,6 +165,7 @@ pub struct Operation {
     pub receipt: Option<ReceiptDto>,
     pub reason: Option<String>,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Attribute {
@@ -158,6 +174,7 @@ pub struct Attribute {
     pub value_type: String,
     pub value: serde_json::Value,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Field {
@@ -168,6 +185,7 @@ pub struct Field {
     pub digest: String,
     pub reference: Option<String>,
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -206,6 +224,7 @@ pub enum Change {
         key: String,
     },
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FeedBlock {
@@ -221,6 +240,7 @@ pub struct FeedBlock {
     pub changes: Vec<Change>,
     pub spent_units: String,
 }
+
 impl FeedBlock {
     pub fn new(
         id: &Identity,
@@ -243,6 +263,7 @@ impl FeedBlock {
         block.feed_digest = hex(block.digest()?.as_slice());
         Ok(block)
     }
+
     pub fn digest(&self) -> Result<B256> {
         let mut value = serde_json::to_value(self).map_err(|_| Error("InvalidRequest"))?;
         value
@@ -251,6 +272,7 @@ impl FeedBlock {
             .remove("feedDigest");
         metadata_digest(&value)
     }
+
     pub fn validate_digest(&self) -> Result<()> {
         if hash(&self.feed_digest)? != self.digest()? {
             return Err(Error("InvalidRequest"));
@@ -260,7 +282,7 @@ impl FeedBlock {
 }
 
 /// Whole-block metadata codec v1. JSON is transport only: explicit type tags,
-/// BE lengths/numbers, UTF-8 key ordering, depth64 and8MiB output bounds.
+/// BE lengths/numbers, UTF-8 key ordering, depth 64 and 8 MiB output bounds.
 pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
         if bytes.len() > (8 * 1024 * 1024usize).saturating_sub(out.len()) {
@@ -269,12 +291,14 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
         out.extend_from_slice(bytes);
         Ok(())
     }
+
     fn string(out: &mut Vec<u8>, s: &str) -> Result<()> {
         put(out, &[4])?;
         let n = u32::try_from(s.len()).map_err(|_| Error("CapacityReached"))?;
         put(out, &n.to_be_bytes())?;
         put(out, s.as_bytes())
     }
+
     fn write(
         out: &mut Vec<u8>,
         v: &serde_json::Value,
@@ -332,6 +356,7 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     write(&mut out, value, 0, &mut 0)?;
     Ok(out)
 }
+
 pub fn metadata_digest(value: &serde_json::Value) -> Result<B256> {
     Ok(arkiv_db::digest(
         "arkiv/simulator-feed-block/v1",
@@ -343,16 +368,6 @@ pub fn metadata_digest(value: &serde_json::Value) -> Result<B256> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProofRequest {
     pub request: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResolveRequest {
-    pub height: String,
-    pub namespace: String,
-    pub attribute: String,
-    pub value_type: String,
-    pub value: serde_json::Value,
-    pub limit: u32,
 }
 
 pub fn proof_limits() -> arkiv_db::proof::ProofLimits {

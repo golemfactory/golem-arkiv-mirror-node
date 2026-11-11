@@ -1,4 +1,6 @@
-//! Isolated Arkiv entity producer/full/light acceptance. No running service or network.
+//! Arkiv entity profile on the simulator stack: producer, full and light,
+//! in process (loopback HTTP only).
+
 use arkiv_db::{
     durable::Options,
     encode,
@@ -19,6 +21,7 @@ fn run() -> RunConfig {
         workload: Workload::default(),
     }
 }
+
 fn request(
     height: u64,
     name: &str,
@@ -36,6 +39,7 @@ fn request(
         cursor: None,
     }
 }
+
 fn inspect(host: &Host, light: &mut Light, r: &VerifiedRequest) -> serde_json::Value {
     let (q, p) = light.request(r).unwrap();
     let proof = host.proof(&q).unwrap();
@@ -59,6 +63,7 @@ fn inspect(host: &Host, light: &mut Light, r: &VerifiedRequest) -> serde_json::V
     ));
     value
 }
+
 #[test]
 fn lifecycle_history_full_replay_header_only_restart_and_typed_proofs() {
     let store = Arc::new(MemoryVersionedStore::new());
@@ -368,8 +373,14 @@ async fn http_light_inspection_is_typed_bounded_and_independently_verifiable() {
         assert!(c.get("verification").is_none());
     }
     for require_proof in [true, false] {
-        let mut body = serde_json::json!({"query":"((group = u64(1)))", "requireProof":require_proof,
-            "height":"3","namespace":"1","limit":2,"cursor":null});
+        let mut body = serde_json::json!({
+            "query": "((group = u64(1)))",
+            "requireProof": require_proof,
+            "height": "3",
+            "namespace": "1",
+            "limit": 2,
+            "cursor": null,
+        });
         let response = client
             .post(format!("{local}/sim/v1/query/text"))
             .json(&body)
@@ -407,8 +418,8 @@ async fn http_light_inspection_is_typed_bounded_and_independently_verifiable() {
     let response = client
         .post(format!("{source}/sim/v1/query/text"))
         .json(
-            &serde_json::json!({"query":"group = u64(1)","requireProof":true,
-            "height":"3","namespace":"1","limit":2}),
+            &serde_json::json!({"query":"group = u64(1)", "requireProof":true,
+            "height":"3", "namespace":"1", "limit":2}),
         )
         .send()
         .await
@@ -419,7 +430,7 @@ async fn http_light_inspection_is_typed_bounded_and_independently_verifiable() {
     let response = client
         .post(format!("{local}/sim/v1/query/text"))
         .json(&serde_json::json!({"query":"group = u64(1)",
-            "height":"3","namespace":"1","limit":2}))
+            "height":"3", "namespace":"1", "limit":2}))
         .send()
         .await
         .unwrap();
@@ -472,9 +483,18 @@ async fn text_query_reports_runtime_proof_limits_without_downgrade() {
             Runtime::new(Node::Light(Box::new(light)), Some(peer_url), None).unwrap(),
         );
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let response = reqwest::Client::new().post(format!("{url}/sim/v1/query/text"))
-            .json(&serde_json::json!({"query":"group = u64(1)","requireProof":false,"height":"3","namespace":"1","limit":2}))
-            .send().await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{url}/sim/v1/query/text"))
+            .json(&serde_json::json!({
+                "query": "group = u64(1)",
+                "requireProof": false,
+                "height": "3",
+                "namespace": "1",
+                "limit": 2,
+            }))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), 422);
         let error: serde_json::Value = response.json().await.unwrap();
         assert_eq!(error["classification"]["proof"]["status"], "supported");

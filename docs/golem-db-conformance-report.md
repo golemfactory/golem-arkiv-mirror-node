@@ -27,14 +27,14 @@ the harness patch, the scaled scenarios and the tests.
   exact `BranchInfo::version`, golem's genesis YAML, opening modes and
   `OpenInfo`, and golem's storage-error mapping with retry after a failed
   call.
-- **Ported golem API tests: 9 of 14 pass.** Every failure is either a
-  golem-internal system record (`#alloc`, `#recordKeys`, `#roots`) or a
-  read of an old commit, where golem returns `CommitUnavailable` and we
-  keep history and return the data. With `ARKIV_STATE_RETENTION=0` (head
-  only, see [pruning design](pruning-design.md)) the old-commit read is
-  `CommitUnavailable` too and only the system-record divergences remain.
-  All user-visible record, branch, opening and storage-failure behaviour
-  passes.
+- **Ported golem API tests: 9 of 14 pass.** All five failures are on
+  golem-internal system records (`#alloc`, `#recordKeys`, `#roots`), which
+  have no engine counterpart. The same five fail with the default archive
+  retention and with `ARKIV_STATE_RETENTION=0` (head only, see
+  [pruning design](pruning-design.md)); a read of an old commit, where golem
+  returns `CommitUnavailable`, differs only under archive retention, which
+  keeps history and returns the data. All user-visible record, branch,
+  opening and storage-failure behaviour passes.
 - **Adapter tests: 6 of 6 pass.** One of them runs seeded random scripts
   on golem-db itself and on both of our backends and finds no difference
   in any call's outcome or `BranchInfo`.

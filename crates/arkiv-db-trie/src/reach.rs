@@ -1,5 +1,4 @@
-//! Read-only reachability walks over committed maps, for storage reports
-//! and (later) the mark phase of history pruning.
+//! Read-only reachability walks over committed maps, for storage reports.
 use crate::{
     Link, MerkleMap, NodeBox, NodeLoader, ObjectId, TrieError, TrieKey, TrieValue, node::Node,
 };

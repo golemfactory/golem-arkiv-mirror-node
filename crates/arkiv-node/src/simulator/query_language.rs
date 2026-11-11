@@ -6,6 +6,7 @@
 //! on that repository. Parsing never rewrites Boolean trees or expands DNF.
 //! The source parser normalizes system block heights to U256; the selection
 //! adapter deliberately restores U64, as required by this engine's indexes.
+
 pub(crate) mod ast;
 pub(crate) mod error;
 pub(crate) mod lexer;
@@ -111,7 +112,8 @@ pub fn classify(input: &str) -> Classification {
                 ),
                 proof: capability(
                     false,
-                    "This expression cannot enter the proof path because language validation did not succeed.",
+                    "This expression cannot enter the proof path because language validation did \
+                     not succeed.",
                 ),
                 selection: None,
                 shape: "invalid".into(),
@@ -126,7 +128,8 @@ pub fn classify(input: &str) -> Classification {
         ),
         Query::All => (
             "all",
-            "The all-entity selector is valid, but this node exposes no complete all-entity query endpoint or proof.",
+            "The all-entity selector is valid, but this node exposes no complete all-entity query \
+             endpoint or proof.",
         ),
         Query::Gt { .. }
         | Query::Gte { .. }
@@ -134,28 +137,41 @@ pub fn classify(input: &str) -> Classification {
         | Query::Lte { .. }
         | Query::Between { .. } => (
             "range",
-            "Ranges are valid Arkiv queries, but this node exposes execution and proofs only for a single equality.",
+            "Ranges are valid Arkiv queries, but this node exposes execution and proofs only for \
+             a single equality.",
         ),
         Query::StartsWith { .. } => (
             "prefix",
-            "UTF-8 byte prefix predicates are valid, but this node does not expose prefix execution or completeness proofs.",
+            "UTF-8 byte prefix predicates are valid, but this node does not expose prefix \
+             execution or completeness proofs.",
         ),
         Query::And(..) => (
             "and",
-            "AND is valid, but conjunction execution and completeness proofs are not exposed by this node.",
+            "AND is valid, but conjunction execution and completeness proofs are not exposed by \
+             this node.",
         ),
         Query::Or(..) => (
             "or",
-            "OR is valid, but union execution and completeness proofs are not exposed by this node.",
+            "OR is valid, but union execution and completeness proofs are not exposed by this \
+             node.",
         ),
         Query::Not(..) => (
             "not",
-            "NOT is valid, but live-entity complement execution and completeness proofs are not exposed by this node.",
+            "NOT is valid, but live-entity complement execution and completeness proofs are not \
+             exposed by this node.",
         ),
     };
-    let mut notes = vec!["Classification describes capability, not proof verification. Snapshot availability and runtime proof limits are checked when executing.".into()];
+    let mut notes = vec![
+        "Classification describes capability, not proof verification. Snapshot availability \
+         and runtime proof limits are checked when executing."
+            .into(),
+    ];
     if contains_not(&tree) {
-        notes.push("NOT means the complement within all live entities, including entities missing the attribute or carrying another type. It is not typed inequality (!=).".into());
+        notes.push(
+            "NOT means the complement within all live entities, including entities missing the \
+             attribute or carrying another type. It is not typed inequality (!=)."
+                .into(),
+        );
     }
     let eligible = matches!(tree, Query::Eq { .. });
     let reason = explanation;

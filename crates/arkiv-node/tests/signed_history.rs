@@ -1,4 +1,5 @@
 //! Storage outcomes and trust boundaries for retained bodies and light headers.
+
 use alloy_primitives::keccak256;
 use arkiv_db::{
     B256, Budget, CellName, Engine, NamespaceId, Value, decode_exact, encode,
@@ -21,15 +22,18 @@ use arkiv_node::signed::{
 use std::sync::Arc;
 
 mod signed_support;
+
 fn signed_genesis() -> (SignedGenesis, Signer) {
     (
         signed_support::genesis(9003, 1000, [7; 16], 1, 100, &[1]),
         signed_support::signer(1),
     )
 }
+
 fn certificate(genesis: &SignedGenesis, signer: &Signer) -> SignedHeader {
     SignedHeader::sign(genesis, genesis.header(), signer).unwrap()
 }
+
 fn next(genesis: &SignedGenesis, signer: &Signer, parent: &SignedHeader, tag: u8) -> SignedHeader {
     let mut header = parent.header;
     header.height += 1;
@@ -38,11 +42,13 @@ fn next(genesis: &SignedGenesis, signer: &Signer, parent: &SignedHeader, tag: u8
     header.inputs_digest = B256::repeat_byte(tag);
     SignedHeader::sign(genesis, header, signer).unwrap()
 }
+
 fn conflict(genesis: &SignedGenesis, signer: &Signer, header: &SignedHeader) -> SignedHeader {
     let mut native = header.header;
     native.inputs_digest = B256::repeat_byte(0xee);
     SignedHeader::sign(genesis, native, signer).unwrap()
 }
+
 fn message<T>(result: arkiv_node::signed::Result<T>) -> &'static str {
     result.err().expect("expected rejection").0
 }
@@ -181,7 +187,7 @@ fn history_reference_codec_and_limits_are_exact_and_bounded() {
     for end in 0..encoded.len() {
         assert!(decode_exact::<BodyRef>(&encoded[..end]).is_err());
     }
-    let mut trailing = encoded.clone();
+    let mut trailing = encoded;
     trailing.push(0);
     assert!(decode_exact::<BodyRef>(&trailing).is_err());
     let invalid = BodyRef {

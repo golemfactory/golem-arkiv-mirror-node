@@ -21,6 +21,7 @@ fn fixture() -> (TrustConfig, SigningKey) {
         key,
     )
 }
+
 fn header_chain(trust: &TrustConfig, key: &SigningKey) -> HeaderChain {
     HeaderChain::new(
         trust.clone(),
@@ -29,6 +30,7 @@ fn header_chain(trust: &TrustConfig, key: &SigningKey) -> HeaderChain {
     )
     .unwrap()
 }
+
 #[test]
 fn empty_genesis_root_and_prepared_publication() {
     let (trust, _) = fixture();
@@ -55,6 +57,7 @@ fn empty_genesis_root_and_prepared_publication() {
     other.protocol_version += 1;
     assert!(ChainSpec::new(other).is_err());
 }
+
 #[test]
 fn literal_authentication_layout_vectors() {
     let (trust, key) = fixture();
@@ -114,6 +117,7 @@ fn literal_authentication_layout_vectors() {
     bad[3] = 2;
     assert!(decode_exact::<SignedHeader>(&bad).is_err());
 }
+
 #[test]
 fn signature_linkage_equivocation_and_false_root_trust_boundary() {
     let (trust, key) = fixture();
@@ -178,7 +182,7 @@ fn signature_linkage_equivocation_and_false_root_trust_boundary() {
         chain.accept(false_signed.clone()),
         Err(DemoError::ChainConflict)
     );
-    assert_eq!(chain.accept(valid.clone()), Err(DemoError::ChainConflict));
+    assert_eq!(chain.accept(valid), Err(DemoError::ChainConflict));
     assert_eq!(chain.conflicts().len(), 2);
     let mut false_body = body.clone();
     let mut block: arkiv_node::Block = wire::unpack(&body.block, wire::RESPONSE_CAP).unwrap();
@@ -210,10 +214,11 @@ fn signature_linkage_equivocation_and_false_root_trust_boundary() {
     assert_eq!(full.apply_body(tampered), Err(DemoError::InvalidHeader));
     assert_eq!(full.height(), 0);
 }
+
 #[test]
 fn unservable_candidate_and_capacity_never_publish() {
     let (trust, key) = fixture();
-    let mut producer = Node::producer(trust.clone(), key.clone(), 3, Some(7)).unwrap();
+    let mut producer = Node::producer(trust, key, 3, Some(7)).unwrap();
     producer.response_cap = 1;
     assert_eq!(
         producer.produce().unwrap_err(),
@@ -234,6 +239,7 @@ fn unservable_candidate_and_capacity_never_publish() {
     assert!(producer.chain.as_ref().unwrap().snapshot(0).is_some());
     assert!(producer.chain.as_ref().unwrap().snapshot(1).is_some());
 }
+
 #[test]
 fn strict_wire_unknown_fields_versions_hex_and_decimal() {
     assert!(

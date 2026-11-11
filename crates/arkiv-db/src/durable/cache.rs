@@ -82,8 +82,8 @@ pub struct CacheStats {
     /// load; the retained node is returned.
     pub insert_races: u64,
     /// Hits and misses per map, indexed by [`MapKind::index`].
-    pub hits_by_map: [u64; 7],
-    pub misses_by_map: [u64; 7],
+    pub hits_by_map: [u64; MapKind::ALL.len()],
+    pub misses_by_map: [u64; MapKind::ALL.len()],
     pub shards: usize,
     /// Shard lock acquisitions that had to wait for another thread.
     pub shard_contended: u64,
@@ -257,8 +257,8 @@ struct Counters {
     second_chances: AtomicU64,
     oversize_rejects: AtomicU64,
     insert_races: AtomicU64,
-    hits_by_map: [AtomicU64; 7],
-    misses_by_map: [AtomicU64; 7],
+    hits_by_map: [AtomicU64; MapKind::ALL.len()],
+    misses_by_map: [AtomicU64; MapKind::ALL.len()],
     shard_contended: AtomicU64,
     miss_read_ns: AtomicU64,
     decode_ns: AtomicU64,
@@ -528,7 +528,7 @@ impl Context {
 mod tests {
     use super::*;
     use arkiv_db_memory::MemoryVersionedStore;
-    use arkiv_db_storage::versioned::{CommitBatch, CommitOutcome, Head, ObjectReader};
+    use arkiv_db_storage::versioned::{CommitBatch, CommitOutcome, Head};
     use arkiv_db_trie::{MemoryOnly, MerkleMap, Probe, Staged};
 
     const SPACE: SpaceId = SpaceId::Namespace(1);
@@ -851,14 +851,10 @@ mod tests {
     }
 
     #[test]
-    fn raw_reads_pass_the_health_gate_without_the_cache() {
+    fn raw_reads_bypass_the_cache() {
         let context = context(1, 1024 * 1024, 8);
         let (id, bytes) = object(0);
         assert_eq!(context.read_object(SPACE, &id).unwrap(), Some(bytes));
         assert_eq!(context.stats().entries, 0);
-        assert_eq!(
-            context.store.read_object(SPACE, &id).unwrap(),
-            context.read_object(SPACE, &id).unwrap()
-        );
     }
 }

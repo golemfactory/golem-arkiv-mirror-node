@@ -6,11 +6,13 @@ use std::{
 };
 
 use crate::versioned::{
-    CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, SpaceId,
+    CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, Relabel, SpaceId,
     StorageError, StorageErrorKind, StoreStats, Table, VersionedStore,
 };
 
-/// A commit fault, consumed by the next [`VersionedStore::commit`].
+/// A fault consumed by the next write: [`VersionedStore::commit`],
+/// [`stage_objects`](VersionedStore::stage_objects) or
+/// [`relabel`](VersionedStore::relabel).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitFault {
     /// Refuse before anything is applied: `NotCommitted(kind)`, as when the
@@ -43,7 +45,7 @@ pub enum DiskFull {
     DuringCommit,
 }
 
-/// Which reads a [`ReadFault`] fails.
+/// Which reads [`FaultyStore::fail_reads`] fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadScope {
     /// Object reads in every space.
@@ -54,18 +56,15 @@ pub enum ReadScope {
     Records,
     /// Head reads.
     Head,
-    /// Every read: objects, records and head.
-    Everything,
 }
 
 impl ReadScope {
     fn covers(self, target: ReadTarget) -> bool {
         match (self, target) {
-            (ReadScope::Everything, _) => true,
-            (ReadScope::AllObjects, ReadTarget::Object(_)) => true,
             (ReadScope::Space(space), ReadTarget::Object(read)) => space == read,
-            (ReadScope::Records, ReadTarget::Record) => true,
-            (ReadScope::Head, ReadTarget::Head) => true,
+            (ReadScope::AllObjects, ReadTarget::Object(_))
+            | (ReadScope::Records, ReadTarget::Record)
+            | (ReadScope::Head, ReadTarget::Head) => true,
             _ => false,
         }
     }
@@ -78,26 +77,21 @@ enum ReadTarget {
     Head,
 }
 
-/// A read fault: fails matching reads with `kind`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadFault {
-    /// The reads it applies to.
-    pub scope: ReadScope,
-    /// The error kind returned.
-    pub kind: StorageErrorKind,
-    /// How many more reads fail; `None` until
-    /// [`FaultyStore::clear_read_faults`].
-    pub remaining: Option<u64>,
+/// Fails matching reads with `kind`: `remaining` more of them, or all of
+/// them until cleared if `None`.
+#[derive(Clone, Copy, Debug)]
+struct ReadFault {
+    scope: ReadScope,
+    kind: StorageErrorKind,
+    remaining: Option<u64>,
 }
 
 /// What a [`FaultyStore`] has injected so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FaultCounters {
-    /// Reads failed by a [`ReadFault`].
+    /// Reads failed by an injected read fault.
     pub reads_failed: u64,
-    /// Commits answered by an injected fault (including disk full).
-    pub commits_faulted: u64,
-    /// Of those, commits the inner store actually applied.
+    /// Writes the inner store applied although a fault was reported.
     pub commits_applied: u64,
     /// Recoveries failed on purpose.
     pub recoveries_failed: u64,
@@ -156,39 +150,22 @@ impl FaultState {
 
 /// A [`VersionedStore`] wrapper that injects failures.
 ///
-/// Without armed faults every call is forwarded unchanged, so a wrapped store
-/// passes the whole behavioural [contract](crate::testing::contract).
-///
-/// Faults:
-///
-/// - read faults ([`ReadFault`]) for object reads (all spaces or one
-///   space), record reads and head reads, for a number of calls or until
-///   cleared;
-/// - commit faults ([`CommitFault`]), consumed one per commit:
-///   `NotCommitted` before apply, `Indeterminate` after apply (the commit did
-///   happen) and without apply, and a lost acknowledgement;
-/// - disk full ([`FaultyStore::set_disk_full`]): while set, every commit
-///   fails with `Full` and applies nothing, either before the commit starts
-///   (`NotCommitted`) or inside it (`Indeterminate`), see [`DiskFull`];
-/// - failed recoveries ([`FaultyStore::fail_next_recoveries`]).
+/// Faults are armed with the `fail_*`, `push_*` and `set_*` methods; with
+/// none armed every call is forwarded unchanged, so a wrapped store passes
+/// the behavioural [contract](crate::testing::contract).
 ///
 /// **Latching mode** ([`FaultyStore::latching`]) follows `RedbStore`'s rule
-/// (crate `arkiv-db-redb`), so a caller tested against it meets the same
-/// health changes as against the disk store:
+/// (the `error` module of crate `arkiv-db-redb`), so a caller tested against
+/// it meets the same health changes as against the disk store: an injected
+/// `Io` or `Full` failure of a read or of a staged write latches, an
+/// injected `Indeterminate` outcome latches whatever its kind, a failed
+/// recovery latches its own error in place of any earlier one, and a lost
+/// acknowledgement never latches.
+/// [`set_latch_corrupt`](FaultyStore::set_latch_corrupt) also latches
+/// `Corrupt`, which the contract allows and redb does not do.
 ///
-/// - an injected `Io` or `Full` failure of a read or of a staged commit
-///   (`NotCommitted`, disk full before the commit) latches; `Corrupt` and
-///   every other kind do not, unless
-///   [`set_latch_corrupt`](FaultyStore::set_latch_corrupt) turns `Corrupt`
-///   latching on (the contract allows a store to latch it; redb does not);
-/// - an injected `Indeterminate` outcome latches whatever its kind, as any
-///   error of redb's `commit()` does;
-/// - an injected recovery failure latches the recovery's error in place of
-///   any earlier one, as a `RedbStore` whose reopen failed has no handle;
-/// - a lost acknowledgement never latches.
-///
-/// Once latched, every call — reads included — returns the latched error
-/// (commits as `NotCommitted`) and [`health`](VersionedStore::health) is
+/// Once latched, every call, reads included, returns the latched error
+/// (writes as `NotCommitted`) and [`health`](VersionedStore::health) is
 /// `Failed`, until [`recover`](VersionedStore::recover) succeeds. Without
 /// latching, faults are one-shot and health is the inner store's.
 #[derive(Debug)]
@@ -233,8 +210,8 @@ impl<S: VersionedStore> FaultyStore<S> {
         self.lock().latch_corrupt = latch;
     }
 
-    /// Queues a fault for a later commit; faults are consumed in order, one
-    /// per commit.
+    /// Queues a fault for a later write; faults are consumed in order, one
+    /// per `commit`, `stage_objects` or `relabel`.
     pub fn push_commit_fault(&self, fault: CommitFault) {
         self.lock().commit_faults.push_back(fault);
     }
@@ -256,7 +233,7 @@ impl<S: VersionedStore> FaultyStore<S> {
     }
 
     /// Sets the disk-full condition (`None` clears it): while set, every
-    /// commit fails with `Full` where `full` says, applying nothing.
+    /// write fails with `Full` where `full` says, applying nothing.
     pub fn set_disk_full(&self, full: Option<DiskFull>) {
         self.lock().disk_full = full;
     }
@@ -272,15 +249,6 @@ impl<S: VersionedStore> FaultyStore<S> {
     /// Latches `error` directly, as if an injected fault had produced it.
     pub fn latch(&self, error: StorageError) {
         self.lock().latched = Some(error);
-    }
-
-    /// Removes every armed fault (the latch, if any, stays).
-    pub fn clear_faults(&self) {
-        let mut state = self.lock();
-        state.commit_faults.clear();
-        state.read_faults.clear();
-        state.disk_full = None;
-        state.recover_failures = 0;
     }
 
     /// What has been injected so far.
@@ -311,6 +279,61 @@ impl<S: VersionedStore> FaultyStore<S> {
         state.counters.reads_failed += 1;
         let error = StorageError::new(kind, format!("injected {target:?} read fault"));
         Err(state.fail(error))
+    }
+
+    /// Runs one write of the inner store behind the latch, the disk-full
+    /// condition and the commit-fault queue.
+    fn write(&self, apply: impl FnOnce(&S) -> CommitOutcome) -> CommitOutcome {
+        let fault = {
+            let mut state = self.lock();
+            if let Some(error) = state.latched() {
+                return CommitOutcome::NotCommitted(error);
+            }
+            match state.disk_full {
+                Some(DiskFull::BeforeCommit) => {
+                    Some(CommitFault::NotCommitted(StorageErrorKind::Full))
+                }
+                Some(DiskFull::DuringCommit) => {
+                    Some(CommitFault::IndeterminateNotApplied(StorageErrorKind::Full))
+                }
+                None => state.commit_faults.pop_front(),
+            }
+        };
+        let Some(fault) = fault else {
+            return apply(&self.inner);
+        };
+        let injected = |kind: StorageErrorKind, what: &str| {
+            StorageError::new(kind, format!("injected commit fault: {what}"))
+        };
+        match fault {
+            CommitFault::NotCommitted(kind) => {
+                let error = injected(kind, "not committed");
+                CommitOutcome::NotCommitted(self.lock().fail(error))
+            }
+            CommitFault::IndeterminateNotApplied(kind) => {
+                let error = injected(kind, "indeterminate, not applied");
+                CommitOutcome::Indeterminate(self.lock().fail_indeterminate(error))
+            }
+            CommitFault::IndeterminateApplied(kind) => match apply(&self.inner) {
+                CommitOutcome::Committed => {
+                    let mut state = self.lock();
+                    state.counters.commits_applied += 1;
+                    let error = injected(kind, "indeterminate, applied");
+                    CommitOutcome::Indeterminate(state.fail_indeterminate(error))
+                }
+                other => other,
+            },
+            CommitFault::AckLost => match apply(&self.inner) {
+                CommitOutcome::Committed => {
+                    self.lock().counters.commits_applied += 1;
+                    CommitOutcome::Indeterminate(injected(
+                        StorageErrorKind::Io,
+                        "acknowledgement lost",
+                    ))
+                }
+                other => other,
+            },
+        }
     }
 }
 
@@ -357,59 +380,15 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
     }
 
     fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
-        let fault = {
-            let mut state = self.lock();
-            if let Some(error) = state.latched() {
-                return CommitOutcome::NotCommitted(error);
-            }
-            match state.disk_full {
-                Some(DiskFull::BeforeCommit) => {
-                    Some(CommitFault::NotCommitted(StorageErrorKind::Full))
-                }
-                Some(DiskFull::DuringCommit) => {
-                    Some(CommitFault::IndeterminateNotApplied(StorageErrorKind::Full))
-                }
-                None => state.commit_faults.pop_front(),
-            }
-        };
-        let Some(fault) = fault else {
-            return self.inner.commit(batch);
-        };
-        let injected = |kind: StorageErrorKind, what: &str| {
-            let mut state = self.lock();
-            state.counters.commits_faulted += 1;
-            StorageError::new(kind, format!("injected commit fault: {what}"))
-        };
-        match fault {
-            CommitFault::NotCommitted(kind) => {
-                let error = injected(kind, "not committed");
-                CommitOutcome::NotCommitted(self.lock().fail(error))
-            }
-            CommitFault::IndeterminateNotApplied(kind) => {
-                let error = injected(kind, "indeterminate, not applied");
-                CommitOutcome::Indeterminate(self.lock().fail_indeterminate(error))
-            }
-            CommitFault::IndeterminateApplied(kind) => match self.inner.commit(batch) {
-                CommitOutcome::Committed => {
-                    self.lock().counters.commits_applied += 1;
-                    let error = injected(kind, "indeterminate, applied");
-                    CommitOutcome::Indeterminate(self.lock().fail_indeterminate(error))
-                }
-                other => other,
-            },
-            CommitFault::AckLost => match self.inner.commit(batch) {
-                CommitOutcome::Committed => {
-                    let mut state = self.lock();
-                    state.counters.commits_faulted += 1;
-                    state.counters.commits_applied += 1;
-                    CommitOutcome::Indeterminate(StorageError::new(
-                        StorageErrorKind::Io,
-                        "injected commit fault: acknowledgement lost",
-                    ))
-                }
-                other => other,
-            },
-        }
+        self.write(|inner| inner.commit(batch))
+    }
+
+    fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
+        self.write(|inner| inner.stage_objects(objects))
+    }
+
+    fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
+        self.write(|inner| inner.relabel(relabel))
     }
 
     fn health(&self) -> Health {

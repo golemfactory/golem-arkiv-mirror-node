@@ -1,15 +1,18 @@
 //! Independent state-format-2 leaf construction over the logical block model.
 //! No engine codec/layout/digest or trie implementation under test is used.
+
 use super::{CellKind, Model, Value, Weights};
 use alloy_primitives::{B256, keccak256};
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "../../../arkiv-db-trie/tests/support/mod.rs"]
 mod trie_support;
+
 fn bytes(b: &[u8]) -> Vec<u8> {
     let mut v = (b.len() as u32).to_be_bytes().to_vec();
     v.extend(b);
     v
 }
+
 /// Escaped (`00 → 01 01`, `01 → 01 02`) and `00`-terminated.
 fn escaped(b: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -23,6 +26,7 @@ fn escaped(b: &[u8]) -> Vec<u8> {
     v.push(0);
     v
 }
+
 fn tag(v: &Value) -> u8 {
     match v {
         Value::Bool(_) => 1,
@@ -33,6 +37,7 @@ fn tag(v: &Value) -> u8 {
         _ => panic!("scalar outside the root fixture"),
     }
 }
+
 fn value(v: &Value) -> Vec<u8> {
     let mut b = vec![tag(v)];
     match v {
@@ -42,6 +47,7 @@ fn value(v: &Value) -> Vec<u8> {
     };
     b
 }
+
 fn term_value(v: &Value) -> Vec<u8> {
     match v {
         Value::Bool(v) => vec![u8::from(*v)],
@@ -52,6 +58,7 @@ fn term_value(v: &Value) -> Vec<u8> {
         _ => panic!("scalar outside the root fixture"),
     }
 }
+
 /// `escaped(name) ‖ tag ‖ presence ‖ value`; a `Str` value (tag 2) is its
 /// bytes plus one and a `00` terminator, a scalar its term bytes.
 fn term(name: &str, t: u8, v: Option<Vec<u8>>) -> Vec<u8> {
@@ -68,11 +75,13 @@ fn term(name: &str, t: u8, v: Option<Vec<u8>>) -> Vec<u8> {
     }
     b
 }
+
 fn handle(m: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
     let mut b = trie_support::reference::root(m).to_vec();
     b.extend((m.len() as u64).to_be_bytes());
     b
 }
+
 fn schedule(w: Weights) -> Vec<u8> {
     let mut b = w.id.to_be_bytes().to_vec();
     b.extend(31u32.to_be_bytes());
@@ -113,6 +122,7 @@ fn schedule(w: Weights) -> Vec<u8> {
     }
     b
 }
+
 pub(super) fn root(model: &Model) -> B256 {
     let mut catalog = BTreeMap::new();
     for (id, ns) in &model.namespaces {

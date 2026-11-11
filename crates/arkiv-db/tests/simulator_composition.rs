@@ -198,9 +198,7 @@ fn host_publication_is_atomic_lazy_and_profile_separated() {
     assert_eq!(e.simulator_block(0).unwrap().bytes, [0; 8]);
     let mut wrong = identity();
     wrong.source_id[0] ^= 1;
-    assert!(
-        DurableEngine::open_simulator(store.clone(), genesis(), Options::default(), wrong).is_err()
-    );
+    assert!(DurableEngine::open_simulator(store, genesis(), Options::default(), wrong).is_err());
     let ordinary = Arc::new(MemoryVersionedStore::new());
     DurableEngine::initialize(ordinary.clone(), genesis(), Options::default()).unwrap();
     assert!(
@@ -271,7 +269,7 @@ fn packet_caps_identity_and_state_association_fail_before_commit() {
     let mut p = base.clone();
     p.inclusions[0].value = vec![0; 1025];
     variants.push(p);
-    let mut p = base.clone();
+    let mut p = base;
     p.bytes = vec![0; BLOCK_MAX_BYTES - BLOCK_FRAMING_BYTES + 1];
     variants.push(p);
     for p in variants {
@@ -287,7 +285,7 @@ fn packet_caps_identity_and_state_association_fail_before_commit() {
     let cap = 600;
     drop(e);
     let mut e = DurableEngine::open_simulator(
-        store.clone(),
+        store,
         genesis(),
         Options {
             prepare_bytes: cap,
@@ -873,7 +871,9 @@ fn prefilled_genesis_open_checks_height_zero_root_even_under_later_head() {
     drop(overrides);
     let error =
         DurableEngine::open_simulator(store, g, Options::default(), identity()).unwrap_err();
-    assert!(
-        matches!(error, DurableError::Storage(StorageError { kind: StorageErrorKind::Corrupt, detail }) if detail.contains("configured initial state"))
-    );
+    let DurableError::Storage(error) = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(error.kind, StorageErrorKind::Corrupt);
+    assert!(error.detail.contains("configured initial state"));
 }

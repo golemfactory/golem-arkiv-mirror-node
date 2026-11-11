@@ -8,22 +8,7 @@
 //! entities takes seconds, a key lookup reads a few dozen objects and
 //! status, `eth_blockNumber`, admission and empty blocks read none. (A
 //! match-all count is answered from the stored row count.)
-//!
-//! What this file establishes:
-//! - While a heavy count runs, status, `eth_blockNumber`, a key lookup and
-//!   block production answer promptly; the count returns the entity count
-//!   of the height it was admitted at.
-//! - With every read permit taken, another detached read is refused at once
-//!   with `ServerBusy` (JSON-RPC code -32010 and HTTP 429 for a single
-//!   request, per-entry in a batch; REST 429), while transaction admission
-//!   and production proceed.
-//! - A read past its deadline is answered `ReadDeadlineExceeded`, and one
-//!   whose client disconnects is abandoned; either way the walk stops at its
-//!   next charge and releases its permit long before it would have finished.
-//! - Concurrent reads while blocks are produced each see one published
-//!   height: every query page and count equals the in-lock read of the
-//!   height it reports, and unpinned counts equal the count of some height.
-//! - Cursor pages of concurrent walks join to the single-page result.
+
 use alloy_primitives::U256;
 use arkiv_db::{CellName, Value as DbValue, durable::Options};
 use arkiv_db_memory::MemoryVersionedStore;
@@ -72,6 +57,7 @@ struct SlowStore {
     delay_us: AtomicU64,
     namespace_reads: AtomicU64,
 }
+
 impl SlowStore {
     fn slow(&self, space: SpaceId) {
         if matches!(space, SpaceId::Namespace(_)) {
@@ -82,15 +68,18 @@ impl SlowStore {
             }
         }
     }
+
     fn reads(&self) -> u64 {
         self.namespace_reads.load(Relaxed)
     }
 }
+
 impl ObjectReader for SlowStore {
     fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
         self.slow(space);
         self.inner.read_object(space, id)
     }
+
     fn read_object_bounded(
         &self,
         space: SpaceId,
@@ -101,16 +90,20 @@ impl ObjectReader for SlowStore {
         self.inner.read_object_bounded(space, id, max_bytes)
     }
 }
+
 impl VersionedStore for SlowStore {
     fn database_id(&self) -> DatabaseId {
         self.inner.database_id()
     }
+
     fn head(&self) -> Result<Option<Head>, StorageError> {
         self.inner.head()
     }
+
     fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.inner.read_record(table, key)
     }
+
     fn read_record_bounded(
         &self,
         table: Table,
@@ -119,18 +112,23 @@ impl VersionedStore for SlowStore {
     ) -> Result<Option<Vec<u8>>, StorageError> {
         self.inner.read_record_bounded(table, key, max_bytes)
     }
+
     fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
         self.inner.commit(batch)
     }
+
     fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
         self.inner.stage_objects(objects)
     }
+
     fn health(&self) -> Health {
         self.inner.health()
     }
+
     fn recover(&self) -> Result<Option<Head>, StorageError> {
         self.inner.recover()
     }
+
     fn stats(&self) -> StoreStats {
         self.inner.stats()
     }
@@ -139,10 +137,12 @@ impl VersionedStore for SlowStore {
 fn signer() -> Signer {
     Signer::from_bytes([1; 32]).unwrap()
 }
+
 fn creator() -> [u8; 20] {
     *signer().address().as_bytes()
 }
-/// Prefilled entity `n`: attribute `n` holds `n % 4`.
+
+/// The key of prefilled entity `nonce`.
 fn entity_key(nonce: u64) -> [u8; 32] {
     derive_entity_key(CHAIN, &creator(), nonce, nonce as u128)
 }
@@ -153,15 +153,18 @@ struct Node2 {
     public: Server,
     private: Server,
 }
+
 struct Server {
     url: String,
     task: tokio::task::JoinHandle<()>,
 }
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
+
 async fn serve(router: axum::Router) -> Server {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", socket.local_addr().unwrap());
@@ -249,6 +252,7 @@ async fn node(limits: ReadLimits) -> Node2 {
         private,
     }
 }
+
 fn limits(concurrency: usize, deadline_secs: u64) -> ReadLimits {
     ReadLimits {
         concurrency,
@@ -285,12 +289,15 @@ fn create(genesis: &SignedGenesis, nonce: u64, value: u64) -> SignedTx {
     };
     SignedTx::sign(genesis, nonce, tx, &signer()).unwrap()
 }
+
 fn genesis_of(rt: &Shared) -> SignedGenesis {
     rt.node.lock().unwrap().genesis().clone()
 }
+
 fn head(rt: &Shared) -> u64 {
     rt.node.lock().unwrap().head().height
 }
+
 /// Submits a create and produces the block holding it, through the API.
 async fn produce_create(
     client: &reqwest::Client,
@@ -302,6 +309,7 @@ async fn produce_create(
     submit(client, node, genesis, nonce, value).await;
     step(client, node).await;
 }
+
 async fn submit(
     client: &reqwest::Client,
     node: &Node2,
@@ -313,6 +321,7 @@ async fn submit(
     let url = format!("{}/signed/v1/transactions", node.public.url);
     until_admitted(|| client.post(&url).json(&body)).await;
 }
+
 async fn step(client: &reqwest::Client, node: &Node2) {
     let url = format!("{}/signed/v1/control", node.private.url);
     until_admitted(|| {
@@ -323,8 +332,9 @@ async fn step(client: &reqwest::Client, node: &Node2) {
     })
     .await;
 }
-/// Writers take the node lock without waiting, as before detached reads,
-/// and answer `ServerBusy` while any request holds it; clients retry.
+
+/// Writers answer `ServerBusy` while a request holds the node lock; clients
+/// retry.
 async fn until_admitted(request: impl Fn() -> reqwest::RequestBuilder) {
     let started = Instant::now();
     loop {
@@ -349,11 +359,13 @@ async fn rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -
     let status = response.status().as_u16();
     (status, response.json().await.unwrap())
 }
+
 async fn timed<T>(f: impl std::future::Future<Output = T>) -> (T, Duration) {
     let started = Instant::now();
     let value = f.await;
     (value, started.elapsed())
 }
+
 async fn wait_for(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
     let started = Instant::now();
     while !condition() {
@@ -361,14 +373,17 @@ async fn wait_for(what: &str, limit: Duration, mut condition: impl FnMut() -> bo
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
 /// The parameters of a count whose walk loads and probes every live row.
 fn heavy_count() -> Value {
     json!([{"query":"NOT (n STARTSWITH str('x'))"}])
 }
+
 fn key_query(nonce: u64) -> String {
     format!("$key = key({})", hex(&entity_key(nonce)))
 }
-/// The same read served the old way: planned and run under the node lock.
+
+/// The reference answer: the same read planned and run under the node lock.
 fn in_lock(rt: &Shared, method: &str, params: Value) -> Value {
     let node = rt.node.lock().unwrap();
     let Node::Full(host) = &*node else {
@@ -489,15 +504,22 @@ async fn saturated_reads_are_refused_at_once_without_blocking_writes() {
         assert_eq!(code, 429);
         assert_eq!(
             busy,
-            json!({"jsonrpc":"2.0","id":1,"error":{"code":arkiv_node::signed::rpc::SERVER_BUSY_CODE,"message":"ServerBusy"}})
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": arkiv_node::signed::rpc::SERVER_BUSY_CODE,
+                    "message": "ServerBusy",
+                },
+            })
         );
         assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
     let batch: Value = client
         .post(&node.public.url)
         .json(&json!([
-            {"jsonrpc":"2.0","id":1,"method":"arkiv_getEntityCount","params":[]},
-            {"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]}
+            {"jsonrpc":"2.0", "id":1, "method":"arkiv_getEntityCount", "params":[]},
+            {"jsonrpc":"2.0", "id":2, "method":"eth_blockNumber", "params":[]}
         ]))
         .send()
         .await
@@ -594,7 +616,12 @@ async fn deadlines_and_departed_clients_stop_the_walk() {
     stream
         .write_all(
             format!(
-                "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST / HTTP/1.1\r\n\
+                 Host: {address}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
                 body.len()
             )
             .as_bytes(),

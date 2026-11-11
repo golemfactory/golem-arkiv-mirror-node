@@ -1,4 +1,5 @@
 //! Pinned single-producer development authentication; not consensus.
+
 use super::{DemoError, Result};
 use crate::{ChainSpec, Genesis, Header, validate};
 use arkiv_db::{B256, Decode, DecodeError, Decoder, Encode, Encoder, decode_exact, digest, encode};
@@ -18,6 +19,7 @@ fn version(d: &mut Decoder<'_>, kind: &'static str) -> std::result::Result<(), D
     }
     Ok(())
 }
+
 impl Encode for TrustConfig {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(1);
@@ -26,6 +28,7 @@ impl Encode for TrustConfig {
         e.fixed(&self.public_key);
     }
 }
+
 impl Decode for TrustConfig {
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
         version(d, "TrustConfigV1")?;
@@ -36,6 +39,7 @@ impl Decode for TrustConfig {
         })
     }
 }
+
 impl TrustConfig {
     pub fn validate(&self) -> Result<ChainSpec> {
         let spec = ChainSpec::new(self.genesis.clone()).map_err(|_| DemoError::InvalidHeader)?;
@@ -53,6 +57,7 @@ pub struct SignedHeader {
     pub header: Header,
     pub signature: [u8; 64],
 }
+
 impl Encode for SignedHeader {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(1);
@@ -61,6 +66,7 @@ impl Encode for SignedHeader {
         e.fixed(&self.signature);
     }
 }
+
 impl Decode for SignedHeader {
     const MIN_ENCODED_LEN: usize = 4 + 32 + 156 + 64;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -72,6 +78,7 @@ impl Decode for SignedHeader {
         })
     }
 }
+
 pub fn signing_message(genesis_hash: B256, header: &Header) -> B256 {
     let mut e = Encoder::new();
     e.u32(1);
@@ -79,6 +86,7 @@ pub fn signing_message(genesis_hash: B256, header: &Header) -> B256 {
     e.put(&header.hash());
     digest("arkiv/demo-sign/v1", &e.into_bytes())
 }
+
 impl SignedHeader {
     pub fn sign(genesis_hash: B256, header: Header, key: &SigningKey) -> Self {
         Self {
@@ -89,6 +97,7 @@ impl SignedHeader {
                 .to_bytes(),
         }
     }
+
     pub fn authenticate(&self, trust: &TrustConfig) -> Result<()> {
         if self.genesis_hash != trust.genesis_hash || self.header.chain_id != trust.genesis.chain_id
         {
@@ -113,6 +122,7 @@ pub struct HeaderChain {
     conflicts: Vec<SignedHeader>,
     capacity: usize,
 }
+
 impl HeaderChain {
     pub fn new(trust: TrustConfig, genesis: SignedHeader, capacity: usize) -> Result<Self> {
         let spec = trust.validate()?;
@@ -128,18 +138,23 @@ impl HeaderChain {
             capacity,
         })
     }
+
     pub fn trust(&self) -> &TrustConfig {
         &self.trust
     }
+
     pub fn head(&self) -> &SignedHeader {
         self.headers.last().expect("genesis")
     }
+
     pub fn at(&self, height: u64) -> Option<&SignedHeader> {
         self.headers.get(usize::try_from(height).ok()?)
     }
+
     pub fn conflicts(&self) -> &[SignedHeader] {
         &self.conflicts
     }
+
     /// Authentication and continuity are checked without claiming execution.
     pub fn accept(&mut self, signed: SignedHeader) -> Result<bool> {
         if !self.conflicts.is_empty() {

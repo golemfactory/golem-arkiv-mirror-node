@@ -2,6 +2,7 @@
 //! definite commit or an eviction ([`Pool::evict_from`],
 //! [`Pool::evict_unaffordable`]) does, and an evicted transaction is
 //! remembered in a bounded [`Dropped`] registry with its reason.
+
 use super::{
     Error, Result,
     protocol::{SignedGenesis, SignedInputs, SignedLimits, SignedTx},
@@ -33,6 +34,7 @@ pub struct Dropped {
     by_hash: BTreeMap<String, (OwnerId, RequestId, &'static str)>,
     by_request: BTreeMap<(OwnerId, RequestId), String>,
 }
+
 impl Dropped {
     fn record(&mut self, tx: &SignedTx, reason: &'static str) {
         let hash = crate::simulator::wire::hex(tx.hash().as_slice());
@@ -54,6 +56,7 @@ impl Dropped {
             }
         }
     }
+
     fn forget(&mut self, tx: &SignedTx) {
         let hash = crate::simulator::wire::hex(tx.hash().as_slice());
         if self.by_hash.remove(&hash).is_some() {
@@ -61,12 +64,14 @@ impl Dropped {
             self.by_request.remove(&(tx.tx.actor, tx.tx.request_id));
         }
     }
+
     /// Why the transaction with this hash was dropped.
     pub fn reason(&self, hash: &str) -> Option<&'static str> {
         self.by_hash
             .get(&hash.to_ascii_lowercase())
             .map(|(_, _, reason)| *reason)
     }
+
     /// The hash and reason of a dropped request.
     pub fn request(&self, actor: OwnerId, request: RequestId) -> Option<(&str, &'static str)> {
         let hash = self.by_request.get(&(actor, request))?;
@@ -82,6 +87,7 @@ pub struct PoolLimits {
     pub max_senders: usize,
     pub max_per_sender: usize,
 }
+
 impl Default for PoolLimits {
     fn default() -> Self {
         Self {
@@ -92,6 +98,7 @@ impl Default for PoolLimits {
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     Inserted,
@@ -124,10 +131,12 @@ pub struct Pool {
     bytes: usize,
     arrival: u64,
 }
+
 impl Pool {
     pub fn new(genesis: &SignedGenesis) -> Result<Self> {
         Self::with_limits(genesis, PoolLimits::default())
     }
+
     pub fn with_limits(genesis: &SignedGenesis, limits: PoolLimits) -> Result<Self> {
         genesis.validate()?;
         if limits.max_entries == 0
@@ -155,18 +164,23 @@ impl Pool {
             arrival: 0,
         })
     }
+
     pub fn len(&self) -> usize {
         self.count
     }
+
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
     pub fn sender_count(&self) -> usize {
         self.senders.len()
     }
+
     pub fn by_hash(&self, hash: &str) -> Option<&SignedTx> {
         self.senders
             .values()
@@ -174,10 +188,12 @@ impl Pool {
             .find(|e| crate::simulator::wire::hex(e.hash.as_slice()).eq_ignore_ascii_case(hash))
             .map(|e| &e.tx)
     }
+
     pub fn pending(&self, actor: OwnerId, request: RequestId) -> Option<&SignedTx> {
         let nonce = self.requests.get(&(actor, request))?;
         self.senders.get(&actor)?.get(nonce).map(|entry| &entry.tx)
     }
+
     pub fn contiguous_next(&self, actor: OwnerId, committed_next: u64) -> u64 {
         let Some(entries) = self.senders.get(&actor) else {
             return committed_next;
@@ -208,6 +224,7 @@ impl Pool {
                 .ok_or(Error("BalanceOverflow"))
             })
     }
+
     /// The cheap admission checks of `tx`, before any state read: identity,
     /// duplicates and conflicts, the nonce window, sizes, pool capacity, and
     /// funds for every pending reservation of its sender plus its own fee
@@ -225,6 +242,7 @@ impl Pool {
         self.funded(tx, balance, alloy_primitives::U256::ZERO)?;
         Ok(None)
     }
+
     /// Admits `tx` if `balance` covers every pending reservation of its
     /// sender plus its own fee, value and `rent`, its rent quoted on the head
     /// state. Execution checks rent again: an operation whose rent the sender
@@ -246,6 +264,7 @@ impl Pool {
         }
         self.insert_checked(tx, rent)
     }
+
     fn funded(
         &self,
         tx: &SignedTx,
@@ -264,6 +283,7 @@ impl Pool {
         }
         Ok(())
     }
+
     /// Removes `actor`'s transactions from `nonce` on, remembering them as
     /// dropped for `reason`: the one at `nonce` can never be included, and
     /// its successors cannot run before it. Never called for a transaction of
@@ -284,6 +304,7 @@ impl Pool {
         }
         evicted.len()
     }
+
     /// After a commit: for every sender, keeps its pending transactions in
     /// nonce order while `balance_of` covers their cumulative reservations,
     /// and evicts the first that no longer fits with its successors
@@ -316,6 +337,7 @@ impl Pool {
             .map(|(actor, nonce)| self.evict_from(actor, nonce, "InsufficientBalance"))
             .sum())
     }
+
     /// The structural checks of `tx`; `Some(Duplicate)` for an exact pending
     /// retry.
     fn check(&self, tx: &SignedTx, committed_next: u64) -> Result<Option<Admission>> {
@@ -380,6 +402,7 @@ impl Pool {
             .ok_or(Error("ArrivalExhausted"))?;
         Ok(None)
     }
+
     fn insert_checked(&mut self, tx: SignedTx, rent: alloy_primitives::U256) -> Result<Admission> {
         let hash = tx.hash();
         let actor = tx.tx.actor;

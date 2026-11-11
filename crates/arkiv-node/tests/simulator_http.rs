@@ -1,4 +1,5 @@
 //! Real sockets: private controls/body access, caps, full replay and local proof badge.
+
 use arkiv_db::durable::Options;
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::simulator::{
@@ -28,17 +29,20 @@ struct Server {
     url: String,
     task: tokio::task::JoinHandle<()>,
 }
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
+
 async fn serve(router: Router) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     Server { url, task }
 }
+
 fn host() -> Host {
     Host::create(
         Arc::new(MemoryVersionedStore::new()),
@@ -52,9 +56,19 @@ fn host() -> Host {
     )
     .unwrap()
 }
+
 fn query() -> Value {
-    json!({"height":"20","namespace":"1","attribute":"group","valueType":"u64","value":"1","limit":1,"cursor":null})
+    json!({
+        "height": "20",
+        "namespace": "1",
+        "attribute": "group",
+        "valueType": "u64",
+        "value": "1",
+        "limit": 1,
+        "cursor": null,
+    })
 }
+
 async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
     client
         .get(format!("{url}/sim/v1/{path}"))
@@ -65,6 +79,7 @@ async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
         .await
         .unwrap()
 }
+
 async fn request(
     client: &reqwest::Client,
     url: &str,
@@ -78,6 +93,7 @@ async fn request(
         .await
         .unwrap()
 }
+
 fn height(rt: &Shared) -> u64 {
     let n = rt.node.lock().unwrap();
     match &*n {
@@ -149,7 +165,14 @@ async fn full_and_light_use_disjoint_endpoints_control_auth_and_chunked_limit() 
         .build()
         .unwrap();
     let status = get(&client, &public.url, "status").await;
-    let command = json!({"commandId":hex(&[1;32]),"runId":status["runId"],"expectedRevision":"0","expectedHeight":"0","action":"step","config":null});
+    let command = json!({
+        "commandId": hex(&[1;32]),
+        "runId": status["runId"],
+        "expectedRevision": "0",
+        "expectedHeight": "0",
+        "action": "step",
+        "config": null,
+    });
     assert_eq!(
         request(&client, &private.url, "control", &command)
             .await
@@ -278,7 +301,13 @@ async fn full_and_light_use_disjoint_endpoints_control_auth_and_chunked_limit() 
     let address = public.url.strip_prefix("http://").unwrap();
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let prefix = format!(
-        "POST /sim/v1/query/eq HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+        "POST /sim/v1/query/eq HTTP/1.1\r\n\
+         Host: {address}\r\n\
+         Content-Type: application/json\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {:x}\r\n",
         REQUEST_CAP + 1
     );
     stream.write_all(prefix.as_bytes()).await.unwrap();
@@ -313,6 +342,7 @@ async fn mutate(State(source): State<String>, Json(body): Json<Value>) -> Json<V
     v["proof"] = json!(hex(&b));
     Json(v)
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn response_mutation_and_dropped_body_never_produce_verified_rows() {
     let mut h = host();
@@ -363,16 +393,19 @@ async fn response_mutation_and_dropped_body_never_produce_verified_rows() {
 }
 
 struct Child(std::process::Child);
+
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
+
 fn free_address() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().to_string()
 }
+
 #[test]
 fn private_network_http_is_explicit_and_unknown_configuration_fails_closed() {
     assert!(runtime::validate_peer("http://producer:9400").is_err());
@@ -393,11 +426,20 @@ fn private_network_http_is_explicit_and_unknown_configuration_fails_closed() {
     assert!(runtime::parse_private_http(Some("1")).is_err());
     assert!(runtime::parse_private_http(Some("TRUE")).is_err());
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_and_busy_bootstrap_does_not_poison_directory_and_reopen_needs_no_genesis_fetch() {
     let h = host();
     let id = h.identity.clone();
-    let good = json!({"sourceId":id.source_id,"runId":id.run_id,"genesisHash":id.genesis_hash,"chainId":id.chain_id,"genesis":pack(&h.run.genesis),"header":pack(&h.run.genesis.header()),"durableIdentity":hex(&h.durable_identity.envelope().unwrap())});
+    let good = json!({
+        "sourceId": id.source_id,
+        "runId": id.run_id,
+        "genesisHash": id.genesis_hash,
+        "chainId": id.chain_id,
+        "genesis": pack(&h.run.genesis),
+        "header": pack(&h.run.genesis.header()),
+        "durableIdentity": hex(&h.durable_identity.envelope().unwrap()),
+    });
     let mode = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let attempts = Arc::new(AtomicUsize::new(0));

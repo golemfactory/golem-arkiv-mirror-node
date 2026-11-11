@@ -85,6 +85,7 @@ impl VersionedStore for BoundaryStore {
     }
 }
 
+/// Runs only as the child process spawned by the test below.
 #[test]
 fn engine_process_child() {
     let Ok(path) = std::env::var("ARKIV_ENGINE_CHILD_PATH") else {

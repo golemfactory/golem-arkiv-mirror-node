@@ -3,17 +3,9 @@
 //! Keys are [`ByteKey`]s (escaped, `00`-terminated byte strings, the empty
 //! string included) drawn from an alphabet rich in `00`, `01` and `ff`, so
 //! many keys are prefix-related as raw strings while their encodings stay
-//! prefix-free. Establishes, after random insert/overwrite/remove histories:
-//! contents, length, iteration order and lower-bounded seeks (typed and raw)
-//! agree with the model; roots equal both independent oracles
-//! (`HashBuilder` and the reference construction) and do not depend on
-//! insertion order; retained handles keep their contents; temporary entries
-//! collapse back to the original root; point proofs (inclusion and absence)
-//! verify and equal the reference proofs; complete interval proofs over
-//! arbitrary inclusive/exclusive/unbounded raw endpoints and prefix runs
-//! return exactly the model's entries and reject every omission, extra node
-//! and entry-limit overflow; stored maps reopen and walk identically; and a
-//! key that breaks the prefix-free contract is rejected without change.
+//! prefix-free. Roots and point proofs are checked against both oracles in
+//! `support`, interval proofs against the model over arbitrary
+//! inclusive/exclusive/unbounded raw endpoints and prefix runs.
 
 mod support;
 
@@ -203,7 +195,7 @@ fn check_interval(map: &Map, model: &Model, range: &KeyRange) {
         incomplete.remove(omitted);
         assert!(walk_interval(root, range, &incomplete, limits).is_err());
     }
-    let mut extra = proof.clone();
+    let mut extra = proof;
     extra.push(vec![0xc0]);
     assert!(walk_interval(root, range, &extra, limits).is_err());
 }

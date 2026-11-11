@@ -29,7 +29,7 @@
 //! # State and roots
 //!
 //! Every state is a set of Merkle Patricia maps (`arkiv_db_trie::MerkleMap`,
-//! with the key and leaf encodings of state format 1): the namespace
+//! with the key and leaf encodings of [`STATE_FORMAT`]): the namespace
 //! catalog, whose leaf for each namespace holds its descriptor, record
 //! allocator and the roots of its raw record, key-binding, row and term
 //! maps, and the host-state map. Updates copy one key path per map and
@@ -66,8 +66,8 @@
 //! An engine built by [`Engine::new`] keeps its state in memory, its maps
 //! never hold a stored link, and the `try_` forms never fail; the
 //! infallible methods delegate to them. An engine opened from a committed
-//! state ([`Engine::from_state`], a test aid until node step N3c adds
-//! durable manifests) reads map nodes lazily through an
+//! state ([`Engine::from_state`], a test aid, or [`crate::durable`]) reads
+//! map nodes lazily through an
 //! `arkiv_db_storage::versioned::ObjectReader`, and there every `try_` form
 //! can fail. On a snapshot a storage error just fails that call. On a
 //! branch, a storage error inside an operation restores the state from
@@ -77,8 +77,7 @@
 //! `try_seal` return [`EngineError::Poisoned`]. The host discards a poisoned
 //! branch. The node calls only the `try_` forms.
 //!
-//! Durability is not implemented: nothing here survives process
-//! termination.
+//! This engine is volatile; [`crate::durable`] persists the same state.
 
 #[path = "explore.rs"]
 pub mod explore;
@@ -329,7 +328,7 @@ impl WorkingState {
     }
 
     /// Test aid: the staging walk over the whole state, see
-    /// [`Snapshot::staged_objects`] and [`Snapshot::hashed_nodes`].
+    /// [`Snapshot::staged_objects`] and [`SealedCandidate::hashed_nodes`].
     fn staging(&self) -> Staging {
         let mut staging = Staging::default();
         let mut leaves = Vec::new();
@@ -481,9 +480,9 @@ impl Engine {
         Self::from_genesis(state, limits, Nodes::memory())
     }
 
-    /// Test aid, until node step N3c opens durable manifests: an engine
-    /// whose genesis snapshot is the committed state `header` describes,
-    /// with every map node read lazily, on demand, through `reader`.
+    /// Test aid: an engine whose genesis snapshot is the committed state
+    /// `header` describes, with every map node read lazily, on demand,
+    /// through `reader`.
     ///
     /// Nothing is read here; the header is only checked (format and map
     /// handles). Every later read and write may fail with the reader's
@@ -616,10 +615,7 @@ impl Engine {
             });
         }
         let id = SnapshotId(u64::try_from(self.snapshots.len()).expect("snapshot count fits u64"));
-        let root = OnceLock::new();
-        if let Some(computed) = candidate.root.get() {
-            let _ = root.set(*computed);
-        }
+        let root = candidate.root.clone();
         self.snapshots.push(Arc::new(SnapshotState {
             id,
             base: Some(candidate.base),
@@ -684,7 +680,11 @@ impl SealedCandidate {
         self.state.staging().objects
     }
 
-    /// Test aid: see [`Snapshot::hashed_nodes`].
+    /// Test aid: per map, the nodes of this state that exist only in memory
+    /// and carry a hash, which computing the state root hashes once each.
+    /// They are counted where the staging walk meets them, before
+    /// [`staged_objects`](Self::staged_objects) keeps each `(space, map,
+    /// id)` once, so each map's count is at least its staged objects.
     #[doc(hidden)]
     pub fn hashed_nodes(&self) -> BTreeMap<MapKind, u64> {
         self.state.staging().recorded
@@ -777,7 +777,7 @@ impl Snapshot {
         )
     }
 
-    /// Complete index-backed numeric range, with no pagination or truncation.
+    /// Complete index-backed ordered range, with no pagination or truncation.
     /// All matching terms, postings and rows must fit the caller's proof caps.
     pub fn prove_range(
         &self,
@@ -857,33 +857,17 @@ impl Snapshot {
             .get_or_init(|| self.state.state.header().root())
     }
 
-    /// Test aid, until node step N3c stages commits: the objects of this
-    /// state that exist only in memory, each once per space and map. Every
-    /// map is walked from its root, stopping at nodes read from storage; the
-    /// catalog's nested namespace maps and the term leaves' posting maps are
-    /// staged into their namespace's space. For a memory engine that is every object of
-    /// the state; for an engine from [`Engine::from_state`], the objects its
-    /// blocks created. Committing them lets [`Engine::from_state`] reopen
-    /// the state from its header.
+    /// Test aid: the objects of this state that exist only in memory, each
+    /// once per space and map. Every map is walked from its root, stopping
+    /// at nodes read from storage; the catalog's nested namespace maps and
+    /// the term leaves' posting maps are staged into their namespace's
+    /// space. For a memory engine that is every object of the state; for an
+    /// engine from [`Engine::from_state`], the objects its blocks created.
+    /// Committing them lets [`Engine::from_state`] reopen the state from
+    /// its header.
     #[doc(hidden)]
     pub fn staged_objects(&self) -> Vec<StagedObject> {
         self.state.state.staging().objects
-    }
-
-    /// Test aid: per map, the nodes of this state that exist only in memory
-    /// and carry a hash (every map root and every other node of 32 bytes or
-    /// more), which computing the state root hashes once each. The staging
-    /// walk counts them where it meets them, before
-    /// [`staged_objects`](Self::staged_objects) keeps each `(space, map,
-    /// id)` once: identical nodes built separately (the one-entry posting
-    /// maps of one record's terms, say) are hashed and counted once each
-    /// but staged once, and a node the state reached twice would be counted
-    /// twice. So each map's count is at least its staged objects. For an
-    /// engine from [`Engine::from_state`], these are the nodes its blocks
-    /// built.
-    #[doc(hidden)]
-    pub fn hashed_nodes(&self) -> BTreeMap<MapKind, u64> {
-        self.state.state.staging().recorded
     }
 
     /// Test aid: the roots of `namespace`'s maps and its record allocator,
@@ -893,17 +877,16 @@ impl Snapshot {
         &self,
         namespace: NamespaceId,
     ) -> Result<Option<NamespaceRoots>, StorageError> {
-        let handle = |root: B256, len: u64| (root, len);
         Ok(self
             .state
             .state
             .namespace(&self.state.nodes, namespace)?
             .map(|leaf| NamespaceRoots {
                 next_record: leaf.typed.next_record,
-                records: handle(leaf.records.root_hash(), leaf.records.len()),
-                keys: handle(leaf.typed.keys.root_hash(), leaf.typed.keys.len()),
-                rows: handle(leaf.typed.rows.root_hash(), leaf.typed.rows.len()),
-                terms: handle(leaf.typed.terms.root_hash(), leaf.typed.terms.len()),
+                records: (leaf.records.root_hash(), leaf.records.len()),
+                keys: (leaf.typed.keys.root_hash(), leaf.typed.keys.len()),
+                rows: (leaf.typed.rows.root_hash(), leaf.typed.rows.len()),
+                terms: (leaf.typed.terms.root_hash(), leaf.typed.terms.len()),
             }))
     }
 
@@ -3125,16 +3108,16 @@ mod tests {
             assert_eq!(branch.mutations, mutations);
             assert_eq!(branch.receipts.len(), 1, "only the earlier write");
             assert!(branch.is_poisoned());
-
-            // A failing host-state write (the host map is stored) changes
-            // nothing either.
-            let mut branch = engine.begin(engine.head(), None).unwrap();
-            prepare(&mut branch);
-            let state = branch.working.header();
-            reader.allowance.store(0, Ordering::SeqCst);
-            assert!(branch.try_host_put([3; 32], b"later").is_err());
-            assert_eq!(branch.working.header(), state);
-            assert!(branch.is_poisoned());
         }
+
+        // A failing host-state write (the host map is stored) changes
+        // nothing either.
+        let mut branch = engine.begin(engine.head(), None).unwrap();
+        prepare(&mut branch);
+        let state = branch.working.header();
+        reader.allowance.store(0, Ordering::SeqCst);
+        assert!(branch.try_host_put([3; 32], b"later").is_err());
+        assert_eq!(branch.working.header(), state);
+        assert!(branch.is_poisoned());
     }
 }

@@ -3,14 +3,16 @@
 //! Block 1 creates the Arkiv entity namespace (ordinal 1, host-controlled)
 //! and the generic namespaces `alpha` (2) and `beta` (3); the generic record
 //! traffic uses `alpha` and `beta` only.
+
 use crate::{BlockInputs, ChainParams, Expiry, Genesis, TxEnvelope, TxOp};
 use arkiv_db::{
     Cell, CellName, Limits, NamespaceId, NamespaceName, OwnerId, PriceSchedule, RecordKey,
     Revision, Value,
 };
+
 pub const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 pub const BOB: OwnerId = OwnerId::new([0xb0; 20]);
-pub const DEFAULT_SEED: u64 = 7;
+
 pub fn genesis(chain_id: u64, timestamp_ms: u64) -> Genesis {
     Genesis {
         format_version: crate::block::FORMAT_VERSION,
@@ -48,6 +50,7 @@ pub fn genesis(chain_id: u64, timestamp_ms: u64) -> Genesis {
         admins: vec![ALICE],
     }
 }
+
 pub fn inputs(chain_id: u64, height: u64, seed: u64) -> BlockInputs {
     let ns = |n| NamespaceId::from_ordinal(n).expect("namespace");
     let round = height / 20;

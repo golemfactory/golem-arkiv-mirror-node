@@ -182,8 +182,7 @@ blocks earlier, rewrites one host key; head 2001, archive; walk 0.7 s):
 
 The archive union equals the stored totals exactly (objects and key+value
 bytes), which cross-checks the walker. A 128-snapshot window would keep 7 % of
-the objects; about 28 objects per block are history. The checked-in rogue-one
-files on this machine predate the current state format and cannot be opened.
+the objects; about 28 objects per block are history.
 
 ## Physical deletion (phase 2, designed, not implemented)
 

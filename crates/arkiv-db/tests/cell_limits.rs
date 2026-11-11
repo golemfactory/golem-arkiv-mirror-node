@@ -161,7 +161,7 @@ fn names_longer_than_the_limit_are_rejected_in_every_write() {
         create(
             &mut branch,
             b"a",
-            vec![(ok.clone(), Cell::field(Value::Bool(true)))]
+            vec![(ok, Cell::field(Value::Bool(true)))]
         ),
         Ok(())
     );
@@ -175,7 +175,7 @@ fn names_longer_than_the_limit_are_rejected_in_every_write() {
     );
     for (set, remove) in [
         (vec![(long.clone(), Cell::attribute(Value::U64(1)))], vec![]),
-        (vec![], vec![long.clone()]),
+        (vec![], vec![long]),
     ] {
         let result = branch.execute(
             OWNER,

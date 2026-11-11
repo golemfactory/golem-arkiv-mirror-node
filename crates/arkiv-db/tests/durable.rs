@@ -1,8 +1,9 @@
 //! Memory/durable differential histories, format vectors and lazy ownership.
 use arkiv_db::{
     Branch, Budget, Cell, CellName, NamespaceId, NamespaceName, OwnerId, PriceSchedule, Projection,
-    Query, RecordKey, Revision, SnapshotId, Value, WriteOp,
-    durable::{DurableEngine, EngineGenesis, Initialization, Options, Publication},
+    Query, RecordKey, Revision, SnapshotId, Value, WriteOp, decode_exact,
+    durable::{DurableEngine, EngineGenesis, EngineManifest, Initialization, Options, Publication},
+    encode,
 };
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_db_storage::versioned::{SpaceId, VersionedStore};
@@ -240,5 +241,3 @@ fn ten_thousand_publications_retain_no_resident_history_or_dirty_committed_nodes
     drop(handles);
     assert_eq!(engine.stats().resident_manifests, 1);
 }
-
-use arkiv_db::{decode_exact, durable::EngineManifest, encode};

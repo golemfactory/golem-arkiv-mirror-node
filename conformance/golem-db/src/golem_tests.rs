@@ -973,8 +973,8 @@ fn genesis_cell_limits_are_enforced_by_the_engine() {
         Err(OpenError::GenesisMismatch)
     ));
     // Limits above the engine's caps (32-byte names; golem indexes str
-    // attributes up to max_str_len, the engine up to its 512-byte ceiling
-    // since state layout 2) are refused at open rather than narrowed.
+    // attributes up to max_str_len, the engine up to its 512-byte ceiling)
+    // are refused at open rather than narrowed.
     for wide in [
         CellLimits {
             max_cell_name_len: 33,

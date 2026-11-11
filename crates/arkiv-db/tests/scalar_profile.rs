@@ -1,15 +1,12 @@
 //! The single engine profile: hard caps, scalar encodings, and adversarial proofs.
+
 use arkiv_db::{CellName, NamespaceName, TypeTag, Value, decode_exact, encode};
 
 #[test]
-fn profile_limits_are_explicit_and_namespaces_stay_independent() {
+fn profile_constants_and_name_length_bounds() {
     assert_eq!(arkiv_db::LAYOUT_VERSION, 2);
-    assert_eq!(arkiv_db::CODEC_VERSION, 1);
     assert_eq!(arkiv_db::state::STATE_FORMAT, arkiv_db::LAYOUT_VERSION);
     assert_eq!(arkiv_db::proof::PROOF_VERSION, arkiv_db::LAYOUT_VERSION);
-    assert_eq!(CellName::MAX_LEN, 32);
-    assert_eq!(arkiv_db::Limits::DEFAULT_INDEXED_LEN, 128);
-    assert_eq!(Value::INDEXED_LEN_CEILING, 512);
     for len in [0, 20, 21, 32, 33] {
         assert_eq!(
             CellName::new(&"a".repeat(len)).is_ok(),

@@ -5,6 +5,7 @@
 //! `format`, and the given number of indexed `u64` attributes. Execution is
 //! gas at the fixed 1 gwei; rent is GLM of its own (glm-rent-v3), priced per
 //! second and capped at the default year, at the SDK's 2-second blocks.
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use arkiv_db::{
         Budget, Cell, CellName, Engine, Limits, NamespaceName, OwnerId, Projection, RecordKey,
@@ -115,7 +116,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let charged = gas::rent_horizon(expires_at, 1, clock.cap_blocks()) - 1;
         let execution = gas::TX_INTRINSIC_GAS + receipt.spent.units();
         let fee = gas::reference_fee_wei(execution);
-        results.push(serde_json::json!({"example":label,"bodyBytes":body,"indexedAttributes":attributes,"permanent":days.is_none(),"chargedLifetimeSeconds":charged * PERIOD_MS / 1000,"logicalStorageUnits":units.total,"canonicalKeyAndCellsBytes":encode(&(key,row.cells)).len(),"executionGas":execution,"executionFeeGlm":gas::glm(fee),"rentWei":rent.to_string(),"rentGlm":gas::glm(rent),"totalGlm":gas::glm(fee + rent)}));
+        results.push(serde_json::json!({
+            "example": label,
+            "bodyBytes": body,
+            "indexedAttributes": attributes,
+            "permanent": days.is_none(),
+            "chargedLifetimeSeconds": charged * PERIOD_MS / 1000,
+            "logicalStorageUnits": units.total,
+            "canonicalKeyAndCellsBytes": encode(&(key, row.cells)).len(),
+            "executionGas": execution,
+            "executionFeeGlm": gas::glm(fee),
+            "rentWei": rent.to_string(),
+            "rentGlm": gas::glm(rent),
+            "totalGlm": gas::glm(fee + rent),
+        }));
     }
     println!("{}", serde_json::to_string_pretty(&results)?);
     Ok(())

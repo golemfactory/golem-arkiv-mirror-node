@@ -418,7 +418,6 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "alloy-primitives",
  "arkiv-db",
- "arkiv-db-memory",
  "arkiv-db-storage",
  "redb",
 ]

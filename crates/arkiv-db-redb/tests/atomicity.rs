@@ -45,6 +45,9 @@
 //! persisting in any subset, torn at sector or byte granularity). It does not
 //! model firmware that lies about syncs, reordering across a completed sync,
 //! or bit rot.
+//!
+//! The `#[ignore]`d heavy runs:
+//! `cargo test -p arkiv-db-redb --release --test atomicity -- --ignored`.
 
 mod common;
 
@@ -67,7 +70,6 @@ fn every_crash_point_is_parent_or_candidate_with_quick_repair() {
     assert_eq!(tally.full_repairs, 0, "quick repair must avoid full repair");
 }
 
-/// `cargo test -p arkiv-db-redb --release --test atomicity -- --ignored`
 #[test]
 #[ignore = "heavy: 64 torn subsets per granularity and crash point"]
 fn every_crash_point_is_parent_or_candidate_heavy() {
@@ -161,7 +163,6 @@ fn growing_commit_crash_points_are_parent_or_candidate() {
     println!("growing, spilling commit: {tally:?}");
 }
 
-/// `cargo test -p arkiv-db-redb --release --test atomicity -- --ignored`
 #[test]
 #[ignore = "heavy: every crash point of a commit with thousands of backend calls"]
 fn growing_commit_every_crash_point_heavy() {
@@ -169,7 +170,6 @@ fn growing_commit_every_crash_point_heavy() {
     run_growing_steady(None, 2);
 }
 
-/// `cargo test -p arkiv-db-redb --release --test atomicity -- --ignored`
 #[test]
 #[ignore = "heavy: 64 torn subsets per granularity and crash point, steady state"]
 fn every_crash_point_in_steady_state_heavy() {

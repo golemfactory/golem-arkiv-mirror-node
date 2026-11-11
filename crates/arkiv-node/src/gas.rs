@@ -3,6 +3,7 @@
 //! per storage unit per second of capped lifetime ([`rent`], [`RentClock`]),
 //! debited from the sender outside the gas budget. Prices are an experimental
 //! capacity policy, not a measured hardware cost.
+
 use arkiv_db::{Cell, CellKind, CellName, PriceSchedule};
 
 pub const SCHEDULE_ID: u32 = 0x474c4d01;
@@ -12,10 +13,8 @@ pub const REFERENCE_GAS_PRICE_WEI: u64 = 1_000_000_000;
 pub const ENTITY_OVERHEAD_UNITS: u64 = 512;
 pub const INDEX_OVERHEAD_UNITS: u64 = 128;
 /// The rent rate, in GLM base units (wei) per storage unit per day of
-/// chargeable lifetime: 20 gwei. It is the `glm-rent-v2` rate at 2-second
-/// blocks (8 gas at 1 gwei per 17,280 blocks of 2 s), now fixed per second so
-/// the same lifetime costs the same at every block period. A year is
-/// 7,300 gwei per unit.
+/// chargeable lifetime: 20 gwei, charged per second so the same lifetime
+/// costs the same at every block period. A year is 7,300 gwei per unit.
 pub const RENT_WEI_PER_UNIT_DAY: u128 = 20_000_000_000;
 /// Milliseconds per day, the denominator of [`RENT_WEI_PER_UNIT_DAY`].
 pub const DAY_MS: u128 = 86_400_000;
@@ -39,6 +38,7 @@ pub const EMPTY_ENTITY_UNITS: u64 = 1_460;
 ///
 /// [`ChainParams::max_new_storage_units_per_block`]: crate::ChainParams::max_new_storage_units_per_block
 pub const DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK: u64 = 1_500_000;
+
 /// The most storage units the committed transactions of one block can add
 /// under its input and operation limits: every user cell costs at most its
 /// encoded input bytes (a name and value plus two tags, against a length
@@ -81,6 +81,7 @@ pub struct RentClock {
     block_period_ms: u64,
     cap_blocks: u64,
 }
+
 impl RentClock {
     /// `None` unless `1 ≤ block_period_ms ≤ MAX_BLOCK_PERIOD_MS` and
     /// `1 ≤ cap_seconds ≤ MAX_RENT_CAP_SECONDS`.
@@ -100,17 +101,17 @@ impl RentClock {
             None => None,
         }
     }
+
     /// The clock of validated chain parameters; `None` outside the bounds.
     pub const fn of(params: &crate::ChainParams) -> Option<Self> {
         Self::new(params.block_period_ms, params.max_rent_lifetime_seconds)
     }
-    pub const fn block_period_ms(&self) -> u64 {
-        self.block_period_ms
-    }
+
     /// The rent cap in blocks: `ceil(cap_seconds × 1000 / block_period_ms)`.
     pub const fn cap_blocks(&self) -> u64 {
         self.cap_blocks
     }
+
     /// The price of `unit_blocks` storage-unit blocks:
     /// `ceil(unit_blocks × block_period_ms × RENT_WEI_PER_UNIT_DAY / DAY_MS)`
     /// wei, computed with the reduced rate `6250 / 27` wei per unit-millisecond.
@@ -126,14 +127,17 @@ impl RentClock {
         }
     }
 }
+
 const fn gcd(a: u128, b: u128) -> u128 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
+
 /// [`RENT_WEI_PER_UNIT_DAY`] / [`DAY_MS`] in lowest terms: 6250 / 27.
 const RATE_NUMERATOR: u128 = RENT_WEI_PER_UNIT_DAY / gcd(RENT_WEI_PER_UNIT_DAY, DAY_MS);
 const RATE_DENOMINATOR: u128 = DAY_MS / gcd(RENT_WEI_PER_UNIT_DAY, DAY_MS);
 
-/// Counts remain model 3; this schedule gives its logical work Ethereum-sized units.
+/// The GLM gas schedule: Ethereum-sized prices for the engine's operation
+/// classes.
 pub const fn schedule() -> PriceSchedule {
     PriceSchedule::new(
         SCHEDULE_ID,
@@ -143,9 +147,11 @@ pub const fn schedule() -> PriceSchedule {
         ],
     )
 }
+
 pub fn is_active(pricing: &PriceSchedule) -> bool {
     pricing.id() == SCHEDULE_ID
 }
+
 pub fn validate_schedule(pricing: &PriceSchedule) -> bool {
     !is_active(pricing) || *pricing == schedule()
 }
@@ -155,6 +161,7 @@ pub enum GasError {
     Overflow,
     InvalidLifetime,
 }
+
 impl std::fmt::Display for GasError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -163,6 +170,7 @@ impl std::fmt::Display for GasError {
         })
     }
 }
+
 impl std::error::Error for GasError {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -174,9 +182,11 @@ pub struct StorageUnits {
     pub index_overhead: u64,
     pub total: u64,
 }
+
 fn add(a: u64, b: u64) -> Result<u64, GasError> {
     a.checked_add(b).ok_or(GasError::Overflow)
 }
+
 /// Every committed system and user cell is counted the same way, whatever its
 /// name or type: its name, value and two tag bytes are stored data. Only an
 /// indexed cell ([`CellKind::Attribute`]) also reserves a value and presence
@@ -200,6 +210,7 @@ pub fn storage_units(cells: &[(CellName, Cell)]) -> Result<StorageUnits, GasErro
     )?;
     Ok(result)
 }
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RentQuote {
     pub growth_units: u64,
@@ -212,6 +223,7 @@ pub struct RentQuote {
     /// The rent: `unit_blocks` priced by [`RentClock::wei`].
     pub wei: u128,
 }
+
 /// The rent horizon of `expiry` at `height`: rent is never charged past
 /// `height + cap`, so every expiry at least `cap` blocks away, the permanent
 /// `u64::MAX` included, has the same horizon. Saturates instead of
@@ -220,6 +232,7 @@ pub const fn rent_horizon(expiry: u64, height: u64, cap: u64) -> u64 {
     let limit = height.saturating_add(cap);
     if expiry < limit { expiry } else { limit }
 }
+
 /// Rent of one operation at `height` under the chain's rent clock. Every
 /// lifetime is charged through its [`rent_horizon`] only, recomputed from the
 /// current height with the cap in blocks ([`RentClock::cap_blocks`]):
@@ -277,13 +290,12 @@ pub fn rent(
         wei,
     })
 }
+
 /// Exact reference cost in GLM base units. This is a quote, not a balance transfer.
 pub fn reference_fee_wei(gas: u64) -> u128 {
     u128::from(gas) * u128::from(REFERENCE_GAS_PRICE_WEI)
 }
-pub fn reference_fee_glm(gas: u64) -> String {
-    glm(reference_fee_wei(gas))
-}
+
 /// `wei` as a decimal GLM amount without trailing zeros.
 pub fn glm(wei: u128) -> String {
     let unit = 1_000_000_000_000_000_000u128;
@@ -306,12 +318,14 @@ mod tests {
         Some(clock) => clock,
         None => panic!("default clock"),
     };
+
     /// A year of one storage unit: 365 × 20 gwei.
     const UNIT_YEAR_WEI: u128 = 7_300_000_000_000;
     const GWEI: u128 = 1_000_000_000;
     fn clock(period_ms: u64, cap_seconds: u64) -> RentClock {
         RentClock::new(period_ms, cap_seconds).unwrap()
     }
+
     #[test]
     fn logical_size_is_content_and_kind_based() {
         let cells = vec![
@@ -360,6 +374,7 @@ mod tests {
         assert_eq!(field.cell_bytes, indexed.cell_bytes);
         assert_eq!(indexed.total - field.total, INDEX_OVERHEAD_UNITS);
     }
+
     #[test]
     fn lifecycle_charges_growth_and_extension_without_refunds() {
         let wei = |before, after, old, new| rent(before, after, old, new, 10, CLOCK).unwrap().wei;
@@ -370,6 +385,7 @@ mod tests {
         assert_eq!(wei(2000, 0, Some(17_290), None), 0);
         assert_eq!(wei(2000, 2500, Some(17_290), Some(34_570)), 24_000 * GWEI);
     }
+
     #[test]
     fn boundaries_round_once_and_reject_invalid_lifetimes() {
         // One unit-block of 2 s is 462,962.96… wei, rounded up once.
@@ -405,20 +421,18 @@ mod tests {
             u128::from(u64::MAX - 1) * 3_153_600_000_000
         );
     }
+
     #[test]
     fn the_default_storage_cap_binds_no_block_the_input_cap_admits() {
         let empty = crate::arkiv::create_cells([7; 32], [1; 20], 9, u64::MAX, 3, &[]);
         assert_eq!(storage_units(&empty).unwrap().total, EMPTY_ENTITY_UNITS);
         let bound = block_storage_bound(crate::signed::protocol::INPUT_CAP, 128);
-        assert_eq!(bound, 786_432 + 128 * (1_460 + 32 * 128));
         assert_eq!(bound, 1_497_600);
-        assert_eq!(
-            DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK.max(bound),
-            DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK
-        );
+        assert!(bound <= DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK);
         // Eleven full 128 KiB entities fit the default; the input cap admits five.
         assert_eq!(DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK / 133_134, 11);
     }
+
     #[test]
     fn the_clock_bounds_the_period_and_the_cap() {
         assert_eq!(DEFAULT_RENT_CAP_SECONDS, 31_536_000);
@@ -433,7 +447,6 @@ mod tests {
             assert_eq!(RentClock::new(period, cap), None, "{period} {cap}");
         }
         assert_eq!(clock(MAX_BLOCK_PERIOD_MS, 1).cap_blocks(), 1);
-        assert_eq!(clock(1, MAX_RENT_CAP_SECONDS).block_period_ms(), 1);
         // h + cap never saturates before the sentinel neighbourhood.
         let widest = clock(1, MAX_RENT_CAP_SECONDS);
         assert!(u64::MAX / 2 + widest.cap_blocks() < u64::MAX);
@@ -441,6 +454,7 @@ mod tests {
         assert_eq!(rent_cap_blocks(u64::MAX, 1_000), None);
         assert_eq!(rent_cap_blocks(1, 3_000), Some(1));
     }
+
     #[test]
     fn a_year_costs_the_same_at_every_block_period() {
         let units = 3_086;
@@ -470,6 +484,7 @@ mod tests {
             (u128::from(units) * 31_536_001_000 * 6250).div_ceil(27)
         );
     }
+
     #[test]
     fn every_lifetime_at_or_beyond_the_cap_costs_the_cap() {
         let (units, height) = (3_086, 1_000);
@@ -494,6 +509,7 @@ mod tests {
         assert_eq!(at_cap.wei, 22_527_800 * GWEI);
         assert_eq!(glm(at_cap.wei), "0.0225278");
     }
+
     #[test]
     fn extensions_pay_only_for_the_growth_of_the_capped_horizon() {
         // A 1,000-block cap: 1,000 s at one-second blocks.
@@ -537,6 +553,7 @@ mod tests {
         layers: Vec<u64>,
         paid_wei: u128,
     }
+
     impl Walk {
         fn create(clock: RentClock, height: u64, size: u64, expiry: u64) -> Self {
             let quote = rent(0, size, None, Some(expiry), height, clock).unwrap();
@@ -603,6 +620,7 @@ mod tests {
             );
         }
     }
+
     fn later(expiry: u64, by: u64) -> u64 {
         if by == u64::MAX {
             u64::MAX
@@ -692,6 +710,7 @@ mod tests {
         }
         assert!(applied > 50_000, "{applied}");
     }
+
     #[test]
     fn horizons_saturate_instead_of_overflowing() {
         let cap = CLOCK.cap_blocks();
@@ -704,12 +723,14 @@ mod tests {
         let near = rent(0, 1_000, None, Some(u64::MAX - 1), u64::MAX - 5, CLOCK).unwrap();
         assert_eq!(near.extension_blocks, 4);
     }
+
     #[test]
-    fn quote_is_exact_and_schedule_identity_is_pinned() {
-        assert_eq!(reference_fee_glm(50_000), "0.00005");
-        assert_eq!(reference_fee_glm(1_000_000), "0.001");
-        assert_eq!(reference_fee_glm(100_000_000), "0.1");
-        assert_eq!(reference_fee_glm(u64::MAX), "18446744073.709551615");
+    fn reference_fees_render_exactly_and_the_schedule_validates() {
+        let fee = |gas| glm(reference_fee_wei(gas));
+        assert_eq!(fee(50_000), "0.00005");
+        assert_eq!(fee(1_000_000), "0.001");
+        assert_eq!(fee(100_000_000), "0.1");
+        assert_eq!(fee(u64::MAX), "18446744073.709551615");
         assert_eq!(glm(7_300_000_000_000), "0.0000073");
         assert!(validate_schedule(&schedule()));
         assert!(!validate_schedule(

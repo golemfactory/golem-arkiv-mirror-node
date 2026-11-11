@@ -4,7 +4,10 @@ use arkiv_db::{
     durable::{DurableEngine, EngineGenesis, Initialization, Options, Publication},
 };
 use arkiv_db_memory::MemoryVersionedStore;
-use arkiv_db_storage::versioned::{Table, VersionedStore};
+use arkiv_db_storage::versioned::{
+    CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, SpaceId,
+    StorageError, StorageErrorKind, StoreStats, Table, VersionedStore,
+};
 use std::sync::Arc;
 fn committed(i: Initialization) -> DurableEngine {
     match i {
@@ -288,10 +291,6 @@ struct InterruptCopy {
     calls: std::sync::atomic::AtomicUsize,
     fail_on: usize,
 }
-use arkiv_db_storage::versioned::{
-    CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, SpaceId,
-    StorageError, StorageErrorKind, StoreStats,
-};
 impl ObjectReader for InterruptCopy {
     fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
         self.store.read_object(space, id)

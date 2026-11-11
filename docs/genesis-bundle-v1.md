@@ -1,8 +1,37 @@
-# Implemented genesis bundle v1 contract
+# Genesis bundle v1
 
-The authoring commands and examples are described in
-[the design](genesis-bundle-design.md#implemented-envelope). This document freezes
-the machine fields and runtime behavior of the bounded implementation.
+This document freezes the machine fields and runtime behavior of the bounded
+genesis bundle. Larger prefills use the
+[streaming genesis](streaming-genesis-v2.md).
+
+## Authoring
+
+`arkiv-proposer genesis lock CHAIN [--refresh]`,
+`arkiv-proposer genesis build CHAIN --out BUNDLE --locked`, and
+`arkiv-proposer genesis verify BUNDLE` support the
+[runnable examples](examples/genesis-bundle/README.md). Source documents and
+payload files are each at most 1 MiB, their total exact input bytes at most
+8 MiB, and the inventory at most 512 files. Relative source paths are ASCII,
+at most 512 bytes; traversal, symlinks, duplicate paths and case collisions
+fail closed. The compiler freezes each opened file into bounded memory,
+hashes those same bytes, and accounts canonical row bytes before retaining
+normalized rows. It sorts in memory and constructs the state once.
+
+Inline or file allocations, inline entities, typed TOML/JSONL datasets,
+payload files/text/padded Base64, allocation aliases and the immutable
+`arkiv-entity-v3/glm-v2@5` preset all feed the same canonical builder. The
+lock contains every source SHA-256/length, the expanded profile and its
+digest, resolved identities/economics and the exact canonical artifact
+hashes. Refresh reports changed resolved fields with before/after values;
+supplied pins remain assertions during refresh. Builds do not refresh the
+source lock.
+
+The portable directory contains `genesis.bin`, `prefill.bin`,
+`genesis.lock.toml` and `report.json`. It is built privately and published
+with an atomic no-replace rename. Independent verification reconstructs the
+full initial state and compares canonical bytes, roots, sponsor debit and
+report; source inventory remains provenance and requires the original source
+tree for rechecking its contents.
 
 ## Versions and identity
 
@@ -236,10 +265,11 @@ Ceilings are 256 rows, 1 MiB canonical stream, 8 MiB logical storage units,
 (39 total cells), 256 positive allocations,
 1 MiB per source, 8 MiB aggregate sources and 512 source files. Durable defaults
 add 32 MiB prepared bytes, 100,000 objects and 1,000,000 visits. Any exceeded bound
-fails explicitly. This implementation uses bounded memory sorting and one atomic
-publication: external sorting, object packs, chunk transport, cross-process bulk
-checkpoints and million-row support remain future work. These are admission
-bounds, not a demonstrated maximum-volume performance claim.
+fails explicitly. This format uses bounded memory sorting and one atomic
+publication; prefills beyond these ceilings use the
+[streaming genesis](streaming-genesis-v2.md) and its
+[bulk construction](bulk-prefill.md). These are admission bounds, not a
+demonstrated maximum-volume performance claim.
 
 ## Validation
 

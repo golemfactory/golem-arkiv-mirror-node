@@ -1,6 +1,7 @@
 //! State-history retention of the durable engine: the strict floor, its
 //! persistence and monotonicity across reopen, pins, and the read-only
-//! reachability report. Nothing is deleted in this phase.
+//! reachability report. Retention only refuses reads below the floor; no
+//! object is deleted.
 
 use std::sync::Arc;
 

@@ -1,5 +1,6 @@
 //! Bounded WebSocket JSON-RPC using the same authenticated dispatcher as HTTP.
 //! Subscriptions are connection-local and follow acknowledged canonical blocks.
+
 use super::{rpc, runtime::Shared};
 use axum::{
     extract::{
@@ -89,7 +90,11 @@ async fn dispatch(
         if params.len() != 1 || !params[0].is_string() {
             return failure(id, -32602, "Expected subscription ID");
         }
-        return json!({"jsonrpc":"2.0","id":id,"result":subscriptions.remove(params[0].as_str().unwrap()).is_some()});
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": subscriptions.remove(params[0].as_str().unwrap()).is_some(),
+        });
     }
     if subscriptions.len() >= SUBSCRIPTIONS {
         return failure(id, SUBSCRIPTION_LIMIT_CODE, "Subscription limit exceeded");
@@ -185,36 +190,60 @@ async fn session(mut socket: WebSocket, rt: Shared) {
                 };
                 let request: Value = match serde_json::from_slice(&bytes) {
                     Ok(value) => value,
-                    Err(_) => { if !send(&mut socket, &failure(Value::Null,-32700,"Parse error")).await { break } continue; }
+                    Err(_) => {
+                        if !send(&mut socket, &failure(Value::Null, -32700, "Parse error")).await {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 let response = if let Some(batch) = request.as_array() {
                     if batch.is_empty() || batch.len() > BATCH {
-                        failure(Value::Null,-32600,"Invalid or oversized batch")
+                        failure(Value::Null, -32600, "Invalid or oversized batch")
                     } else {
                         let mut out = Vec::new();
                         let mut size = 0;
                         for item in batch {
-                            let response = dispatch(&rt,item.clone(),&mut subscriptions,&mut next_id).await;
-                            if item.get("id").is_some() || !item.is_object() || item.get("method").is_none() {
+                            let response =
+                                dispatch(&rt, item.clone(), &mut subscriptions, &mut next_id).await;
+                            if item.get("id").is_some()
+                                || !item.is_object()
+                                || item.get("method").is_none()
+                            {
                                 size += response.to_string().len();
-                                if size > RESPONSE_BYTES { return }
+                                if size > RESPONSE_BYTES {
+                                    return;
+                                }
                                 out.push(response);
                             }
                         }
-                        if out.is_empty() { Value::Null } else { Value::Array(out) }
+                        if out.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Array(out)
+                        }
                     }
                 } else {
-                    let notification = request.is_object() && request.get("id").is_none() && request.get("method").is_some();
-                    let response = dispatch(&rt,request,&mut subscriptions,&mut next_id).await;
+                    let notification = request.is_object()
+                        && request.get("id").is_none()
+                        && request.get("method").is_some();
+                    let response = dispatch(&rt, request, &mut subscriptions, &mut next_id).await;
                     if notification { Value::Null } else { response }
                 };
-                if !response.is_null() && !send(&mut socket,&response).await { break }
+                if !response.is_null() && !send(&mut socket, &response).await {
+                    break;
+                }
             }
             _ = tick.tick(), if !subscriptions.is_empty() => {
-                let head = match rt.node.try_lock() { Ok(node) => node.head().height, Err(_) => continue };
+                let head = match rt.node.try_lock() {
+                    Ok(node) => node.head().height,
+                    Err(_) => continue,
+                };
                 let mut pruned = Vec::new();
                 for (id, subscription) in &mut subscriptions {
-                    if head.saturating_sub(subscription.next_height) > MAX_LAG { return }
+                    if head.saturating_sub(subscription.next_height) > MAX_LAG {
+                        return;
+                    }
                     // Bound work per tick so socket input and unsubscribe remain responsive.
                     let through = head.min(subscription.next_height.saturating_add(7));
                     while subscription.next_height <= through {
@@ -225,13 +254,29 @@ async fn session(mut socket: WebSocket, rt: Shared) {
                             filter["toBlock"] = filter["fromBlock"].clone();
                             json!({"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[filter]})
                         } else {
-                            json!({"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":[format!("0x{height:x}"),false]})
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "eth_getBlockByNumber",
+                                "params": [format!("0x{height:x}"), false],
+                            })
                         };
-                        let answer = rpc::handle_request(&rt,request).await;
+                        let answer = rpc::handle_request(&rt, request).await;
                         if answer["error"]["code"] == rpc::HISTORY_PRUNED_CODE {
                             // The replay position fell below the retention floor:
                             // end the subscription explicitly, never skip events.
-                            if !send(&mut socket,&json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":id,"error":answer["error"]}})).await { return }
+                            if !send(
+                                &mut socket,
+                                &json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "eth_subscription",
+                                    "params": {"subscription": id, "error": answer["error"]},
+                                }),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             pruned.push(id.clone());
                             break;
                         }
@@ -239,19 +284,49 @@ async fn session(mut socket: WebSocket, rt: Shared) {
                             // Retain the next height and retry; never silently skip an event.
                             break;
                         }
-                        let Some(mut result) = answer.get("result").cloned() else { return };
+                        let Some(mut result) = answer.get("result").cloned() else {
+                            return;
+                        };
                         if subscription.filter.is_some() {
-                            let Some(logs) = result.as_array() else { return };
+                            let Some(logs) = result.as_array() else {
+                                return;
+                            };
                             for log in logs {
-                                if !send(&mut socket,&json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":id,"result":log}})).await { return }
+                                if !send(
+                                    &mut socket,
+                                    &json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "eth_subscription",
+                                        "params": {"subscription": id, "result": log},
+                                    }),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                             }
                         } else {
-                            let Some(header) = result.as_object_mut() else { return };
+                            let Some(header) = result.as_object_mut() else {
+                                return;
+                            };
                             header.remove("transactions");
                             header.remove("uncles");
-                            if !send(&mut socket,&json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":id,"result":result}})).await { return }
+                            if !send(
+                                &mut socket,
+                                &json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "eth_subscription",
+                                    "params": {"subscription": id, "result": result},
+                                }),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                         }
-                        let Some(next) = height.checked_add(1) else { return };
+                        let Some(next) = height.checked_add(1) else {
+                            return;
+                        };
                         subscription.next_height = next;
                     }
                 }

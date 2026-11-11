@@ -25,7 +25,6 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
-    /// Creates an empty batch.
     pub const fn new() -> Self {
         Self {
             operations: Vec::new(),

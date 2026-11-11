@@ -1,5 +1,13 @@
 # Sourcify 100,000-contract streaming prefill validation
 
+> Dated run record, kept as written apart from machine paths (`$REPO` is this
+> checkout, `$WORK` the operator's run directory). It used the payload-era
+> Sourcify converter and runner scripts (row codec 2, `sourcify-prefill.py`,
+> `run-full-prefill.py`, `full-prefill-bootstrap.py`), which have since been
+> removed: current nodes accept only row codec 3, written by
+> [`scripts/sourcify-v4-prefill.py`](../sourcify-v4-prefill.md). The commands
+> below are a record, not instructions.
+
 Recorded on 2026-10-19. Conversion of the actual uploaded Sourcify sample
 completed, and the experimental genesis builder published a bundle after two
 SIGKILL interruptions and checkpoint recoveries. The converter and builder
@@ -21,7 +29,7 @@ implementation; the interrupted stages used different importer settings.
 Local evidence is retained under:
 
 ```text
-/home/ubuntu/arkiv-network/operations/runs/experiment-prefill-100k
+$WORK/experiment-prefill-100k
 ```
 
 The input is
@@ -214,10 +222,10 @@ are never overwritten. These commands record the relevant executable arguments;
 the original builder base came from an earlier disposable harness fixture.
 
 ```sh
-cd /home/ubuntu/arkiv-network/arkiv-state-db-experiment
-PREFILL_RUN=/home/ubuntu/arkiv-network/operations/runs/experiment-prefill-100k
+cd $REPO
+PREFILL_RUN=$WORK/experiment-prefill-100k
 PREFILL_SOURCE="$PREFILL_RUN/source/sourcify-uploaded-100k-contracts-never"
-PREFILL_BASE=/home/ubuntu/arkiv-network/operations/runs/experiment-prefill-smoke/acceptance-3/base/genesis.bin
+PREFILL_BASE=$WORK/experiment-prefill-smoke/acceptance-3/base/genesis.bin
 export ARKIV_PREFILL_RESERVE_GIB=80
 
 /usr/bin/time -v python3 scripts/sourcify-prefill.py convert \
@@ -241,11 +249,11 @@ sudo systemd-run --unit=arkiv-prefill-100k-acceptance-reproduce \
   --wait --pipe --collect --uid=ubuntu \
   --property=MemoryMax=32G --property=MemorySwapMax=0 \
   --setenv=ARKIV_PREFILL_RESERVE_GIB=80 \
-  --working-directory=/home/ubuntu/arkiv-network/arkiv-state-db-experiment \
+  --working-directory=$REPO \
   /usr/bin/python3 scripts/streaming-prefill-smoke.py \
   --bundle "$PREFILL_RUN/bundle" \
   --work-dir "$PREFILL_RUN/acceptance-reproduce" \
-  --bin /home/ubuntu/arkiv-network/arkiv-state-db-experiment/target/release/arkiv-proposer \
+  --bin $REPO/target/release/arkiv-proposer \
   --timeout 7200 --expected-entities 445583 --expect-contract-proof-limit \
   --query 'address = addr(0x00000000000009ca62911fdd88c8cf50565ab183)'
 ```
@@ -281,7 +289,7 @@ even when one row is requested. Its default maximum is 4,096 posting IDs; the
 materialized. The verifier reconstructs the complete posting trie and also
 applies cumulative work/allocation limits. Raising only the posting cap would
 not provide a bounded page-proof implementation. No proof caps or protocol
-were changed for this validation. See [equality proof resource rules](eq-proof-charges.md).
+were changed for this validation. See [equality proof resource rules](../eq-proof-charges.md).
 
 `acceptance/acceptance.json` records `result: "passed"` and `resumed: true`:
 
@@ -316,18 +324,7 @@ The 100,000-contract inventory is established by source/converter audit, not
 by a light-verified 100,000-match count or a broad one-row equality page. The
 successful selective proof stays within the existing posting and work limits.
 
-## Code validation
-
-The full Rust workspace run passed 1,174 tests with four intentionally ignored
-tests before cache tuning. After tuning, the node suite passed 328 tests with
-no failures; eight focused tests, formatting and Clippy with warnings denied
-also passed. All 15 converter tests passed with both real source fixtures
-enabled. The actual resumed 445,583-entity harness run supplies the integration
-evidence above. These checks do not replace an uninterrupted scale benchmark
-or exhaustive crash/failure-window testing.
-
-See [streaming genesis](streaming-genesis-v2.md) for protocol/recovery details
-and [the converter](sourcify-prefill-converter.md) for source validation and
-finite expiry policy. The previous 263-row and synthetic tests remain separate
+See [streaming genesis](../streaming-genesis-v2.md) for protocol/recovery details
+and its [row expiry rules](../streaming-genesis-v2.md#row-expiry). The previous 263-row and synthetic tests remain separate
 evidence. No full Sourcify import, permanent expiry policy, live-history physical
 pruning, or public deployment is established by this sample run.

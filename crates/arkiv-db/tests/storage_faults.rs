@@ -1,4 +1,4 @@
-//! Storage failures beneath engine state (node step N3b).
+//! Storage failures beneath engine state.
 //!
 //! Every engine map reads its committed nodes through a loader. A memory
 //! engine never has a stored node; here a state is staged
@@ -8,36 +8,13 @@
 //! counts reads, fails every read after a chosen number with a chosen
 //! error kind, and can lose or damage single objects.
 //!
-//! What this file establishes:
-//! - A reopened state reads nothing at open, has the original state root,
-//!   and answers every read (values, receipts **and** physical node
-//!   visits) exactly as the memory engine that built it, while loading
-//!   nodes on demand.
-//! - On a snapshot, a failed, missing or corrupt node makes the read return
-//!   the storage error (`Io`, `Full`, `Missing`, `Corrupt`), never an
-//!   absent record, an empty result or a rejection; the snapshot answers
-//!   again once the store heals. Failing the k-th node load of a read, for
-//!   every k up to the loads it needs and with `Io` or `Full`, always
-//!   yields that error.
-//! - On a branch, a storage error at any read of an operation (every k, for
-//!   raw and typed writes, namespace operations, host-state writes,
-//!   estimates, reads and the expiry sweep) returns the error, records no
-//!   receipt, adds nothing to the block's spend and poisons the branch:
-//!   every later call returns a storage error even after the store heals,
-//!   and `try_checkpoint`, `rollback_to`, `set_pricing`, `try_state_root`
-//!   and `try_seal` return `EngineError::Poisoned`. An operation given
-//!   enough reads succeeds with the receipt the memory engine issues.
-//! - Leaves that decode but contradict the key they sit under (a catalog
-//!   leaf describing another namespace, a key binding naming a row that
-//!   holds another key) are `Corrupt`, and so is a row whose attribute no
-//!   admitted write can hold (a `Bytes` value, or one over 64 bytes), for
-//!   reads and for the deletes and patches that would index it.
-//! - A state header of another format is `Incompatible`, and a map handle
-//!   that no map has is `Corrupt`.
+//! On a snapshot a failed, missing or corrupt node surfaces as the storage
+//! error, never as an absent record or a rejection. On a branch it also
+//! poisons the branch and records no receipt.
 //!
 //! The unit test `engine::tests` checks that a failed branch operation
 //! leaves the branch's state as it was before the operation. What this file
-//! does not establish: durability, caching or manifests (node step N3c).
+//! does not establish: durability, caching or manifests.
 
 #[path = "../../arkiv-db-trie/tests/support/mod.rs"]
 mod trie_support;
@@ -64,10 +41,6 @@ use trie_support::reference;
 
 const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 const BOB: OwnerId = OwnerId::new([0xb0; 20]);
-
-// ---------------------------------------------------------------------------
-// The test object store
-// ---------------------------------------------------------------------------
 
 /// Objects by space and id, with read counting and fault injection.
 struct TestStore {
@@ -148,10 +121,6 @@ impl ObjectReader for TestStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The fixture: a small state built in memory, then reopened from its objects
-// ---------------------------------------------------------------------------
-
 fn ns(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).unwrap()
 }
@@ -222,10 +191,6 @@ fn reopened() -> (Engine, Engine, Arc<TestStore>) {
     (memory, engine, store)
 }
 
-// ---------------------------------------------------------------------------
-// Reads
-// ---------------------------------------------------------------------------
-
 /// A read of a snapshot, returning its outcome as debug text.
 type SnapshotRead = fn(&Snapshot) -> Result<String, StorageError>;
 
@@ -254,7 +219,7 @@ fn mixed() -> Query {
     }
 }
 
-/// Every metered read of the fixture and the statistics, traced, so the
+/// Every metered read of the fixture and the statistics, traced(), so the
 /// debug text holds values, receipts with ledgers and physical traces.
 fn snapshot_reads() -> Vec<(&'static str, SnapshotRead)> {
     vec![
@@ -365,7 +330,6 @@ fn missing_and_corrupt_objects_are_availability_errors() {
     let head = memory.head_snapshot();
     let objects = head.staged_objects();
     let header = head.state_header();
-    let traced = Budget::unlimited().traced();
     // Namespace 2's objects: its row map is one leaf (one record).
     let ns2: Vec<_> = objects
         .iter()
@@ -401,7 +365,7 @@ fn missing_and_corrupt_objects_are_availability_errors() {
                 &Projection::ALL,
                 10,
                 None,
-                traced,
+                traced(),
             );
             let consistent = snapshot.try_index_consistent(ns(2));
             let failures: Vec<StorageErrorKind> = [walk.err(), consistent.err()]
@@ -421,37 +385,25 @@ fn missing_and_corrupt_objects_are_availability_errors() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Branches
-// ---------------------------------------------------------------------------
-
 /// An operation on a branch, returning its outcome as debug text.
 type BranchCall = fn(&mut Branch) -> Result<String, StorageError>;
 
+fn exec(branch: &mut Branch, actor: OwnerId, op: WriteOp) -> Result<String, StorageError> {
+    text(branch.try_execute(actor, op, traced()))
+}
+
 fn calls() -> Vec<(&'static str, BranchCall)> {
     vec![
-        ("put", |branch| {
-            branch
-                .try_execute(ALICE, put(1, b"k03", b"new"), Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
-        }),
+        ("put", |branch| exec(branch, ALICE, put(1, b"k03", b"new"))),
         ("delete", |branch| {
             let op = WriteOp::Delete {
                 namespace: ns(1),
                 key: b"k04".to_vec(),
             };
-            branch
-                .try_execute(ALICE, op, Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            exec(branch, ALICE, op)
         }),
         ("create record", |branch| {
-            branch
-                .try_execute(
-                    ALICE,
-                    record(1, b"new", "rust", 9),
-                    Budget::unlimited().traced(),
-                )
-                .map(|r| format!("{r:?}"))
+            exec(branch, ALICE, record(1, b"new", "rust", 9))
         }),
         ("patch record", |branch| {
             let op = WriteOp::PatchRecord {
@@ -460,26 +412,20 @@ fn calls() -> Vec<(&'static str, BranchCall)> {
                 set: vec![(name("kind"), Cell::attribute(Value::I64(-1)))],
                 remove: vec![name("h")],
             };
-            branch
-                .try_execute(ALICE, op, Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            exec(branch, ALICE, op)
         }),
         ("delete record (host)", |branch| {
             let op = WriteOp::DeleteRecord {
                 namespace: ns(1),
                 key: key(&[b'r', 6]),
             };
-            branch
-                .try_execute_host(op, Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            text(branch.try_execute_host(op, traced()))
         }),
         ("create namespace", |branch| {
             let op = WriteOp::CreateNamespace {
                 name: NamespaceName::new("gamma").unwrap(),
             };
-            branch
-                .try_execute(BOB, op, Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            exec(branch, BOB, op)
         }),
         ("transfer", |branch| {
             let op = WriteOp::TransferNamespace {
@@ -487,55 +433,40 @@ fn calls() -> Vec<(&'static str, BranchCall)> {
                 expected_revision: Revision(0),
                 new_owner: BOB,
             };
-            branch
-                .try_execute(ALICE, op, Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            exec(branch, ALICE, op)
         }),
         ("unauthorized put", |branch| {
-            branch
-                .try_execute(BOB, put(1, b"k", b"v"), Budget::unlimited().traced())
-                .map(|r| format!("{r:?}"))
+            exec(branch, BOB, put(1, b"k", b"v"))
         }),
         ("estimate", |branch| {
-            branch
-                .try_estimate(
-                    ALICE,
-                    record(1, b"est", "red", 2),
-                    Budget::unlimited().traced(),
-                )
-                .map(|r| format!("{r:?}"))
+            text(branch.try_estimate(ALICE, record(1, b"est", "red", 2), traced()))
         }),
         ("host put", |branch| {
-            branch
-                .try_host_put([1; 32], b"changed")
-                .map(|r| format!("{r:?}"))
+            text(branch.try_host_put([1; 32], b"changed"))
         }),
         ("host remove", |branch| {
-            branch.try_host_remove(&[2; 32]).map(|r| format!("{r:?}"))
+            text(branch.try_host_remove(&[2; 32]))
         }),
         ("query", |branch| {
             let query = Query::term(Term::starts_with(name("kind"), "ru"));
-            branch
-                .try_query(
-                    ns(1),
-                    &query,
-                    &Projection::ALL,
-                    10,
-                    None,
-                    Budget::unlimited(),
-                )
-                .map(|r| format!("{r:?}"))
+            text(branch.try_query(
+                ns(1),
+                &query,
+                &Projection::ALL,
+                10,
+                None,
+                Budget::unlimited(),
+            ))
         }),
         ("expiry sweep", |branch| {
-            try_expire_records(
+            text(try_expire_records(
                 branch,
                 ns(1),
                 &name("h"),
                 BlockNumber(3),
                 Budget::unlimited(),
                 Budget::unlimited(),
-            )
-            .map(|r| format!("{r:?}"))
+            ))
         }),
     ]
 }
@@ -626,10 +557,6 @@ fn a_storage_error_poisons_the_branch_and_records_nothing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Leaves that contradict their keys, and invalid headers
-// ---------------------------------------------------------------------------
-
 /// The encoded single-leaf catalog node for 8-byte key `id` and `value`:
 /// `[hex_prefix(16 nibbles, leaf), value]`.
 fn single_leaf(id: u64, value: &[u8]) -> Vec<u8> {
@@ -675,8 +602,8 @@ fn crafted(store: &Arc<TestStore>, id: u64, value: Vec<u8>) -> Result<Engine, St
     Engine::from_state(&header, Limits::DEFAULT, store.clone())
 }
 
-/// One namespace holding records created in `order`, the first deleted
-/// again, so the survivor has id 2.
+/// One namespace where `first` is created and deleted again, so `survivor`
+/// has id 2.
 fn one_survivor(first: &[u8], survivor: &[u8]) -> Snapshot {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
     let mut branch = engine.begin(engine.head(), None).unwrap();
@@ -700,7 +627,6 @@ fn one_survivor(first: &[u8], survivor: &[u8]) -> Snapshot {
 
 #[test]
 fn leaves_that_contradict_their_keys_are_corrupt() {
-    let traced = Budget::unlimited().traced();
     // `a` bound to id 2 in one state; id 2's row holds `b` in another.
     let with_a = one_survivor(b"x", b"a");
     let with_b = one_survivor(b"x", b"b");
@@ -718,8 +644,8 @@ fn leaves_that_contradict_their_keys_are_corrupt() {
     let engine = crafted(&store, 2, honest.clone()).unwrap();
     let snapshot = engine.head_snapshot();
     for error in [
-        snapshot.try_descriptor(ns(2), traced).err(),
-        snapshot.try_get(ns(2), b"k", traced).err(),
+        snapshot.try_descriptor(ns(2), traced()).err(),
+        snapshot.try_get(ns(2), b"k", traced()).err(),
         snapshot.try_record_count(ns(2)).err(),
     ] {
         assert_eq!(
@@ -731,7 +657,7 @@ fn leaves_that_contradict_their_keys_are_corrupt() {
     let engine = crafted(&store, 1, honest).unwrap();
     let got = engine
         .head_snapshot()
-        .try_get_record(ns(1), &key(b"a"), &Projection::KEY_ONLY, traced)
+        .try_get_record(ns(1), &key(b"a"), &Projection::KEY_ONLY, traced())
         .unwrap()
         .unwrap();
     assert_eq!(got.value.unwrap().key, Some(key(b"a")));
@@ -746,7 +672,7 @@ fn leaves_that_contradict_their_keys_are_corrupt() {
     let engine = crafted(&store, 1, mixed).unwrap();
     let error = engine
         .head_snapshot()
-        .try_get_record(ns(1), &key(b"a"), &Projection::KEY_ONLY, traced)
+        .try_get_record(ns(1), &key(b"a"), &Projection::KEY_ONLY, traced())
         .unwrap_err();
     assert_eq!(error.kind, StorageErrorKind::Corrupt, "{error}");
 
@@ -760,7 +686,7 @@ fn leaves_that_contradict_their_keys_are_corrupt() {
     let engine = crafted(&store, 1, uneven).unwrap();
     let error = engine
         .head_snapshot()
-        .try_descriptor(ns(1), traced)
+        .try_descriptor(ns(1), traced())
         .unwrap_err();
     assert_eq!(error.kind, StorageErrorKind::Corrupt, "{error}");
 }
@@ -780,7 +706,6 @@ fn row_value(kind: u8, value: &[u8]) -> Vec<u8> {
 
 #[test]
 fn rows_whose_attributes_cannot_be_indexed_are_corrupt() {
-    let traced = Budget::unlimited().traced();
     // An honest namespace with one record `a` (id 1) holding only a field,
     // so its term map is empty; its row map is replaced below.
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -832,7 +757,7 @@ fn rows_whose_attributes_cannot_be_indexed_are_corrupt() {
         );
         let engine = crafted(&store, 1, leaf).unwrap();
         let snapshot = engine.head_snapshot();
-        let read = snapshot.try_get_record(ns(1), &key(b"a"), &Projection::ALL, traced);
+        let read = snapshot.try_get_record(ns(1), &key(b"a"), &Projection::ALL, traced());
         if readable {
             // The construction is sound: as a field, the same value reads.
             let row = read.unwrap().unwrap().value.unwrap();
@@ -860,7 +785,7 @@ fn rows_whose_attributes_cannot_be_indexed_are_corrupt() {
         ];
         for op in writes {
             let mut branch = engine.begin(engine.head(), None).unwrap();
-            let error = branch.try_execute(ALICE, op, traced).unwrap_err();
+            let error = branch.try_execute(ALICE, op, traced()).unwrap_err();
             assert_eq!(error.kind, StorageErrorKind::Corrupt, "{what}: {error}");
             assert!(branch.is_poisoned(), "{what}");
             assert!(branch.receipts().is_empty(), "{what}");

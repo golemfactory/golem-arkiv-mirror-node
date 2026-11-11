@@ -1,9 +1,8 @@
 # Vendored trie sources
 
-The user explicitly authorized copying the Reth trie implementation and adding
-its dependencies. This supersedes the initial dependency-free restriction for
-the trie integration. The KV storage contract and memory backend remain
-standard-library-only.
+The trie sources are vendored deliberately: path dependencies at pinned
+upstream revisions, so the implementation is local. Only the KV storage
+contract and the memory backend are standard-library-only.
 
 ## Reth extraction
 

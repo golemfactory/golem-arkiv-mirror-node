@@ -91,15 +91,13 @@ pub fn total_key(height: u64) -> HostKey {
     key
 }
 
-/// A block executed on a branch: ready for publication (and, in step N4,
-/// for a durable commit).
+/// A block executed on a branch: ready for publication.
 #[derive(Debug)]
 pub struct ExecutedBlock {
     /// The sealed terminal state.
     pub candidate: SealedCandidate,
     /// What the inputs produced.
     pub outcomes: BlockOutcomes,
-    /// The block's header.
     pub header: Header,
     /// The candidate transactions a producer building the block left out,
     /// in input order; always empty when executing a given block. The block
@@ -112,7 +110,6 @@ pub struct ExecutedBlock {
 pub struct Deferred {
     /// Its index among the candidate inputs.
     pub index: usize,
-    /// Why.
     pub reason: DeferReason,
 }
 
@@ -152,33 +149,20 @@ enum Mode {
 pub enum ScheduleFault {
     /// A due or total entry has a malformed key or a value that is not a
     /// nonzero 8-byte count.
-    MalformedEntry {
-        /// The entry's key.
-        key: HostKey,
-    },
+    MalformedEntry { key: HostKey },
     /// A count to decrement is missing.
-    Underflow {
-        /// The height.
-        height: u64,
-        /// The namespace.
-        namespace: NamespaceId,
-    },
+    Underflow { height: u64, namespace: NamespaceId },
     /// A count does not fit in 64 bits.
     Overflow,
     /// The sweep deleted a different number of records than were due.
     CountMismatch {
-        /// The height.
         height: u64,
-        /// The namespace.
         namespace: NamespaceId,
-        /// The due count.
         due: u64,
-        /// The records deleted.
         deleted: u64,
     },
     /// A height's total differs from the sum of its due counts.
     TotalMismatch {
-        /// The height.
         height: u64,
         /// The stored total (0 if absent).
         total: u64,
@@ -186,10 +170,7 @@ pub enum ScheduleFault {
         due: u64,
     },
     /// A total remains at a swept height without due counts.
-    OrphanTotal {
-        /// The height.
-        height: u64,
-    },
+    OrphanTotal { height: u64 },
 }
 
 /// A broken internal invariant: unreachable under a validated genesis and
@@ -201,18 +182,13 @@ pub enum Invariant {
     Branch,
     /// A statically valid operation was refused at engine admission.
     AdmissionRejected {
-        /// The transaction.
         tx: u32,
-        /// The operation.
         op: u32,
         /// The engine's reason.
         reason: Rejection,
     },
     /// A record's `$expiresAt` cell is not a `U64` attribute.
-    MalformedExpiryCell {
-        /// The namespace.
-        namespace: NamespaceId,
-    },
+    MalformedExpiryCell { namespace: NamespaceId },
     /// The host's own read of a record's expiry was refused.
     ExpiryReadRejected(Rejection),
     /// The sweep read bound overflows under the schedule in force.
@@ -247,7 +223,6 @@ pub enum ExecError {
     StorageCapExceeded {
         /// The units added through the transaction that crossed the cap.
         added: u64,
-        /// The cap.
         cap: u64,
     },
     /// The storage beneath the state failed: an availability error.
@@ -262,10 +237,8 @@ pub enum ExecError {
         namespace: NamespaceId,
         /// Records of that entry deleted before the halt.
         deleted: usize,
-        /// The rejection.
         reason: Rejection,
     },
-    /// A broken invariant.
     Invariant(Invariant),
     /// The block's inputs or position are invalid; nothing was executed.
     InvalidBlock(BlockFault),
@@ -450,8 +423,9 @@ pub fn execute_block_observed(
     )
 }
 
-/// Internal host bookkeeping after each transaction's rollback decision.
-/// Unsigned chains use a no-op; signed hosts advance the account nonce.
+/// [`execute_block_observed`] with host bookkeeping: `after_tx` runs after
+/// each transaction's rollback decision. Unsigned chains pass a no-op; signed
+/// hosts advance the account nonce.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_block_hooked(
     spec: &ChainSpec,
@@ -714,9 +688,6 @@ struct Executor<'s> {
 }
 
 impl<'s> Executor<'s> {
-    // -----------------------------------------------------------------------
-    // Admin inputs.
-
     fn admin(&mut self, input: &AdminInput) -> Result<AdminOutcome, ExecError> {
         let AdminAction::SetPricing(schedule) = &input.action;
         if crate::gas::is_active(self.branch.pricing()) || crate::gas::is_active(schedule) {
@@ -741,9 +712,6 @@ impl<'s> Executor<'s> {
             Err(other) => Err(ExecError::Invariant(Invariant::Engine(other))),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // The due schedule.
 
     fn read_count(&self, key: &HostKey) -> Result<u64, ExecError> {
         match self.branch.try_host_get(key)? {
@@ -789,9 +757,6 @@ impl<'s> Executor<'s> {
         }
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // The expiry sweep.
 
     fn sweep(&mut self) -> Result<Vec<ExpiryDeletion>, ExecError> {
         let bound = sweep_read_bound(self.branch.pricing(), self.spec.limits())
@@ -905,9 +870,6 @@ impl<'s> Executor<'s> {
         }
         Ok(deletions)
     }
-
-    // -----------------------------------------------------------------------
-    // User transactions.
 
     /// An upper bound of the storage units `tx` adds on the current state
     /// ([`crate::arkiv::quote_tx`]): exact when it commits, nothing when it
@@ -1152,10 +1114,10 @@ impl<'s> Executor<'s> {
                 Step::Failed(executed.outcome)
             });
         }
+        // Namespace creation pays the intrinsic fee plus the existing
+        // metered directory/create/root charges. Other generic writes stay
+        // disabled: they do not implement the Arkiv storage-rent contract.
         if crate::gas::is_active(self.branch.pricing())
-            // Namespace creation pays the intrinsic fee plus the existing
-            // metered directory/create/root charges. Other generic writes stay
-            // disabled: they do not implement the Arkiv storage-rent contract.
             && !matches!(op, TxOp::CreateNamespace { .. })
         {
             return Ok(Step::Failed(OpOutcome::HostRejected {

@@ -5,11 +5,9 @@
 
 #![allow(dead_code)]
 
-use std::ops::Bound;
-
 use arkiv_db::{
-    Budget, Cell, CellName, Entry, Limits, NamespaceDescriptor, NamespaceId, NamespaceName,
-    OwnerId, PriceSchedule, Projection, Query, RecordKey, Row, Snapshot, TypeTag, Value,
+    Budget, Cell, CellName, Limits, NamespaceDescriptor, NamespaceId, NamespaceName, OwnerId,
+    PriceSchedule, Projection, Query, RecordKey, Row, Snapshot, Value,
 };
 use arkiv_node::{
     AdminAction, AdminInput, BlockInputs, ChainParams, Expiry, FORMAT_VERSION, Genesis,
@@ -217,14 +215,6 @@ pub fn raw(snapshot: &Snapshot, namespace: u64, key_bytes: &[u8]) -> Option<Vec<
         .value
 }
 
-pub fn scan(snapshot: &Snapshot, namespace: u64) -> Vec<Entry> {
-    snapshot
-        .try_scan_prefix(ns(namespace), b"", Budget::unlimited())
-        .expect("memory engine")
-        .expect("valid read")
-        .value
-}
-
 pub fn descriptor(snapshot: &Snapshot, namespace: u64) -> Option<NamespaceDescriptor> {
     snapshot
         .try_descriptor(ns(namespace), Budget::unlimited())
@@ -244,8 +234,7 @@ pub fn host_entries(snapshot: &Snapshot) -> Vec<([u8; 32], Vec<u8>)> {
         .expect("memory engine")
 }
 
-/// Every row matching `query`, walked page by page with the instance's
-/// largest page.
+/// Every row matching `query`, walked `page` rows at a time.
 pub fn query_all(
     snapshot: &Snapshot,
     namespace: u64,
@@ -273,26 +262,6 @@ pub fn query_all(
             Some(next) => cursor = Some(next),
             None => return rows,
         }
-    }
-}
-
-/// The smallest `U64` term of `name`, if any.
-pub fn smallest_u64(snapshot: &Snapshot, namespace: u64, name_text: &str) -> Option<u64> {
-    let terms = snapshot
-        .try_terms(
-            ns(namespace),
-            &name(name_text),
-            TypeTag::U64,
-            Bound::Unbounded,
-            1,
-            Budget::unlimited(),
-        )
-        .expect("memory engine")
-        .expect("valid read")
-        .value;
-    match terms.first() {
-        Some(Value::U64(value)) => Some(*value),
-        _ => None,
     }
 }
 

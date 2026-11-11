@@ -1,15 +1,12 @@
-//! In-memory storage structures: the mutable ordered KV backend, the
-//! immutable, structurally shared map used for engine snapshots, and the
-//! volatile reference implementation of the versioned storage contract.
+//! In-memory storage: the mutable ordered KV backend and the volatile
+//! reference implementation of the versioned storage contract.
 
-mod persistent;
 mod versioned;
 
 use std::{collections::BTreeMap, convert::Infallible, ops::Bound};
 
 use arkiv_db_storage::{Entry, KvStore, WriteBatch, WriteOperation};
 
-pub use persistent::{PersistentMap, Probe, Range};
 pub use versioned::MemoryVersionedStore;
 
 /// A volatile store backed by the standard library's ordered map.
@@ -23,7 +20,6 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
-    /// Creates an empty store.
     pub const fn new() -> Self {
         Self {
             entries: BTreeMap::new(),

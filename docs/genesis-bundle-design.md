@@ -64,7 +64,7 @@ records, fixed 1 gwei gas price. Recommend finite prefill lifetimes with rent pa
 from an explicit genesis sponsor. Dataset installation consumes Arkiv creation
 nonces, but does not invent signed transactions or consume account transaction
 nonces. Create the `entities` namespace at height 0; block 1 is an ordinary block
-in the new profile. The separate [base-fee plan](base-fee-v1-plan.md) is future
+in the new profile. The separate [base-fee plan](proposals/base-fee.md) is future
 work and is not enabled by these examples.
 
 The complete illustrative authoring set is in

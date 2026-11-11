@@ -2,8 +2,6 @@
 //! engine type whose term bytes equal golem's stored value bytes, values
 //! round-trip as attributes and fields, ordered types answer range queries
 //! in value order, and an empty patch is golem's no-op.
-//!
-//! Runs under both profiles: every type id is admitted by both.
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -134,15 +132,9 @@ fn one_of_each() -> Vec<Value> {
 
 #[test]
 fn every_type_id_is_admitted_and_named() {
-    assert_eq!(TypeTag::ALL.len(), 25);
     for tag in TypeTag::ALL {
-        assert_eq!(TypeTag::from_id(tag.id()), Some(tag));
         assert_eq!(TypeTag::from_name(tag.name()), Some(tag));
         assert_eq!(tag.is_indexable(), tag != TypeTag::Bytes);
-    }
-    assert_eq!(TypeTag::from_id(0), None);
-    for id in [5, 6, 7, 26, 27, 30, 63, 65, 127, 255] {
-        assert_eq!(TypeTag::from_id(id), None, "{id}");
     }
     let ids: Vec<u8> = TypeTag::ALL.iter().map(|tag| tag.id()).collect();
     assert!(

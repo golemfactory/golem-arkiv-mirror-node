@@ -1,4 +1,5 @@
 //! The host boundary: one writer, a published body catalog, bounded polling.
+
 use super::{
     DemoError, Result,
     auth::{HeaderChain, SignedHeader, TrustConfig},
@@ -27,6 +28,7 @@ pub enum Role {
     Full,
     Light,
 }
+
 impl Role {
     pub fn name(self) -> &'static str {
         match self {
@@ -57,6 +59,7 @@ pub struct Node {
     pub response_cap: usize,
     last_progress: Instant,
 }
+
 pub type Shared = Arc<Mutex<Node>>;
 
 fn compatible(spec: &ChainSpec) -> Result<()> {
@@ -83,6 +86,7 @@ fn compatible(spec: &ChainSpec) -> Result<()> {
     }
     Ok(())
 }
+
 impl Node {
     pub fn producer(
         trust: TrustConfig,
@@ -116,6 +120,7 @@ impl Node {
             last_progress: Instant::now(),
         })
     }
+
     pub fn follower(
         role: Role,
         trust: TrustConfig,
@@ -155,11 +160,13 @@ impl Node {
             last_progress: Instant::now(),
         })
     }
+
     pub fn height(&self) -> u64 {
         self.chain
             .as_ref()
             .map_or(self.headers.head().header.height, MemoryChain::height)
     }
+
     fn header(&self, height: u64) -> Result<&crate::Header> {
         if height > self.height() {
             return Err(DemoError::BlockNotSynced);
@@ -169,6 +176,7 @@ impl Node {
             .map(|h| &h.header)
             .ok_or(DemoError::UnknownBlock)
     }
+
     pub fn status(&self) -> Status {
         let h = self.header(self.height()).expect("accepted head");
         Status {
@@ -197,6 +205,7 @@ impl Node {
             conflict_evidence: self.headers.conflicts().iter().map(packed).collect(),
         }
     }
+
     pub fn submit(&mut self, tx: TxEnvelope) -> Result<Json> {
         if self.role != Role::Producer {
             return Err(DemoError::InvalidRequest);
@@ -234,6 +243,7 @@ impl Node {
         result["durability"] = Json::String("pending/included in this volatile run".into());
         Ok(result)
     }
+
     /// Timer and manual triggers share this path under the same mutex.
     pub fn produce(&mut self) -> Result<SignedBlock> {
         if self.role != Role::Producer {
@@ -320,6 +330,7 @@ impl Node {
         self.health = "running".into();
         Ok(body)
     }
+
     pub fn apply_body(&mut self, body: SignedBlock) -> Result<bool> {
         if self.role != Role::Full {
             return Err(DemoError::InvalidRequest);
@@ -355,6 +366,7 @@ impl Node {
         self.blocks.push(Some(body));
         Ok(true)
     }
+
     fn check_snapshot(&self, request: &EqRequest) -> Result<()> {
         let s = &request.snapshot;
         let h = self.header(s.height)?;
@@ -366,6 +378,7 @@ impl Node {
         }
         Ok(())
     }
+
     fn resolve(
         &self,
         height: String,
@@ -413,10 +426,14 @@ impl Node {
             limit,
             continuation: None,
         };
-        Ok(
-            json!({"request":packed(&request), "snapshot":packed(&request.snapshot), "height": height.to_string(), "root": request.snapshot.state_root.to_string()}),
-        )
+        Ok(json!({
+            "request": packed(&request),
+            "snapshot": packed(&request.snapshot),
+            "height": height.to_string(),
+            "root": request.snapshot.state_root.to_string(),
+        }))
     }
+
     fn query_local(&self, request: &EqRequest) -> Result<Json> {
         self.check_snapshot(request)?;
         let chain = self.chain.as_ref().ok_or(DemoError::UnsupportedProof)?;
@@ -477,6 +494,7 @@ impl Node {
             .collect();
         Ok(json!({"outcome":"Page", "rows":rows_json(&rows), "execution":"execution checked"}))
     }
+
     pub fn handle(&mut self, request: Request) -> Result<Json> {
         match request {
             Request::Status {} => json(&self.status()),
@@ -589,6 +607,7 @@ impl Node {
         }
     }
 }
+
 fn request_status_json(status: crate::RequestStatus) -> Json {
     match status {
         crate::RequestStatus::Unknown => json!({"status":"unknown"}),
@@ -596,10 +615,16 @@ fn request_status_json(status: crate::RequestStatus) -> Json {
             json!({"status":"pending", "digest":digest.to_string()})
         }
         crate::RequestStatus::Included(inclusion) => {
-            json!({"status":"included", "height":inclusion.height.to_string(), "index":inclusion.index, "digest":inclusion.digest.to_string()})
+            json!({
+                "status": "included",
+                "height": inclusion.height.to_string(),
+                "index": inclusion.index,
+                "digest": inclusion.digest.to_string(),
+            })
         }
     }
 }
+
 fn unpack_hash(s: &str) -> Result<B256> {
     let bytes = unhex(s, 32)?;
     if bytes.len() != 32 {
@@ -607,12 +632,14 @@ fn unpack_hash(s: &str) -> Result<B256> {
     }
     Ok(B256::from_slice(&bytes))
 }
+
 fn proof_limits() -> ProofLimits {
     ProofLimits {
         max_proof_bytes: (RESPONSE_CAP - 4096) / 2,
         ..ProofLimits::default()
     }
 }
+
 fn proof_error(error: arkiv_db::proof::ProofError) -> DemoError {
     use arkiv_db::proof::ProofError as E;
     match error {
@@ -626,14 +653,31 @@ fn proof_error(error: arkiv_db::proof::ProofError) -> DemoError {
         E::InvalidProof => DemoError::InvalidProof,
     }
 }
-pub fn rows_json(rows: &[Row]) -> Json {
-    Json::Array(rows.iter().map(|row| json!({"id": row.id.ordinal().to_string(), "key":row.key.as_ref().map(|k| hex(k.as_bytes())), "cells": row.cells.iter().map(|(name,cell)| {
+
+fn rows_json(rows: &[Row]) -> Json {
+    let cell_json = |(name, cell): &(CellName, arkiv_db::Cell)| {
         // Text in every case: booleans as true/false, the rest as their
         // value_json text.
         let tag = cell.value.tag().name();
-        let value = match crate::value_json::to_json(&cell.value) { Json::String(text) => text, other => other.to_string() };
-        json!({"name":name.as_str(),"kind":if cell.is_attribute(){"attribute"}else{"field"},"type":tag,"value":value})
-    }).collect::<Vec<_>>() })).collect())
+        let value = match crate::value_json::to_json(&cell.value) {
+            Json::String(text) => text,
+            other => other.to_string(),
+        };
+        let kind = if cell.is_attribute() {
+            "attribute"
+        } else {
+            "field"
+        };
+        json!({"name": name.as_str(), "kind": kind, "type": tag, "value": value})
+    };
+    let row_json = |row: &Row| {
+        json!({
+            "id": row.id.ordinal().to_string(),
+            "key": row.key.as_ref().map(|k| hex(k.as_bytes())),
+            "cells": row.cells.iter().map(cell_json).collect::<Vec<_>>(),
+        })
+    };
+    Json::Array(rows.iter().map(row_json).collect())
 }
 
 #[derive(Clone)]
@@ -644,6 +688,7 @@ struct App {
     proofs: Arc<tokio::sync::Semaphore>,
     verification: Arc<tokio::sync::Semaphore>,
 }
+
 async fn verified_query(app: &App, text: String, peer: Option<String>) -> Result<Json> {
     let _permit = app
         .verification
@@ -712,10 +757,22 @@ async fn verified_query(app: &App, text: String, peer: Option<String>) -> Result
             ("Page", page.rows, page.posting_count, next)
         }
     };
-    Ok(
-        json!({"outcome":outcome, "rows":rows_json(&rows), "nextRequest":next, "height":request.snapshot.height.to_string(), "blockHash":request.snapshot.block_hash.to_string(), "root":request.snapshot.state_root.to_string(), "verification":"query proof verified", "authentication":"producer authenticated", "proofBytes":byte_count.to_string(), "postingCount":posting_count.to_string(), "verificationMicros":verification_micros, "responseMicros":response_micros}),
-    )
+    Ok(json!({
+        "outcome": outcome,
+        "rows": rows_json(&rows),
+        "nextRequest": next,
+        "height": request.snapshot.height.to_string(),
+        "blockHash": request.snapshot.block_hash.to_string(),
+        "root": request.snapshot.state_root.to_string(),
+        "verification": "query proof verified",
+        "authentication": "producer authenticated",
+        "proofBytes": byte_count.to_string(),
+        "postingCount": posting_count.to_string(),
+        "verificationMicros": verification_micros,
+        "responseMicros": response_micros,
+    }))
 }
+
 async fn dispatch(app: App, request: Request) -> Result<Json> {
     if let Request::QueryVerified { request, peer } = request {
         return verified_query(&app, request, peer).await;
@@ -743,6 +800,7 @@ async fn dispatch(app: App, request: Request) -> Result<Json> {
     .await
     .map_err(|_| DemoError::StorageUnavailable)?
 }
+
 async fn http_handler(
     axum::extract::State(app): axum::extract::State<App>,
     request: axum::extract::Request,
@@ -779,6 +837,7 @@ async fn http_handler(
     };
     ([("content-type", "application/json")], bytes).into_response()
 }
+
 /// Serve loopback by default (the CLI requires an explicit address to change it).
 pub async fn serve(node: Shared, listen: &str, interval: Duration) -> Result<()> {
     let app = App {
@@ -847,6 +906,7 @@ pub async fn serve(node: Shared, listen: &str, interval: Duration) -> Result<()>
         .await
         .map_err(|_| DemoError::Transport)
 }
+
 pub async fn sync_once(node: &Shared, client: &reqwest::Client) -> Result<bool> {
     let (role, peer, height, hash) = {
         let node = node.lock().map_err(|_| DemoError::StorageUnavailable)?;

@@ -1,11 +1,11 @@
-//! Nodes rehashed per block against the `RootUpdate` bound (node step N3b).
+//! Nodes rehashed per block against the `RootUpdate` bound.
 //!
 //! Model 3 prepays root maintenance with one `RootUpdate` per logical map
 //! entry write. The cost that prepayment covers is the trie nodes a block
 //! builds and must hash: an entry write in a map with `L`-byte keys creates
 //! at most `2L + 2` nodes (`docs/state-trie.md`): catalog, rows and
-//! postings (8 bytes) 18, raw records (21) 44, host (32) 66, key bindings
-//! (33) 68, terms (88) 178.
+//! postings (8 bytes) 18, raw records (41) 84, host (32) 66, key bindings
+//! (33) 68, terms (164) 330.
 //!
 //! Measurement: every block runs on an engine reopened from the previous
 //! block's committed objects (`Engine::from_state` over an in-memory object
@@ -32,13 +32,14 @@
 //! - Adversarial deep paths, with counts derived by hand from the crafted
 //!   key sets (derivations at each fixture): 66 crafted record keys force a
 //!   branch at every nibble a 33-byte key encoding can branch on; creating
-//!   one more key there rehashes exactly 66 key-map nodes and deleting the
-//!   deepest crafted key exactly 65. 214 terms force a 175-node path
+//!   one more key there rehashes exactly 66 key-map nodes, deleting the
+//!   deepest crafted key 66 again, and deleting the added key 65. 218 terms
+//!   force a 175-node path
 //!   through the term map, the longest a valid term allows (only the name
 //!   length and the high nibbles of the tag and presence bytes can never
 //!   differ while the bytes before them agree; the value length can, since
 //!   a `Str` value may end in zero bytes); adding a record to that term
-//!   rehashes exactly 177 term nodes.
+//!   rehashes exactly 176 term nodes.
 //!
 //! The measured numbers are printed with `--nocapture` and reported in
 //! `docs/state-trie.md`. What this file does not establish: time, memory or
@@ -69,16 +70,10 @@ fn bound(map: MapKind) -> u64 {
         MapKind::Keys => 33,
         // A name and its terminator, tag, presence, a default-limit `Str`
         // and its terminator: 33 + 2 + 129.
-        MapKind::Terms => {
-            (CellName::MAX_LEN + 3 + arkiv_db::Limits::DEFAULT_INDEXED_LEN + 1) as u64
-        }
+        MapKind::Terms => (CellName::MAX_LEN + 3 + Limits::DEFAULT_INDEXED_LEN + 1) as u64,
     };
     2 * key_len + 2
 }
-
-// ---------------------------------------------------------------------------
-// A chain whose every block commits to an object store and reopens
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Store {
@@ -311,10 +306,6 @@ fn report(context: &str, measurement: &Measurement) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn ns(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).unwrap()
 }
@@ -362,10 +353,6 @@ impl Rng {
         self.next() % bound
     }
 }
-
-// ---------------------------------------------------------------------------
-// A mixed workload
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_block_of_a_mixed_workload_stays_within_the_root_update_bound() {
@@ -499,16 +486,12 @@ fn every_block_of_a_mixed_workload_stays_within_the_root_update_bound() {
     assert_eq!(measurement.total_staged(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Adversarial record keys
-// ---------------------------------------------------------------------------
-
 /// 66 record keys that force a branch at every nibble a key encoding can
-/// branch on (the v2 encoding is `len ‖ bytes ‖ 0x00 pad`, 33 bytes, 66
+/// branch on (a 32-byte key encodes as `len ‖ bytes`, 33 bytes, 66
 /// nibbles):
 ///
 /// - the spine: 32 zero bytes, encoded `20 00 … 00`;
-/// - `00` (one byte), encoded `01 00 …`: first nibble 0 against the spine's
+/// - `00` (one byte), encoded `01 00`: first nibble 0 against the spine's
 ///   2;
 /// - for each nibble j of the 32 key bytes (encoding nibbles 2 to 65), 32
 ///   bytes that are zero except that nibble, which is 1.
@@ -588,10 +571,6 @@ fn a_deep_key_path_rehashes_its_whole_path() {
         &measurement,
     );
 }
-
-// ---------------------------------------------------------------------------
-// Adversarial terms
-// ---------------------------------------------------------------------------
 
 /// A 20-character name of `a`s with `replacement` at `position`.
 fn name_with(position: usize, replacement: char) -> String {
@@ -684,7 +663,7 @@ fn a_deep_term_path_rehashes_its_whole_path() {
         format!("{prefix}\0q"),
         format!("{prefix}\0\u{1}"),
         format!("{prefix}\0\0"),
-        prefix.clone(),
+        prefix,
     ]);
     assert_eq!(values.len(), 130);
     for (index, value) in values.iter().enumerate() {

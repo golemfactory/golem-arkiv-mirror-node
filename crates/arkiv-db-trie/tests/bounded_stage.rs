@@ -104,13 +104,13 @@ impl TryObjectSink for Sink {
 
 #[test]
 fn oversize_overflow_and_zero_visit_budget_never_encode() {
-    for len in [1024, usize::MAX] {
+    for (len, overflows) in [(1024, false), (usize::MAX, true)] {
         let value = Measured::new(len);
         let map = one(value.clone());
         let error = map
             .preflight_with(1024, &mut StageBudget::new(1), &mut measured_size)
             .unwrap_err();
-        if len == usize::MAX {
+        if overflows {
             assert_eq!(error, StageError::SizeOverflow);
         } else {
             assert!(

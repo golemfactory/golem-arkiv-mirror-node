@@ -10,12 +10,9 @@ use super::{BenchDir, block, commit, quantile, timed};
 /// One database size, one quick-repair setting.
 #[derive(Clone, Debug)]
 pub struct RecoveryRow {
-    /// Quick repair on every commit.
-    pub quick_repair: bool,
     /// File size when the process was killed, which is also its size at the
     /// reopen (a killed handle writes nothing more).
     pub file_bytes: u64,
-    /// Blocks committed.
     pub blocks: u64,
     /// The reopen after the kill.
     pub open: OpenReport,
@@ -29,12 +26,10 @@ pub struct RecoveryRow {
     /// application's part of the open sequence.
     pub app_backend_at_open: BackendStats,
     /// Backend I/O of one small commit (16 objects of 256 bytes plus
-    /// records), averaged over `probe_commits` commits at this size.
+    /// records), averaged over the probe commits at this size.
     pub commit_io: BackendStats,
     /// Median wall-clock time of those commits.
     pub commit_p50: Duration,
-    /// Commits averaged.
-    pub probe_commits: u64,
 }
 
 fn file_len(path: &std::path::Path) -> u64 {
@@ -108,7 +103,6 @@ pub fn measure(
     assert!(manifest.is_some());
     let app = store.stats().since(&stats_before);
     RecoveryRow {
-        quick_repair,
         file_bytes,
         blocks: height,
         open,
@@ -116,6 +110,5 @@ pub fn measure(
         app_backend_at_open: app.backend.expect("backend stats"),
         commit_io,
         commit_p50: quantile(&mut times, 0.5),
-        probe_commits,
     }
 }

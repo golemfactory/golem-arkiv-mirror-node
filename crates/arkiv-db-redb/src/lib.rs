@@ -2,10 +2,9 @@
 //!
 //! [`RedbStore`] implements
 //! [`VersionedStore`](arkiv_db_storage::versioned::VersionedStore) in one
-//! redb file (redb 4.3.0, pinned exactly). It is the storage candidate of
-//! node step N2; `docs/redb-experiment.md` states its pass criteria and the
-//! measured results. This crate adds no engine integration: it stores the
-//! objects, records and head that callers commit.
+//! redb file; `docs/redb-experiment.md` has the measurements. This crate
+//! adds no engine integration: it stores the objects, records and head that
+//! callers commit.
 //!
 //! # Layout
 //!
@@ -20,12 +19,9 @@
 //! | `objects_host` | `[u8; 32]` → bytes | host objects |
 //! | `objects_ns_<16 hex digits>` | `[u8; 32]` → bytes | one table per namespace, created by its first object |
 //!
-//! Engine storage v1 uses an explicitly identified engine-only profile in
-//! caller metadata: head height is a snapshot sequence, head hash is a
-//! domain-separated manifest digest, and `block_index` maps that digest to
-//! the sequence. `blocks` and `inclusions` remain unused in that profile.
-//! These shapes require no adapter-format change and are not node block
-//! identities. Callers must validate their profile before interpreting them.
+//! The engine-only profile described on
+//! [`Head`](arkiv_db_storage::versioned::Head) uses the same tables and
+//! widths.
 //!
 //! # Guarantees and their mechanism
 //!
@@ -47,7 +43,7 @@
 //! - Bounded object and record reads inspect the borrowed redb value guard's
 //!   length before copying it into the returned buffer. An oversized value
 //!   is `Corrupt`, does not count as an answered read, and does not latch
-//!   the store. This bounds that value copy, not redb's pager/I/O buffers.
+//!   the store.
 //! - The redb `Database` lives in a swappable slot. Any redb I/O error
 //!   (including `PreviousIo`) latches the store `Failed`; every call then
 //!   returns that error until [`recover`](arkiv_db_storage::versioned::VersionedStore::recover)
@@ -79,5 +75,5 @@ pub use counting::{CountingBackend, IoProbe};
 pub use metrics::{DURATION_BUCKETS_NANOSECONDS, OperationTimingSnapshot};
 pub use store::{
     DEFAULT_CACHE_SIZE, DataStats, LayoutStats, OpenReport, RedbConfig, RedbStore,
-    STORE_FORMAT_VERSION, TableLayout, initialization_path, object_table_name,
+    STORE_FORMAT_VERSION, TableLayout, initialization_path,
 };

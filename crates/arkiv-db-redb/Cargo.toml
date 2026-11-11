@@ -13,7 +13,6 @@ redb.workspace = true
 
 [dev-dependencies]
 arkiv-db.workspace = true
-arkiv-db-memory.workspace = true
 
 [lints]
 workspace = true

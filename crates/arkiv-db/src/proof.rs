@@ -1,4 +1,4 @@
-//! Bounded complete equality pages (`eq-page-v1`) and unpaged numeric ranges
+//! Bounded complete equality pages (`eq-page-v1`) and unpaged ordered ranges
 //! ([`RANGE_PROOF_PROFILE`]).
 //!
 //! The verifier takes only caller-selected block identity, local limits,
@@ -9,7 +9,8 @@
 //! describes the live rows; this is not an execution or consensus proof.
 //!
 //! Every equality page carries the entire posting set. Read accounting is
-//! version 4 for these proof APIs (model-3 write/read rules are unchanged).
+//! version 4 for these proof APIs; the write and read rules of
+//! [`MODEL_VERSION`](crate::MODEL_VERSION) are unchanged.
 //! See `docs/eq-proof-charges.md` for charges and conservative reservations.
 
 use std::fmt;
@@ -35,7 +36,7 @@ use crate::{
 
 /// Wire/profile version.
 pub const PROOF_VERSION: u32 = crate::LAYOUT_VERSION;
-/// Read-only counting rules used by this API. Model-3 writes are unchanged.
+/// Read-only counting rules used by this API.
 pub const PROOF_READ_MODEL: u32 = 4;
 
 /// One supported positive equality expression. Ordering and full-row
@@ -479,7 +480,6 @@ fn read_path<'a>(
     }
     Ok(path)
 }
-#[allow(clippy::too_many_arguments)]
 fn proven(
     root: B256,
     key: &[u8],
@@ -674,7 +674,7 @@ fn verify_eq_inner(
     }
     let term_key = TermKey::value(&request.query.attribute, &request.query.value);
     // A term path visits at most `2 · L + 1` nodes for the instance's
-    // longest term key `L` (329 for the default limits).
+    // longest term key `L`.
     let term_path = read_path(
         &mut d,
         2 * TermKey::max_len_for(&limits) + 1,
@@ -883,7 +883,6 @@ fn write_path(e: &mut Encoder, path: &[Vec<u8>]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate(
     catalog: &Catalog,
     nodes: &Nodes,

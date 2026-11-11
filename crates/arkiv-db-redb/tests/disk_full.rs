@@ -73,7 +73,7 @@ fn storage_full_at_any_commit_call_is_full_and_reconciles() {
     let image = {
         let disk = CrashDisk::new();
         let store = crash_store(&disk, config());
-        commit(&store, genesis.clone());
+        commit(&store, genesis);
         disk.crash(store, CrashMode::DurableOnly)
     };
     let trace = {

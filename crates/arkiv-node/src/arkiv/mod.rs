@@ -1,4 +1,5 @@
 //! Versioned Arkiv entity host. Authority and counters live in committed engine state.
+
 mod schema;
 use crate::{ExecError, Expiry, HostFault, OpOutcome};
 use arkiv_db::{
@@ -23,8 +24,7 @@ pub enum ArkivFault {
     Namespace = 11,
     Duplicate = 12,
     GasOverflow = 13,
-    /// Retired: live permanent entities are supported since protocol 5. The
-    /// tag stays reserved and is never produced.
+    /// Reserved tag, never produced.
     PermanentStorageUnsupported = 14,
     UnsupportedGasOperation = 15,
     /// The `bytes` cells of the resulting entity would hold more than
@@ -39,11 +39,13 @@ pub enum ArkivFault {
     /// the owner's alone.
     PermanenceOwnerOnly = 18,
 }
+
 impl Encode for ArkivFault {
     fn encode_to(&self, e: &mut Encoder) {
         e.u8(*self as u8)
     }
 }
+
 impl Decode for ArkivFault {
     const MIN_ENCODED_LEN: usize = 1;
     fn decode_from(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -75,6 +77,7 @@ impl Decode for ArkivFault {
         })
     }
 }
+
 /// One entity operation. User attributes travel as engine cells: an indexed
 /// attribute (ABI `typeId` with [`INDEXED_FLAG`]) is a [`Cell::attribute`],
 /// an unindexed one a [`Cell::field`], so the flag is carried, validated,
@@ -106,6 +109,7 @@ pub enum ArkivOperation {
         key: RecordKey,
     },
 }
+
 impl ArkivOperation {
     pub fn key(&self) -> Option<&RecordKey> {
         match self {
@@ -116,12 +120,14 @@ impl ArkivOperation {
             | Self::Delete { key } => Some(key),
         }
     }
+
     pub fn expiry(&self) -> Option<&Expiry> {
         match self {
             Self::Create { expiry, .. } | Self::ExtendExpiry { expiry, .. } => Some(expiry),
             _ => None,
         }
     }
+
     pub fn validate(&self) -> Result<(), ArkivFault> {
         if self.key().is_some_and(|k| k.as_bytes().len() != 32) {
             return Err(ArkivFault::Value);
@@ -168,6 +174,7 @@ impl ArkivOperation {
         Ok(())
     }
 }
+
 impl Encode for ArkivOperation {
     fn encode_to(&self, e: &mut Encoder) {
         match self {
@@ -206,6 +213,7 @@ impl Encode for ArkivOperation {
         }
     }
 }
+
 impl Decode for ArkivOperation {
     const MIN_ENCODED_LEN: usize = 1;
     fn decode_from(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -239,18 +247,21 @@ impl Decode for ArkivOperation {
         })
     }
 }
+
 pub const ARKIV_ADDRESS: [u8; 20] = [
     0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44,
 ];
 pub fn entity_namespace() -> NamespaceId {
     NamespaceId::from_bytes(1u64.to_be_bytes()).expect("namespace one")
 }
+
 pub fn nonce_key(caller: &[u8; 20]) -> HostKey {
     let mut key = [0u8; 32];
     key[..12].copy_from_slice(b"arkiv/nonce/");
     key[12..].copy_from_slice(caller);
     key
 }
+
 pub fn derive_entity_key(chain_id: u64, caller: &[u8; 20], nonce: u64, salt: u128) -> [u8; 32] {
     let mut bytes = Vec::with_capacity(96);
     bytes.extend_from_slice(&[0; 24]);
@@ -261,6 +272,7 @@ pub fn derive_entity_key(chain_id: u64, caller: &[u8; 20], nonce: u64, salt: u12
     bytes.extend_from_slice(&salt.to_be_bytes());
     alloy_primitives::keccak256(bytes).0
 }
+
 #[derive(Clone, Copy, Debug)]
 pub struct ArkivExecutionContext<'a> {
     pub caller: [u8; 20],
@@ -285,6 +297,7 @@ pub struct ArkivExecutionContext<'a> {
     /// lifetime at or beyond the cap.
     pub allow_permanent_create: bool,
 }
+
 /// One executed operation, the rent it charged and the storage units it
 /// added: both nonzero only when the operation applied (a payer was debited
 /// the rent, or would have been).
@@ -297,6 +310,7 @@ pub struct ArkivOutcome {
     /// [`crate::ChainParams::max_new_storage_units_per_block`].
     pub new_units: u64,
 }
+
 impl From<OpOutcome> for ArkivOutcome {
     fn from(outcome: OpOutcome) -> Self {
         Self {
@@ -306,15 +320,18 @@ impl From<OpOutcome> for ArkivOutcome {
         }
     }
 }
+
 fn name(s: &str) -> CellName {
     CellName::new(s).expect("system name")
 }
+
 fn corrupt() -> ExecError {
     ExecError::Storage(arkiv_db::StorageError::new(
         arkiv_db::StorageErrorKind::Corrupt,
         "Arkiv committed state is malformed",
     ))
 }
+
 fn count(branch: &Branch, key: &HostKey) -> Result<u64, ExecError> {
     match branch.try_host_get(key)? {
         None => Ok(0),
@@ -323,6 +340,7 @@ fn count(branch: &Branch, key: &HostKey) -> Result<u64, ExecError> {
         )),
     }
 }
+
 fn put_count(branch: &mut Branch, key: HostKey, value: u64) -> Result<(), ExecError> {
     if value == 0 {
         branch.try_host_remove(&key)?;
@@ -333,11 +351,13 @@ fn put_count(branch: &mut Branch, key: HostKey, value: u64) -> Result<(), ExecEr
     }
     Ok(())
 }
+
 fn rejected(fault: ArkivFault) -> OpOutcome {
     OpOutcome::HostRejected {
         fault: HostFault::Arkiv(fault),
     }
 }
+
 pub(crate) fn expiry(exp: &Expiry, c: &ArkivExecutionContext<'_>) -> Result<u64, HostFault> {
     let floor = c
         .block_height
@@ -351,6 +371,7 @@ pub(crate) fn expiry(exp: &Expiry, c: &ArkivExecutionContext<'_>) -> Result<u64,
     // valid lifetime; the rent cap bounds what it costs.
     Ok(target)
 }
+
 /// Canonical creation cells shared by live execution and bulk genesis: the
 /// [`SYSTEM_CELLS`] host cells, then the user attributes as given. Callers
 /// validate the operation and expiry before invoking this helper.
@@ -382,6 +403,7 @@ pub(crate) fn create_cells(
     cells.extend_from_slice(attributes);
     cells
 }
+
 /// Execute one operation; the enclosing transaction checkpoint provides atomic batches.
 /// Engine/storage errors remain fatal and may never be downgraded to user rejections.
 ///
@@ -661,6 +683,7 @@ pub fn execute_operation(
         new_units,
     })
 }
+
 /// `cells` after a patch that sets `set` and removes `remove`.
 fn patched(
     cells: &[(CellName, Cell)],
@@ -672,6 +695,7 @@ fn patched(
     cells.extend(set.iter().cloned());
     cells
 }
+
 /// What the Arkiv operations of one transaction would charge, applied in
 /// order on `branch` at `c.block_height`, each seeing what the earlier ones
 /// created or changed: an admission and block-building estimate, never
@@ -689,6 +713,7 @@ pub struct TxQuote {
     /// quoted; a transaction that fails adds nothing, so it never undercounts.
     pub new_units: u64,
 }
+
 /// The entity state the earlier operations of a quoted transaction left:
 /// `None` once deleted.
 type Overlay =
@@ -825,6 +850,7 @@ pub fn quote_tx<'o>(
     }
     Ok(quote)
 }
+
 /// Atomic batch on a branch. Deterministic failure rolls back all cells, indexes,
 /// creation counters, due schedules and rent debits, retaining normal engine
 /// charge receipts. Returns the outcomes and the rent the batch charged (zero

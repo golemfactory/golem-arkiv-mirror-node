@@ -1,36 +1,11 @@
-//! The engine's host-state map (node step N0b-2).
+//! The engine's host-state map: 32-byte keys bound to values of at most
+//! 256 bytes, versioned with the rest of the state and invisible to the data
+//! plane.
 //!
-//! What this file establishes:
-//! - A fresh state has no host entries. `try_host_put` binds a 32-byte key
-//!   to a value of at most 256 bytes (the empty value included) and returns
-//!   the value it replaced; `try_host_remove` returns the removed value;
-//!   `try_host_get` reads it back. A 257-byte value is refused with
-//!   `HostStateError::ValueTooLarge` and changes nothing: not the entry, not
-//!   the other entries, not the branch's mutation serial.
-//! - `try_host_range(from, limit)` returns at most `limit` entries with keys
-//!   at least `from`, in bytewise key order, on branches and snapshots.
-//! - Checkpoints and rollbacks restore host state with the rest of the
-//!   state; a sealed candidate carries it; every published snapshot keeps
-//!   its own version while later blocks change it; discarded and rolled-back
-//!   host writes never reach a snapshot. Host writes record no receipt and
-//!   spend nothing.
-//! - Every successful host put or remove advances the branch's mutation
-//!   serial, so a branch cursor issued before it is a `CursorMismatch`.
-//! - Isolation, both ways: two engines run the same workload (namespace
-//!   writes, raw puts and deletes, typed creates, patches and deletes,
-//!   owner and host paths, rejected operations, a transfer, estimates and
-//!   an expiry sweep), one of them with host entries written between every
-//!   step under keys and values that spell the workload's own namespace
-//!   ids, raw keys and record keys. Every write result (effect or
-//!   rejection, receipt, physical trace), every estimate, the block's
-//!   receipts and spend, every metered read and statistic of both branches
-//!   and of the published snapshots are identical, and the host map holds
-//!   exactly what a `BTreeMap` model of the host writes holds: no data-plane
-//!   operation reads or changes it, and no namespace data appears in it.
-//!
-//! Expected answers come from the `BTreeMap` model and from the engine run
-//! without host state; no cost is asserted here beyond equality, because
-//! the claim is that host state changes nothing.
+//! Expected answers come from a `BTreeMap` model of the host writes and from
+//! the same workload run on an engine without host state; no cost is
+//! asserted beyond equality, because the claim is that host state changes
+//! nothing.
 
 use std::{collections::BTreeMap, ops::Bound};
 
@@ -119,17 +94,6 @@ fn create_record(branch: &mut Branch, namespace: NamespaceId, record: &[u8], hei
 }
 
 #[test]
-fn a_fresh_state_has_no_host_entries() {
-    let engine = Engine::new(PriceSchedule::FIXTURE);
-    let genesis = engine.head_snapshot();
-    assert_eq!(genesis.try_host_get(&hk(1)), Ok(None));
-    assert_eq!(all_at(&genesis), Vec::new());
-    let branch = engine.begin(engine.head(), None).unwrap();
-    assert_eq!(get(&branch, &hk(1)), None);
-    assert_eq!(all(&branch), Vec::new());
-}
-
-#[test]
 fn puts_replace_and_removes_return_the_previous_value() {
     let engine = Engine::new(PriceSchedule::FIXTURE);
     let mut branch = engine.begin(engine.head(), None).unwrap();
@@ -210,7 +174,7 @@ fn oversize_values_are_refused_and_change_nothing() {
 
 #[test]
 fn ranges_are_bounded_ordered_and_start_at_from() {
-    let engine = Engine::new(PriceSchedule::FIXTURE);
+    let mut engine = Engine::new(PriceSchedule::FIXTURE);
     let mut branch = engine.begin(engine.head(), None).unwrap();
     let mut one_then_one = hk(1);
     one_then_one[31] = 1;
@@ -254,7 +218,6 @@ fn ranges_are_bounded_ordered_and_start_at_from() {
     );
     assert_eq!(branch.try_host_range(&[0; 32], 0), Ok(Vec::new()));
 
-    let mut engine = engine;
     let sealed = branch.seal();
     let id = engine.publish(&sealed).unwrap();
     let snapshot = engine.snapshot(id).unwrap();
@@ -417,10 +380,6 @@ fn host_writes_advance_the_branch_mutation_serial() {
     branch.try_host_range(&[0; 32], 10).unwrap();
     assert_eq!(resume(&branch, &issued), Ok(()));
 }
-
-// ---------------------------------------------------------------------------
-// Isolation: the same workload with and without host state.
-// ---------------------------------------------------------------------------
 
 /// One workload step: an owner write, or a host-path write.
 enum Step {

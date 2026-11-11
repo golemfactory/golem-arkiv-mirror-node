@@ -211,7 +211,7 @@ assert.equal((untyped.$attributes as any)["arkiv.schema"]?.value, "posts")
 step("untyped getEntity returns every attribute")
 
 // The longest lifetime SDK 1.0.x sends: ExpirationTime.max(), MAX_LIFETIME
-// blocks from the landing block. The SDK no longer writes permanent entities.
+// blocks from the landing block. SDK 1.0.x cannot write permanent entities.
 const head = async () => BigInt(await read.getBlockNumber())
 const long = await write.createEntity(Probe, { purpose: "max_lifetime" }, { expiration: ExpirationTime.max() })
 const longReceipt = await read.getTransactionReceipt({ hash: long.txHash })

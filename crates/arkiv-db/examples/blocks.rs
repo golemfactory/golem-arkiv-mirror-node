@@ -1,4 +1,4 @@
-//! The milestone-1 flow: two namespaces, ordered metered blocks, an ownership
+//! The block flow: two namespaces, ordered metered blocks, an ownership
 //! transfer that moves no data, rejected operations, a historical read, one
 //! block that touches both namespaces atomically, and the state root that
 //! commits to each block's whole state.

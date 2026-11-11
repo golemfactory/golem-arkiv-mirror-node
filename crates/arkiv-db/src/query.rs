@@ -17,7 +17,7 @@
 //! cursors, `next` and counts are exactly the written evaluation's; charges
 //! remain a pure function of the state and the query, but no longer of the
 //! literal order. Block execution never opts in. The rules are those of the
-//! planner module in `typed`, summarized in `docs/snapshot-query-plan.md`.
+//! planner module in `typed`, summarized in `docs/metering.md`.
 
 use std::{collections::BTreeSet, fmt, ops::Bound, sync::Arc};
 
@@ -36,47 +36,31 @@ use crate::{
 pub enum Term {
     /// The attribute equals `value`.
     Eq {
-        /// Attribute name.
         name: CellName,
         /// Typed value; its type selects the index.
         value: Value,
     },
     /// The attribute has `value`'s type and a different value. A record
     /// lacking the attribute does not match.
-    NotEq {
-        /// Attribute name.
-        name: CellName,
-        /// Typed value.
-        value: Value,
-    },
+    NotEq { name: CellName, value: Value },
     /// The attribute is an ordered value inside the bounds. At least one
     /// bound must be given; both must carry the same ordered type.
     Range {
-        /// Attribute name.
         name: CellName,
-        /// Lower bound.
         lower: Bound<Value>,
-        /// Upper bound.
         upper: Bound<Value>,
     },
     /// The attribute is a `Str` starting with `prefix` (byte-wise on UTF-8).
     StartsWith {
-        /// Attribute name.
         name: CellName,
         /// Prefix; empty matches every `Str` attribute of that name.
         prefix: Arc<str>,
     },
     /// The record has an attribute of that name and type.
-    Exists {
-        /// Attribute name.
-        name: CellName,
-        /// Required type.
-        tag: TypeTag,
-    },
+    Exists { name: CellName, tag: TypeTag },
 }
 
 impl Term {
-    /// Equality on `name`.
     pub fn eq(name: CellName, value: Value) -> Self {
         Self::Eq { name, value }
     }
@@ -86,12 +70,10 @@ impl Term {
         Self::NotEq { name, value }
     }
 
-    /// A range on `name`.
     pub fn range(name: CellName, lower: Bound<Value>, upper: Bound<Value>) -> Self {
         Self::Range { name, lower, upper }
     }
 
-    /// A prefix test on `name`.
     pub fn starts_with(name: CellName, prefix: &str) -> Self {
         Self::StartsWith {
             name,
@@ -120,14 +102,12 @@ impl Term {
 /// the namespace that the term does not match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Literal {
-    /// The predicate.
     pub term: Term,
     /// Whether the literal is the complement of the term.
     pub negated: bool,
 }
 
 impl Literal {
-    /// A positive literal.
     pub const fn of(term: Term) -> Self {
         Self {
             term,
@@ -135,7 +115,6 @@ impl Literal {
         }
     }
 
-    /// A negated literal.
     pub const fn not(term: Term) -> Self {
         Self {
             term,
@@ -175,7 +154,6 @@ impl Query {
 /// Which cells a read returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellSelect {
-    /// No cells.
     None,
     /// Every cell of the record.
     All,
@@ -187,9 +165,7 @@ pub enum CellSelect {
 /// and the cells are opt-in, and only projected bytes are charged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Projection {
-    /// Return the key.
     pub key: bool,
-    /// Which cells to return.
     pub cells: CellSelect,
 }
 
@@ -212,7 +188,7 @@ impl Projection {
         cells: CellSelect::None,
     };
 
-    /// The key plus the named cells.
+    /// The named cells, and the key if `key`.
     pub fn named(key: bool, names: impl IntoIterator<Item = CellName>) -> Self {
         Self {
             key,
@@ -271,12 +247,7 @@ impl fmt::Display for QueryFault {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CursorContext {
     /// A published snapshot of the engine instance.
-    Snapshot {
-        /// Engine instance.
-        instance: u64,
-        /// The pinned snapshot.
-        id: SnapshotId,
-    },
+    Snapshot { instance: u64, id: SnapshotId },
     /// The working state of a branch at one mutation count.
     Branch {
         /// The branch's process-wide token.
@@ -320,17 +291,14 @@ impl Cursor {
         }
     }
 
-    /// The namespace the cursor is bound to.
     pub const fn namespace(&self) -> NamespaceId {
         self.namespace
     }
 
-    /// The query the cursor is bound to.
     pub fn query(&self) -> &Query {
         &self.query
     }
 
-    /// The projection the cursor is bound to.
     pub fn projection(&self) -> &Projection {
         &self.projection
     }

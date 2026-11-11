@@ -1,45 +1,36 @@
-# Architecture: KV foundation and immutable snapshots
+# Architecture
 
 ## Scope and reference
 
-The original KV milestone used
-[`arkiv-source-of-truth` at `2954267`](https://github.com/Arkiv-Network/arkiv-source-of-truth/blob/2954267c5173fcf1c5565f04b7d79bad69af40f2/golem-db.md).
 The upstream [Golem-DB requirements](https://github.com/Arkiv-Network/arkiv-source-of-truth/blob/main/golem-db.md)
-remain a reference. This repository's [single-block contract](single-block-query-proofs.md)
-and [namespace contract](project-namespaces.md) record the implementation
-direction agreed for this prototype. The engine prioritizes Arkiv's block workload and
-deterministic execution; block-facing APIs map block numbers to internal
-snapshots. Consensus and authorization remain host responsibilities. The
-ordinary `Engine` keeps state, history and indexes in memory; the separate
-`durable::DurableEngine` stores them on disk. The
-source's production mechanism is libmdbx; our [node and storage plan](node-storage-plan.md)
-evaluates redb beneath a versioned-state interface. The immediate
-[full/light-node demo](full-light-demo.md) brings a bounded complete
-equality-proof profile before durability. The current dedicated proof APIs also
-support [complete numeric ranges](range-proofs.md).
-Step N2 added that interface
-(`arkiv_db_storage::versioned`) and a redb adapter (`arkiv-db-redb`),
-measured in the [redb experiment](redb-experiment.md). N3c now integrates
-the actual engine through that interface; see the
-[durable lifecycle](engine-storage-run.md) and
-[engine measurements](engine-storage-v1-report.md). The original demo runtime
-remains volatile, while the implemented [simulator](simulator-node.md) and
-[signed-proposer runtime](signed-proposer-v1.md) have durable storage and
-restart paths. N4 references below describe the original milestone plan,
-not a claim that all current node runtimes are volatile.
+are the reference. This repository's [single-block contract](single-block-query-proofs.md)
+and [namespace contract](project-namespaces.md) record the direction taken
+here. The engine prioritizes Arkiv's block workload and deterministic
+execution; block-facing APIs map block numbers to internal snapshots.
+Consensus and authorization are host responsibilities.
 
-The original KV milestone implemented byte-key operations and functional
-tests. Milestones 0, 1 and 2 of the [plan](snapshot-query-plan.md) add the
-block engine above it: project namespaces, immutable snapshots with branches,
+The raw KV facade (`Database`) implements byte-key operations. The block
+engine above it adds project namespaces, immutable snapshots with branches,
 checkpoints and atomic publication, deterministic metering, typed records
 with per-namespace term indexes, and a declared query subset with keyset
-pagination pinned to one snapshot, all in memory. Since node step N3b the
-engine keeps that state in Merkle Patricia maps (`arkiv-db-trie`, node step
-N3a) and every state has a logical state root. The full/light demo implements
-bounded complete equality proofs; N3c persists the same engine state and
-proof material. The memory `Engine` and raw memory facade remain volatile.
-Durable publication explicitly distinguishes committed, definitely absent
-and indeterminate outcomes; an in-process memory publication is unchanged.
+pagination pinned to one snapshot. The engine keeps its state in Merkle
+Patricia maps (`arkiv-db-trie`) and every state has a logical state root.
+Proofs cover complete [equality pages](eq-proof-charges.md) and
+[bounded complete ranges](range-proofs.md).
+
+The ordinary `Engine` keeps state, history and indexes in memory. The
+separate `durable::DurableEngine` stores the same state through the
+versioned storage contract (`arkiv_db_storage::versioned`) and its redb
+adapter (`arkiv-db-redb`); see the [durable lifecycle](engine-storage-run.md),
+the [engine measurements](engine-storage-v1-report.md) and the
+[redb experiment](redb-experiment.md). Durable publication distinguishes
+committed, definitely absent and indeterminate outcomes; a memory
+publication is in-process visibility only.
+
+Of the node runtimes, the [full/light demo](full-light-demo.md) is volatile;
+the [simulator](simulator-node.md) and the
+[signed proposer](signed-proposer-v1.md) have durable storage and restart
+without replay.
 
 ## Crate boundaries
 
@@ -54,7 +45,6 @@ arkiv-db
 arkiv-db-memory
   MemoryStore (KvStore) --------> arkiv-db-storage
   MemoryVersionedStore ---------> arkiv-db-storage::versioned::VersionedStore
-  PersistentMap                   (reference AVL structure; no longer used by the engine)
 arkiv-db-redb
   RedbStore --------------------> arkiv-db-storage::versioned::VersionedStore
                             \---> redb 4.3.0 (pinned), alloy-primitives (keccak256)
@@ -63,17 +53,22 @@ arkiv-db-trie                     (no dependency on arkiv-db or arkiv-db-storage
   MerkleMap / walk / order -----> alloy-trie::nodes::RlpNode, EMPTY_ROOT_HASH
                             \---> alloy-primitives (keccak256, B256), alloy-rlp
   NodeLoader (own trait)          (no dependency on arkiv-db or arkiv-db-storage)
-arkiv-node                        (library, volatile demo, durable simulator/signed runtimes)
+arkiv-node
   block / params / validate / select / identity --> arkiv-db::codec (Encode, Decode, digest)
   exec::execute_block ----------> arkiv-db::{Branch try_ API, try_expire_records}
   replay::MemoryChain ----------> arkiv-db::Engine (memory)
+  arkiv / gas / accounts / retention   (the Arkiv entity host: entities, rent, GLM accounts, serving floor)
+  genesis_*                            (genesis authoring, bundles, streaming and bulk prefill, adoption)
+  demo (arkiv-demo) ------------> arkiv-db::Engine (memory), Ed25519, HTTP
+  simulator (arkiv-simulator) --> arkiv-db::durable::DurableEngine, arkiv-db-redb
+  signed (arkiv-proposer) ------> arkiv-db::durable::DurableEngine, arkiv-db-redb, k256, JSON-RPC/REST
 ```
 
 - `arkiv-db-storage` owns the minimal backend interface and data exchanged
   through it. Operations use raw bytes; point reads and prefix scans return
-  owned data. The contract is fallible so a later file backend can report I/O
+  owned data. The contract is fallible so a file backend can report I/O
   failures without changing successful return types. Its `versioned` module
-  is the separate durable contract of node steps N2–N4: content-addressed
+  is the separate durable contract: content-addressed
   immutable objects per space (catalog, host, one space per namespace),
   insert-only block/manifest/inclusion/index/metadata records and one head,
   committed atomically by compare-and-set with the outcomes `Committed`,
@@ -83,11 +78,9 @@ arkiv-node                        (library, volatile demo, durable simulator/sig
   `RedbStore`'s rule, and the behavioural suite every implementation runs.
   Both are standard-library-only.
 - `arkiv-db-memory` implements that contract with `BTreeMap<Vec<u8>, Vec<u8>>`
-  (`MemoryStore`) and also hosts `PersistentMap`, an immutable AVL tree whose
-  nodes are shared through `Arc`, kept as a reference structure: the engine
-  used it until node step N3b and no longer does. This crate has no record,
-  cell, query, or host knowledge. `MemoryVersionedStore` is the volatile
-  reference implementation of the versioned contract.
+  (`MemoryStore`). This crate has no record, cell, query, or host knowledge.
+  `MemoryVersionedStore` is the volatile reference implementation of the
+  versioned contract.
 - `arkiv-db-redb` implements the versioned contract over one redb file
   (`RedbStore`): one redb transaction per commit with immediate durability
   and quick repair, one object table per namespace, a fresh read transaction
@@ -100,8 +93,8 @@ arkiv-node                        (library, volatile demo, durable simulator/sig
   models. It is not
   standard-library-only (redb uses `libc`). See the
   [redb experiment](redb-experiment.md).
-- `arkiv-db-trie` (node step N3a) is the persistent Merkle Patricia map
-  every engine map is built from (node step N3b): Ethereum MPT node encoding,
+- `arkiv-db-trie` is the persistent Merkle Patricia map every engine map is
+  built from: Ethereum MPT node encoding,
   canonical shape (root = function of the key/value set), `Mem` and
   `Stored` links loaded lazily and hash-verified through a `NodeLoader`
   argument (handles hold no store), a staging walk that emits the nodes
@@ -114,7 +107,7 @@ arkiv-node                        (library, volatile demo, durable simulator/sig
   backend (defaulting to `MemoryStore`), the block engine in the `engine`,
   `meter`, `namespace`, `record`, `query`, `state`, `host` and the private
   `typed`, `layout` (map key and leaf encodings) and `nodes` (the loader
-  seam) modules, the canonical binary codec in `codec` (node step N0b-2),
+  seam) modules, the canonical binary codec in `codec`,
   the durable facade/cache/format/lifecycle in `durable`, and end-to-end
   tests and examples. The common engine types are re-exported from the crate
   root; durable lifecycle types live under `arkiv_db::durable`. Its only
@@ -122,20 +115,21 @@ arkiv-node                        (library, volatile demo, durable simulator/sig
   `alloy-primitives`, for `keccak256` and `B256`; the trie crate brings the
   vendored `alloy-trie` and `alloy-rlp`.
 
-- `arkiv-node` (node step N0b-3) is the host above the engine: block
-  format version 2 (genesis, headers, inputs, envelopes, outcomes) with
-  canonical encodings and hashes, the genesis invariants and the expiry
-  reservation, static validation of requests, block selection, request
-  identities with the pending/inclusion index, `execute_block` (admin
-  inputs, the expiry sweep over a due schedule in the engine's host-state
-  map, then user transactions with per-transaction checkpoints), and
-  `MemoryChain`/`replay` on the memory engine. It reaches engine state
-  only through the fallible `try_` API; its `clippy.toml` bans the
-  infallible forms. Its demo host adds Ed25519 and bounded HTTP dependencies.
-  The node process, RPC and queue (N1) live here; the original demo remains
-  volatile, while the simulator and signed runtimes implement durable node
-  storage and restart. See the
-  [block format](block-format.md#part-2-block-format-version-1).
+- `arkiv-node` is the host above the engine: the block format (genesis,
+  headers, inputs, envelopes, outcomes) with canonical encodings and hashes,
+  the genesis invariants and the expiry reservation, static validation of
+  requests, block selection, request identities with the pending/inclusion
+  index, `execute_block` (admin inputs, the expiry sweep over a due schedule
+  in the engine's host-state map, then user transactions with
+  per-transaction checkpoints), and `MemoryChain`/`replay` on the memory
+  engine. It reaches engine state only through the fallible `try_` API; its
+  `clippy.toml` bans the infallible forms. See the
+  [block format](block-format.md#part-2-block-format). On top of that it
+  holds the Arkiv entity host (`arkiv`, `gas`, `accounts`, `retention`),
+  genesis authoring and prefill (`genesis_*`), and three runtimes, each with
+  its own binary: the volatile `demo` (Ed25519 development authentication),
+  the unsigned durable `simulator`, and `signed`, the durable single-proposer
+  node with full and light followers, JSON-RPC and REST.
 
 Keep future modules in an existing crate until there is a concrete responsibility
 worth separating. Metering, namespaces, records, indexes and queries live as
@@ -185,8 +179,7 @@ separate fixed-width ID. Oversized inputs fail admission before traversal.
 current state in place, reads return owned copies, and scans collect every
 match. A snapshot layer above it would need a full copy per publication
 (O(database size)) or an overlay plus undo log. The engine instead keeps all
-of its state in `arkiv_db_trie::MerkleMap` (node step N3b; an AVL
-`PersistentMap` before):
+of its state in `arkiv_db_trie::MerkleMap`:
 
 - Cloning a map is O(1), so a checkpoint, the per-operation rollback copy, an
   estimation scratch copy and a published snapshot each cost a few pointer
@@ -211,12 +204,12 @@ reachable through the raw facade.
 ### What the raw facade is still for
 
 `Database<S: KvStore>` remains the byte-KV storage foundation and the
-contract a later durable backend implements; its tests pin down the byte-key
+contract a raw durable backend would implement; its tests pin down the byte-key
 semantics that the engine's raw byte maps also follow. It is not the data
 plane: it has no namespaces, snapshots or metering, so nothing done through
 it can bypass namespace or metering rules, because the two structures share
-no state. N3c places persistence beneath the engine's state through
-`DurableEngine`. Merely implementing a redb `KvStore` does not
+no state. `DurableEngine` places persistence beneath the engine's state.
+Merely implementing a redb `KvStore` does not
 persist `Engine`: durable immutable objects, historical manifests, fallible
 lazy reads and atomic block/head publication require a separate contract.
 
@@ -233,7 +226,7 @@ WorkingState {
   catalog: MerkleMap<NamespaceId, NamespaceState>,   // the directory
   next_namespace: u64,                   // ordinal allocator; part of rolled-back state
   pricing: Arc<PriceSchedule>,           // schedule committed in this state
-  host: MerkleMap<[u8; 32], Blob>,       // host-owned entries, values ≤ 256 bytes (N0b-2)
+  host: MerkleMap<[u8; 32], Blob>,       // host-owned entries, values ≤ 256 bytes
 }
 NamespaceState {                          // the catalog leaf ("NamespaceLeaf")
   descriptor: NamespaceDescriptor { id, name, owner, revision },
@@ -268,13 +261,13 @@ byte and appends a `00` terminator:
 The encodings preserve bytewise order, so the raw map iterates in the
 bytewise order of the raw keys (the empty key and trailing zeros included)
 and the term map in the order of `(name, type, existence before value, value
-bytes)`, exactly the orders the engine used before; a prefix scan seeks to
+bytes)`; a prefix scan seeks to
 the encoding of the prefix itself. Unit tests in `layout.rs` compare both
 orders with Rust's slice and tuple ordering on edge cases and random inputs.
 A nested map handle `(EMPTY_ROOT_HASH, 0)` is the empty map; any other
 pairing of the empty root or a zero count is corrupt. Decoding rejects
 everything a leaf alone can contradict (codec rules, name grammar,
-unsorted cells, an attribute of type `Bytes` or over 64 bytes, zero ids,
+unsorted cells, an attribute of type `Bytes` or over the indexed ceiling (512 bytes), zero ids,
 impossible handles, key and row counts that differ, a record allocator not
 above the rows); a catalog leaf whose descriptor names another namespace
 than its key, and a row read by key that holds another key, are corrupt
@@ -292,10 +285,10 @@ leaf is rewritten). A `Branch` owns an `Arc` to its base snapshot plus a
 applying an operation and restores that clone on rejection or on a storage
 error; `checkpoint` stores another clone together with the receipt count.
 
-The host map (node step N0b-2) is a sibling of the catalog, outside every
+The host map is a sibling of the catalog, outside every
 namespace: 32-byte keys to values of at most `HOST_VALUE_MAX` = 256 bytes,
 for schedules the host keeps deterministically in state (the node's expiry
-due counts, N0b-3). Because it is a field of `WorkingState`, checkpoints,
+due counts). Because it is a field of `WorkingState`, checkpoints,
 rollbacks, estimates' scratch copies, sealing and publication treat it like
 the catalog: a rollback restores it, a sealed candidate carries it and every
 snapshot keeps its own version. It is reachable only through the unmetered
@@ -312,10 +305,10 @@ in the state root like the catalog's.
 
 ### State root
 
-Every state has a logical root (`state.rs`, node step N3b):
+Every state has a logical root (`state.rs`):
 
 ```text
-StateHeader { format u32 = 1, catalog_root, catalog_len u64, next_namespace u64,
+StateHeader { format u32 = 2, catalog_root, catalog_len u64, next_namespace u64,
               pricing: PriceSchedule, host_root, host_len u64 }
 state_root = digest("arkiv/state/v1", encode(StateHeader))
 ```
@@ -337,7 +330,7 @@ retention, sensitivity to each field). Root-sharing statistics
 contents count as shared even when the maps were rebuilt.
 
 Every block header commits the state root, and the proofs compose the catalog,
-term, row and key point proofs needed for complete Eq pages. Broader N3d
+term, row and key point proofs needed for complete Eq pages. Broader
 point-read APIs remain open; a root alone is not query evidence.
 
 ### Loaders and storage failures
@@ -349,9 +342,9 @@ hidden `Engine::from_state(header, limits, reader)` test aid opens a state
 from its header over an `arkiv_db_storage::versioned::ObjectReader`,
 reading nothing at open and every node lazily on use, and the hidden
 `Snapshot::staged_objects` returns the nodes a state holds only in memory
-(`Snapshot::hashed_nodes` counts them per map before deduplication, for
+(`SealedCandidate::hashed_nodes` counts them per map before deduplication, for
 the rehash measurements); together they let tests commit a state, reopen it
-and inject storage failures. Node step N3c adds the store context,
+and inject storage failures. `DurableEngine` adds the store context,
 bounded decoded-node cache, manifests and durable head through a separate
 facade that retains no historical state vector. Stored roots share one
 gated loader; recovery invalidates writer generations and cache entries,
@@ -369,7 +362,7 @@ bound to a dense per-namespace
 `RecordId` (from 1, never reused: a deleted key recreated gets a new id) and
 holding up to `max_cells` named cells. A `CellName` follows a fixed ASCII
 grammar (a letter or `$` plus a letter first, then letters, digits, `_`, `-`,
-`.`, `:`; at most 20 bytes); `#` and `@` are unreachable, so engine-reserved
+`.`, `:`; at most 32 bytes); `#` and `@` are unreachable, so engine-reserved
 names can never collide with user names. A cell is an attribute (indexed) or
 a field (stored only) holding one of 25 scalar types (golem-db's full cell
 type grid: `Bool`, `Str`, `Bytes`, fixed bytes of 4/8/16/20/32 bytes,
@@ -420,7 +413,9 @@ claim because a full page has positioned every group at its first match
 beyond the page; a page carries no total because a total would require
 enumerating every match, so `count` is a separate metered read; and nothing
 is reordered or planned, so the charged cost and the abort point are a pure
-function of the state and the query text. Row emission computes the
+function of the state and the query text. A local read may opt in to planned
+evaluation with `Budget::planned` (smallest index source first, same rows and
+order; see [metering](metering.md)); block execution never does. Row emission computes the
 projected byte count before cloning any cell, and a row already loaded by a
 probe or a row-map source is reused for emission rather than loaded again.
 `terms` is a positional read of the same term map: one seek, then
@@ -447,13 +442,14 @@ golem-db's genesis `cell_limits`), `max_page`, `max_groups` and
 checked at admission before any charge, so validation is
 O(`max_groups` × `max_literals` + `max_cells`) and every per-entry step of a
 write or query is bounded by them (a term comparison is at most
-`min(max_indexed_len, max_str_len)` bytes, at most 128; a patch's cell merge is one linear pass, O(cells +
+`min(max_indexed_len, max_str_len)` bytes, 128 by default; a patch's cell merge is one linear pass, O(cells +
 set + remove), over at most 2 × `max_cells` entries).
 
-Indexed strings have a hard 128-byte cap (`Value::MAX_INDEXED_LEN`) and
-cell names a hard 32-byte cap (`CellName::MAX_LEN`), the widths of the
-term-index key; the configured limits may only be smaller, and query
-strings and prefixes obey the indexed-string limit. Namespace names have a
+Indexed strings are limited to 128 bytes by default
+(`Limits::DEFAULT_INDEXED_LEN`) with a hard ceiling of 512
+(`Value::INDEXED_LEN_CEILING`); cell names have a hard 32-byte cap
+(`CellName::MAX_LEN`). The configured limits may only be smaller than the
+hard caps, and query strings and prefixes obey the indexed-string limit. Namespace names have a
 20-character ASCII cap.
 A namespace stores its immutable name in its descriptor; addresses still
 use the stable ID and name-registration policy stays in the host.
@@ -492,7 +488,7 @@ relies on.
 ### Fallible surface
 
 Every `Branch` and `Snapshot` method that walks state has a `try_` form
-(node step N0b-2) returning `Result<T, StorageError>`, where `T` is the
+returning `Result<T, StorageError>`, where `T` is the
 infallible method's return type (`WriteResult`, `ReadResult<_>` or a
 statistic) and `StorageError` is `arkiv_db_storage::versioned::StorageError`,
 re-exported from `arkiv_db`: `try_execute`, `try_execute_host`,
@@ -504,12 +500,12 @@ the statistics (`try_namespace_count`, `try_record_count`,
 `try_index_consistent`, and `host::try_expire_records`, whose result is
 `Result<Result<Vec<(RecordId, Receipt)>, ExpiryHalt>, StorageError>`. A
 `StorageError` is an availability failure: never a rejection, a receipt, a
-missing record or an empty result. Since node step N3b they are truly
+missing record or an empty result. They are truly
 fallible: a map node that cannot be read, is absent (`Missing`) or does
 not verify or decode (`Corrupt`) fails the call, including in the middle of
 an iteration. On a memory engine no map holds a stored node, so the `try_`
-forms always return `Ok` and the infallible methods delegate to them
-(`fallible_api.rs`); the infallible methods panic on a storage error, so a
+forms always return `Ok` and the infallible methods delegate to them;
+the infallible methods panic on a storage error, so a
 host of an engine that reads storage calls only the `try_` forms.
 
 On a snapshot a storage error fails that call only; the snapshot answers
@@ -533,7 +529,7 @@ manifest and its index associations without walking trie state.
 
 ### Canonical codec
 
-`arkiv_db::codec` (node step N0b-2) is the binary encoding of every engine
+`arkiv_db::codec` is the binary encoding of every engine
 type that will be hashed or stored: ids, names, values, cells, record keys,
 `WriteOp`, `Effect`, `Rejection` and its faults, `Outcome`, `Receipt`
 (without its debug ledger), `PriceSchedule`, `Limits` and
@@ -541,13 +537,11 @@ type that will be hashed or stored: ids, names, values, cells, record keys,
 explicit tables, exact consumption and strict decoders that enforce every
 type invariant; `digest(domain, bytes) = keccak256(u8 len(domain) ‖ domain
 ‖ bytes)`. The specification, tag tables and compatibility rules are in the
-[block format](block-format.md), whose part 2 (node step N0b-3) builds
-the block formats of `arkiv-node` on it. For those, the codec gained the
-error variant `DecodeError::UnsupportedVersion`, and `WriteOp::validate`
-(the engine's admission argument checks) became public so that the host's
-static validation is exactly the engine's. Node step N3b adds, from the
-same primitives, the trie leaf layouts and the `StateHeader` of state
-format 1 (above); `DecodeError` gained `Invalid` for them.
+[block format](block-format.md), whose part 2 builds the block formats of
+`arkiv-node` on it. `WriteOp::validate` (the engine's admission argument
+checks) is public so that the host's static validation is exactly the
+engine's. The trie leaf layouts and the `StateHeader` of state format 2
+(above) use the same primitives.
 
 ### Publication, retention, durability
 
@@ -606,7 +600,7 @@ whatever the number of namespaces a lookup visits at most `2·8 + 1` = 17
 nodes (every branch consumes a nibble, every extension at least one and is
 followed by a branch, and the path ends at one leaf) and a write at most 34
 (the lookup path, then the insert path of the updated catalog leaf). The
-bound no longer grows with the namespace count; for dense ids it is much
+bound does not grow with the namespace count; for dense ids it is much
 lower: with ids 1 to 3 a lookup visits 3 nodes, with 1 to 503 it visits 5
 (`isolation.rs`, `query_isolation.rs`). Creation at the cap is rejected with
 `DirectoryFull` after the lookup charge. The constant `DirectoryLookup`
@@ -648,8 +642,7 @@ derived by hand from the trie shapes of their fixtures.
   grows with every retained snapshot's unshared nodes and there is no limit
   on records, terms or snapshots.
 - `PhysicalTrace` counts are non-canonical and change with the data
-  structure (they changed from AVL to trie shapes in node step N3b); they
-  are kept out of receipts.
+  structure; they are kept out of receipts.
 - The fixture weights are uncalibrated. Two schedule invariants must survive
   calibration: `IndexTermCreate > 0` (a distinct term costs more than a
   membership) and the symmetric structural delete weights (`RecordDelete =
@@ -667,7 +660,7 @@ database stores only its current state.
 
 The engine tests use real blocks: a `Branch` per block, per-operation budgets,
 checkpoints, seal, publication and a `host::BlockMap` from block numbers to
-terminal snapshots; the milestone-2 files add record writes, host expiry and
+terminal snapshots; the typed-record tests add record writes, host expiry and
 queries compared with a full-scan reference at every snapshot. See the
 [testing notes](testing.md).
 
@@ -684,79 +677,34 @@ to Arkiv's naming layer.
 
 The directory bound above is measured by the isolation tests for every
 implemented operation, including every query operator. Namespace-local
-roots are composed through the catalog into the state root (node step N3b);
+roots are composed through the catalog into the state root;
 every block header commits that root, and light nodes verify bounded
 catalog paths for Eq pages. Its [proof overhead](eq-proof-charges.md) is
 explicit; broader proof profiles retain their own acceptance gates.
 
-## Next increments
-
-The [snapshot and query implementation plan](snapshot-query-plan.md) records
-the implemented interfaces and proof requirements. Completed foundations:
-
-0. Done: namespace identity/ownership, local addressing and the directory
-   bound are defined and implemented; the cross-namespace interference test
-   exists for every implemented operation.
-1. Done in memory: shared operation metering, write/basic-read budgets, cost
-   receipts and debug ledgers, the namespace catalog, immutable snapshots,
-   branches, checkpoint/rollback, seal and atomic publication, blocks mapped
-   explicitly in a host harness, all snapshots retained for the process
-   lifetime. Eq-page catalog proofs are implemented; N3c persists the same
-   state through `DurableEngine`. Production calibration remains open.
-   (The directory is committed in the state root since node step N3b.)
-2. Done in memory: namespace-local records and cells with frozen encodings,
-   dense record identities, per-namespace term indexes maintained in the
-   writing operation, the declared query subset with record-id ordering,
-   projection and snapshot-pinned keyset pagination, host-executed expiry,
-   instance limits, and model-version-2 metering of every index and query
-   step, with the interference test extended to every operator. Not done:
-   engine-assigned keys, attribute sorting, descending order, offset paging.
-
-Node steps done so far: N0a (the physical traces of queries rejected part
-way) and N0b-1: counting-rule version 3, whose writes prepay root
-maintenance (`RootUpdate` per logical map-entry write, `RowByte` for the
-row a record write leaves behind) and which reserves the point-proof classes
-`ProofNode`/`ProofByte`, and the record-key encoding version 2 that accepts
-the SDK's 32-byte keys. Node step N0b-2 added the canonical codec (codec
-version 1, with golden vectors and the domain-separated digest; see the
-[block format](block-format.md)), the host-state map and the `try_`
-surface. Node step N0b-3 added the `arkiv-node` library: block format
-version 1, the executor that produces and replays blocks (admin inputs,
-expiry, then transactions rolled back whole on failure), static validation,
-selection, request identities and replay on the memory engine. Node step
-N3b moved every engine
-map to `arkiv-db-trie`, added the state root, made the `try_` surface truly
-fallible with branch poisoning, and re-derived the physical literals; every
-block header now carries that root. Its
-`RootUpdate` charges now cover measured rehashing (see the
-[state trie notes](state-trie.md#engine-integration-node-step-n3b)).
-
-The [continuous full/light demo](full-light-demo.md) now implements:
-running producer and independent full followers, root-bearing headers,
-authenticated light followers, and a bounded complete equality-proof
-profile. N3c [engine storage v1](engine-storage-v1.md) now supplies
-disk-backed historical state with bounded loading and preparation. No
-pruning is included. The next work in the
-[node and storage plan](node-storage-plan.md) is N4 durable node production
-and remaining point proofs, followed by
-broader query proofs/SDK support and archive operation. Point proofs alone
-still do not establish query completeness.
-
-The first host uses one producer and one terminal state per block. A disk
-transaction must contain data, indexes, roots, block inputs/outcomes, host
-state and the durable head; expose the new block only after commit. Opening
-an old block loads its immutable state lazily through a bounded RAM cache.
-Node persistence cannot retain the current requirement to keep every
-historical map in RAM or rebuild it by replaying every block on startup.
-
-The current node runtime remains atomic in process and disappears on
-restart. Engine-only durability is implemented and measured; durable
-protocol blocks and producer restart remain N4.
+## Metering and gas
 
 Metering applies to every data-plane operation. Only write receipts are
 converted to gas by Arkiv; read/query receipts support local RPC budgets or
 API billing and never enter consensus. Counting is independent of whether
 storage is in RAM or on disk, and root maintenance is charged per logical
 entry written, not per trie node, so receipts do not depend on the shape of
-a structure. See the plan's
-[cost-accounting rules](snapshot-query-plan.md#operation-cost-is-part-of-the-first-milestone).
+a structure. See [metering](metering.md) for the charge table.
+
+## Known limits
+
+- One proposer, no consensus, finality or fork choice. A proposer signature
+  authenticates the producer, not the execution; full followers re-execute.
+- Proofs exist for complete equality pages and bounded single-attribute
+  ranges. Other query shapes are answered by a full node without a proof,
+  and completeness is always relative to the authenticated index.
+- No physical pruning. `--state-retention` limits which heights are served;
+  nothing is deleted (see the [pruning design](pruning-design.md)).
+- Corruption of a stored object is found when the object is read, not at
+  open.
+- Cache and preparation limits bound retained objects and bytes, not the
+  process's resident memory.
+- Within the query subset there is no attribute sorting, descending order
+  or offset paging in the engine: results are in record-id order with keyset
+  cursors. Keys are caller-assigned; the Arkiv host derives entity keys from
+  the creator and creation nonce.

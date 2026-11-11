@@ -1,4 +1,5 @@
 //! Header-only durable catalog and local stateless Eq verification. No engine or bodies.
+
 use super::{
     Error, Result,
     host::{RunConfig, identity},
@@ -18,6 +19,7 @@ const PROFILE: &[u8] = b"ARKSIMLIGHT1";
 const PROFILE_KEY: &[u8] = b"sim-light/profile";
 const ID_KEY: &[u8] = b"sim-light/identity";
 const CONFLICT_KEY: &[u8] = b"sim-light/conflict";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerifiedRequest {
@@ -29,6 +31,7 @@ pub struct VerifiedRequest {
     pub limit: u32,
     pub cursor: Option<String>,
 }
+
 pub fn resolve(
     identity: &Identity,
     header: &crate::Header,
@@ -84,6 +87,7 @@ pub fn resolve(
         continuation: None,
     })
 }
+
 pub struct Light {
     store: Arc<dyn VersionedStore>,
     pub identity: Identity,
@@ -95,6 +99,7 @@ pub struct Light {
     pub observed: u64,
     continuations: VecDeque<(String, EqRequest, VerifiedContinuation)>,
 }
+
 impl Light {
     pub fn create(store: Arc<dyn VersionedStore>, id: SimulatorIdentity) -> Result<Self> {
         let run: RunConfig = decode_exact(&id.metadata).map_err(|_| Error("InvalidRequest"))?;
@@ -136,6 +141,7 @@ impl Light {
             continuations: VecDeque::new(),
         })
     }
+
     pub fn open(store: Arc<dyn VersionedStore>, expected: &Identity) -> Result<Self> {
         if store
             .read_record_bounded(Table::Meta, PROFILE_KEY, 32)?
@@ -178,6 +184,7 @@ impl Light {
         }
         Ok(light)
     }
+
     fn read_header(&self, height: u64) -> Result<crate::Header> {
         let bytes = self
             .store
@@ -196,6 +203,7 @@ impl Light {
         }
         Ok(header)
     }
+
     pub fn header(&self, height: u64) -> Result<crate::Header> {
         if self.health == "chain-conflict" || self.health == "storage-fenced" {
             return Err(Error("ChainConflict"));
@@ -205,6 +213,7 @@ impl Light {
         }
         self.read_header(height)
     }
+
     fn freeze(&mut self, header: &crate::Header) -> Result<()> {
         self.health = "chain-conflict";
         self.continuations.clear();
@@ -228,6 +237,7 @@ impl Light {
             }
         }
     }
+
     pub fn append(&mut self, headers: &[crate::Header], sampled: &crate::Header) -> Result<()> {
         if self.health == "chain-conflict" || self.health == "storage-fenced" {
             return Err(Error("ChainConflict"));
@@ -330,6 +340,7 @@ impl Light {
         };
         Ok(())
     }
+
     pub fn request(
         &self,
         r: &VerifiedRequest,
@@ -354,6 +365,7 @@ impl Light {
         };
         Ok((request, previous))
     }
+
     pub fn verify(
         &mut self,
         r: &VerifiedRequest,
@@ -363,6 +375,7 @@ impl Light {
     ) -> Result<serde_json::Value> {
         self.verify_page(r, request, previous, bytes, false)
     }
+
     pub fn inspect(
         &mut self,
         r: &VerifiedRequest,
@@ -372,6 +385,7 @@ impl Light {
     ) -> Result<serde_json::Value> {
         self.verify_page(r, request, previous, bytes, true)
     }
+
     fn verify_page(
         &mut self,
         r: &VerifiedRequest,
@@ -408,14 +422,32 @@ impl Light {
             VerifiedEq::Page(p) => p,
         };
         let entities = if request.query.namespace == crate::arkiv::entity_namespace() {
-            page.rows.iter().map(|row| {
-                let p=crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
-                if p.created_at > h.height || p.updated_at > h.height || (p.expires_at != u64::MAX && p.expires_at <= h.height) { return Err(Error("InvalidProof")); }
-                Ok(serde_json::json!({"key":hex(&p.key),"creator":hex(&p.creator),"owner":hex(&p.owner),
-                    "createdAt":p.created_at.to_string(),"updatedAt":p.updated_at.to_string(),"expiresAt":p.expires_at.to_string(),
-                    "creationFlags":{"raw":p.creation_flags,"readonly":p.creation_flags & 1 != 0,"permissionlessExtension":p.creation_flags & 2 != 0},
-                    "attributes":crate::signed::rpc_reads::verified_attributes(&p)?}))
-            }).collect::<Result<Vec<_>>>()?
+            page.rows
+                .iter()
+                .map(|row| {
+                    let p = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
+                    if p.created_at > h.height
+                        || p.updated_at > h.height
+                        || (p.expires_at != u64::MAX && p.expires_at <= h.height)
+                    {
+                        return Err(Error("InvalidProof"));
+                    }
+                    Ok(serde_json::json!({
+                        "key": hex(&p.key),
+                        "creator": hex(&p.creator),
+                        "owner": hex(&p.owner),
+                        "createdAt": p.created_at.to_string(),
+                        "updatedAt": p.updated_at.to_string(),
+                        "expiresAt": p.expires_at.to_string(),
+                        "creationFlags": {
+                            "raw": p.creation_flags,
+                            "readonly": p.creation_flags & 1 != 0,
+                            "permissionlessExtension": p.creation_flags & 2 != 0,
+                        },
+                        "attributes": crate::signed::rpc_reads::verified_attributes(&p)?,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
         };
@@ -436,7 +468,28 @@ impl Light {
                 .push_back((cursor.clone(), request.clone(), token));
             cursor
         });
-        let mut response = serde_json::json!({"verification":"proof verified against trusted simulator root; unsigned source","sourceId":self.identity.source_id,"runId":self.identity.run_id,"genesisHash":self.identity.genesis_hash,"chainId":self.identity.chain_id,"snapshot":{"height":h.height.to_string(),"hash":hex(h.hash().as_slice()),"stateRoot":hex(h.state_root.as_slice())},"query":{"namespace":r.namespace,"attribute":r.attribute,"valueType":r.value_type,"value":r.value,"limit":r.limit},"rows":rows,"continuation":cursor,"postingCount":page.posting_count});
+        let mut response = serde_json::json!({
+            "verification": "proof verified against trusted simulator root; unsigned source",
+            "sourceId": self.identity.source_id,
+            "runId": self.identity.run_id,
+            "genesisHash": self.identity.genesis_hash,
+            "chainId": self.identity.chain_id,
+            "snapshot": {
+                "height": h.height.to_string(),
+                "hash": hex(h.hash().as_slice()),
+                "stateRoot": hex(h.state_root.as_slice()),
+            },
+            "query": {
+                "namespace": r.namespace,
+                "attribute": r.attribute,
+                "valueType": r.value_type,
+                "value": r.value,
+                "limit": r.limit,
+            },
+            "rows": rows,
+            "continuation": cursor,
+            "postingCount": page.posting_count,
+        });
         response["profile"] = serde_json::json!("arkiv-entity-v3");
         response["entities"] = serde_json::json!(entities);
         if let Some(inspection) = inspection {
@@ -450,6 +503,7 @@ impl Light {
         }
         Ok(response)
     }
+
     pub fn continuation_count(&self) -> usize {
         self.continuations.len()
     }

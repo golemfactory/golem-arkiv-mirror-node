@@ -150,7 +150,7 @@ fn io_errors_at_every_commit_call_reconcile_without_re_execution() {
 fn a_failed_final_sync_is_undecided_until_durable_state_is_read() {
     let (parents, candidate) = chain();
     let image = parent_image(&parents);
-    let disk = CrashDisk::from_image(image.clone());
+    let disk = CrashDisk::from_image(image);
     let store = crash_store(&disk, config());
     // With quick repair a commit syncs twice; fail the second (final) one.
     disk.fail(DiskOp::Sync, 1, io::ErrorKind::Other);

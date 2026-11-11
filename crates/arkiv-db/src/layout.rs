@@ -7,8 +7,8 @@
 //! trie branch holds no value). Leaf values are canonical-codec encodings
 //! (codec version [`CODEC_VERSION`](crate::CODEC_VERSION)) and never empty.
 //!
-//! `bytes⁰` is [`order::encode_bytes`]: `00 → 01 01`, `01 → 01 02`, then a
-//! `00` terminator. `text⁺` is [`order::encode_shifted`]: every UTF-8 byte
+//! `bytes⁰` is [`encode_bytes`]: `00 → 01 01`, `01 → 01 02`, then a
+//! `00` terminator. `text⁺` is [`encode_shifted`]: every UTF-8 byte
 //! plus one, then a `00` terminator (exactly `len + 1` bytes; UTF-8 never
 //! holds `ff`). Both are prefix-free and order as the strings do.
 //!
@@ -36,11 +36,11 @@
 //! namespace's space and is staged through [`TrieValue::stage_nested`].
 //!
 //! Decoding checks everything a leaf alone can check (codec rules, name
-//! grammar, sorted unique cells, attributes indexable and at most 128 bytes,
-//! nonzero ids, map handles, the key and row counts agreeing, the allocator
-//! ahead of the rows); what depends on the key the leaf sits under (a
-//! catalog leaf's descriptor id, a row's key) is checked where the leaf is
-//! read.
+//! grammar, sorted unique cells, attributes indexable and within the
+//! indexed-string ceiling, nonzero ids, map handles, the key and row counts
+//! agreeing, the allocator ahead of the rows); what depends on the key the
+//! leaf sits under (a catalog leaf's descriptor id, a row's key) is checked
+//! where the leaf is read.
 
 use std::sync::Arc;
 
@@ -84,10 +84,6 @@ fn decode_leaf<T: Decode>(bytes: &[u8]) -> Result<T, CodecError> {
 fn encode_leaf<T: Encode + ?Sized>(value: &T) -> Vec<u8> {
     crate::codec::encode(value)
 }
-
-// ---------------------------------------------------------------------------
-// Keys
-// ---------------------------------------------------------------------------
 
 /// The ordinal as 8 big-endian bytes, so the catalog iterates in id order.
 impl TrieKey for NamespaceId {
@@ -151,7 +147,7 @@ impl TrieKey for RecordKey {
 }
 
 /// A raw record key of at most [`Limits::MAX_RAW_KEY_LEN`] bytes, empty
-/// included, keyed as `bytes⁰(key)` ([`order::encode_bytes`], 1 to 41
+/// included, keyed as `bytes⁰(key)` ([`encode_bytes`], 1 to 41
 /// bytes).
 ///
 /// The encoding orders exactly as the keys' bytewise order, and the encoding
@@ -259,17 +255,6 @@ impl TermKey {
         out
     }
 
-    /// The run of `Str` value terms of `(name, Str)` whose value starts with
-    /// `prefix`: `[run ‖ shift(prefix), prefix_successor(run ‖ shift(prefix)))`.
-    /// Prefix reads seek to `text⁺(prefix)`, the run's smallest key, and stop
-    /// at the first value without the prefix; this states the run exactly.
-    #[cfg(test)]
-    pub(crate) fn str_prefix_run(name: &CellName, prefix: &[u8]) -> arkiv_db_trie::KeyRange {
-        let mut start = Self::value_run(name, TypeTag::Str);
-        arkiv_db_trie::order::shift_bytes(prefix, &mut start).expect("UTF-8 never holds ff");
-        arkiv_db_trie::KeyRange::prefix(&start)
-    }
-
     /// The longest term key under `limits`: `bytes⁰(name)`, tag, presence
     /// and the longer of a `text⁺` value at the indexed-string limit and the
     /// widest scalar. Bounds proof-walk depth and reservations for one
@@ -362,10 +347,6 @@ impl TrieKey for TermKey {
         Ok(Self { name, tag, value })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Leaf values
-// ---------------------------------------------------------------------------
 
 /// A byte string leaf: raw record values and host values, `u32 len ‖
 /// bytes`, so an empty value is still a nonempty leaf.
@@ -633,9 +614,9 @@ pub(crate) fn valid_handle(root: &B256, len: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! The key encodings order exactly as the orders the engine relied on
-    //! before it moved to tries: bytewise for raw keys, and the derived
-    //! order of `(name, type, Option<term bytes>)` for terms. The expected
+    //! The key encodings order exactly as the engine requires: bytewise
+    //! for raw keys, and the derived order of
+    //! `(name, type, Option<term bytes>)` for terms. The expected
     //! order is Rust's own slice and tuple ordering over an independent
     //! model of each key, never the encoding under test.
 
@@ -714,7 +695,7 @@ mod tests {
         }
         let encodings: Vec<_> = keys.iter().map(|key| raw(key)).collect();
         assert!(arkiv_db_trie::is_prefix_free(&{
-            let mut unique = encodings.clone();
+            let mut unique = encodings;
             unique.sort();
             unique.dedup();
             unique
@@ -771,8 +752,7 @@ mod tests {
     }
 
     /// The model of a term: `(name, type id, None | Some(term bytes))`,
-    /// ordered by Rust's tuple order, exactly the old derived `TermKey`
-    /// order.
+    /// ordered by Rust's tuple order.
     type Model = (String, u8, Option<Vec<u8>>);
 
     fn term(model: &Model) -> TermKey {
@@ -924,7 +904,7 @@ mod tests {
             TermKey::value(&name, &Value::I64(1))
         );
         // The longest keys: a 32-byte name and a ceiling-length string, and
-        // the default instance bound equals the old fixed width.
+        // the default instance bound.
         let longest = TermKey::value(
             &CellName::new(&"n".repeat(CellName::MAX_LEN)).unwrap(),
             &Value::str(&"\0".repeat(Value::INDEXED_LEN_CEILING)),
@@ -939,14 +919,14 @@ mod tests {
         let mut bytes_type = existence.clone();
         bytes_type[2] = TypeTag::Bytes.id();
         assert!(TermKey::decode(&bytes_type).is_err());
-        let mut existence_with_value = existence.clone();
+        let mut existence_with_value = existence;
         existence_with_value.push(0);
         assert!(TermKey::decode(&existence_with_value).is_err());
         assert!(
             TermKey::decode(&one[..one.len() - 1]).is_err(),
             "I64 needs 8 bytes"
         );
-        let mut long_i64 = one.clone();
+        let mut long_i64 = one;
         long_i64.push(0);
         assert!(TermKey::decode(&long_i64).is_err(), "I64 has 8 bytes");
         assert!(
@@ -956,7 +936,7 @@ mod tests {
         let mut trailing = red.clone();
         trailing.push(1);
         assert!(TermKey::decode(&trailing).is_err(), "trailing bytes");
-        let mut not_utf8 = red.clone();
+        let mut not_utf8 = red;
         not_utf8[4] = 0xff;
         assert!(TermKey::decode(&not_utf8).is_err(), "invalid UTF-8");
         assert!(
@@ -975,6 +955,16 @@ mod tests {
         let mut over = over.encode();
         over.insert(4, b'y');
         assert!(TermKey::decode(&over).is_err(), "above the ceiling");
+    }
+
+    /// The run of `Str` value terms of `(name, Str)` whose value starts with
+    /// `prefix`: `[run ‖ shift(prefix), prefix_successor(run ‖ shift(prefix)))`.
+    /// Prefix reads seek to `text⁺(prefix)`, the run's smallest key, and stop
+    /// at the first value without the prefix; this states the run exactly.
+    fn str_prefix_run(name: &CellName, prefix: &[u8]) -> arkiv_db_trie::KeyRange {
+        let mut start = TermKey::value_run(name, TypeTag::Str);
+        arkiv_db_trie::order::shift_bytes(prefix, &mut start).expect("UTF-8 never holds ff");
+        arkiv_db_trie::KeyRange::prefix(&start)
     }
 
     #[test]
@@ -997,7 +987,7 @@ mod tests {
             "\u{10ffff}",
         ];
         for prefix in strings {
-            let run = TermKey::str_prefix_run(&name, prefix.as_bytes());
+            let run = str_prefix_run(&name, prefix.as_bytes());
             for text in strings {
                 let key = TermKey::value(&name, &Value::str(text)).encode();
                 assert_eq!(
@@ -1022,7 +1012,7 @@ mod tests {
     fn leaf_values_never_encode_empty() {
         let key = RecordKey::new(b"k").unwrap();
         let row = StoredRecord {
-            key: key.clone(),
+            key,
             cells: Arc::from(Vec::new()),
         };
         assert!(!row.encodes_empty() && !row.encode().is_empty());
@@ -1082,7 +1072,8 @@ mod tests {
         assert_eq!(StoredRecord::decode(&sorted.encode()).unwrap(), sorted);
         assert!(StoredRecord::decode(&row(&["b", "a"]).encode()).is_err());
         assert!(StoredRecord::decode(&row(&["a", "a"]).encode()).is_err());
-        // Attributes must be indexable and at most 64 bytes; fields need not.
+        // Attributes must be indexable and within the indexed-string
+        // ceiling; fields need not.
         let one = |cell: Cell| StoredRecord {
             key: key.clone(),
             cells: vec![(CellName::new("c").unwrap(), cell)].into(),

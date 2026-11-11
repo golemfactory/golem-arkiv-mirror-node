@@ -337,27 +337,18 @@ impl ChainSpec {
         }
     }
 
-    /// The genesis.
     pub const fn genesis(&self) -> &Genesis {
         &self.genesis
     }
 
-    /// The chain id.
     pub const fn chain_id(&self) -> u64 {
         self.genesis.chain_id
     }
 
-    /// The protocol version.
-    pub const fn protocol_version(&self) -> u32 {
-        self.genesis.protocol_version
-    }
-
-    /// Execution parameters.
     pub const fn params(&self) -> &ChainParams {
         &self.genesis.params
     }
 
-    /// Engine limits.
     pub const fn limits(&self) -> &Limits {
         &self.genesis.limits
     }

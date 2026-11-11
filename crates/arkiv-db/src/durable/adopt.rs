@@ -134,6 +134,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A worker's claim on the queue while it runs one part. Dropping it gives
+/// the claim back and wakes the waiting workers when nothing is left. If the
+/// part panicked, the run is marked failed first, so the other workers stop
+/// instead of waiting for a part that never finishes.
+struct Running<'a, 'b>(&'a Verifier<'b>);
+
+impl Drop for Running<'_, '_> {
+    fn drop(&mut self) {
+        let verifier = self.0;
+        let panicked = std::thread::panicking();
+        if panicked {
+            verifier.failed.store(true, Ordering::Release);
+        }
+        let mut queue = lock(&verifier.queue);
+        queue.active -= 1;
+        if panicked || (queue.active == 0 && queue.parts.is_empty()) {
+            verifier.wake.notify_all();
+        }
+    }
+}
+
 /// The smallest encoded key below a nibble prefix.
 fn lower_bound(mut nibbles: Vec<u8>) -> Vec<u8> {
     if !nibbles.len().is_multiple_of(2) {
@@ -142,7 +163,29 @@ fn lower_bound(mut nibbles: Vec<u8>) -> Vec<u8> {
     nibbles.chunks_exact(2).map(|c| c[0] << 4 | c[1]).collect()
 }
 
-impl Verifier<'_> {
+impl<'a> Verifier<'a> {
+    fn new(
+        source: &'a dyn VersionedStore,
+        state: &'a StateHeader,
+        genesis: &'a EngineGenesis,
+        options: &'a Options,
+        split: u64,
+    ) -> Self {
+        Self {
+            source,
+            state,
+            genesis,
+            options,
+            object_cap: genesis.max_object_bytes as usize,
+            split,
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+            failed: AtomicBool::new(false),
+            error: Mutex::new(None),
+            split_postings: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn run(&self, threads: usize) -> Result<(), DurableError> {
         let catalog = Catalog::from_root(self.state.catalog_root, self.state.catalog_len)
             .map_err(|e| Stop::from(e).0)?;
@@ -199,13 +242,9 @@ impl Verifier<'_> {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
+            let _running = Running(self);
             if let Err(error) = self.part(part, &mut postings) {
                 self.fail(error);
-            }
-            let mut queue = lock(&self.queue);
-            queue.active -= 1;
-            if queue.active == 0 && queue.parts.is_empty() {
-                self.wake.notify_all();
             }
         }
     }
@@ -471,20 +510,7 @@ fn verify_split(
     threads: usize,
     split: u64,
 ) -> Result<(), DurableError> {
-    Verifier {
-        source,
-        state,
-        genesis,
-        options,
-        object_cap: genesis.max_object_bytes as usize,
-        split,
-        queue: Mutex::new(Queue::default()),
-        wake: Condvar::new(),
-        failed: AtomicBool::new(false),
-        error: Mutex::new(None),
-        split_postings: Mutex::new(HashMap::new()),
-    }
-    .run(threads)
+    Verifier::new(source, state, genesis, options, split).run(threads)
 }
 
 impl DurableEngine {
@@ -495,8 +521,7 @@ impl DurableEngine {
     /// [`initialize_bulk`](Self::initialize_bulk) writes it, and nothing else:
     /// no later snapshots, checkpoints or floors, hence no objects of other
     /// states. Every object reachable from the staged state is first read and
-    /// checked as [`initialize_simulator_from_staged`]
-    /// (Self::initialize_simulator_from_staged) checks it while copying:
+    /// checked as [`initialize_simulator_from_staged`] checks it while copying:
     /// content hash, object and batch caps, trie structure, entry counts,
     /// namespace association, row admission and host value bounds. Only the
     /// writes are skipped, and `threads` workers share the reads. Then one
@@ -507,11 +532,12 @@ impl DurableEngine {
     ///
     /// The engine is consumed, so this process keeps no handle that still
     /// interprets the store as staged. After `Committed` the store is the
-    /// database [`initialize_simulator_from_staged`]
-    /// (Self::initialize_simulator_from_staged) would have created, apart from
-    /// its database id, and [`open_simulator`](Self::open_simulator) accepts
-    /// it. After `Indeterminate`, reopen the store and read its
+    /// database [`initialize_simulator_from_staged`] would have created, apart
+    /// from its database id, and [`open_simulator`](Self::open_simulator)
+    /// accepts it. After `Indeterminate`, reopen the store and read its
     /// [`storage_profile`](Self::storage_profile): the relabelling is atomic.
+    ///
+    /// [`initialize_simulator_from_staged`]: Self::initialize_simulator_from_staged
     pub fn adopt_staged_simulator(
         self,
         genesis: EngineGenesis,
@@ -783,6 +809,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_panicking_part_gives_its_claim_back_and_fails_the_run() {
+        let (store, engine, genesis) = staged(1);
+        let state = engine.head_snapshot().state_header();
+        let options = Options::default();
+        let verifier = Verifier::new(&*store, &state, &genesis, &options, SPLIT_ENTRIES);
+        lock(&verifier.queue).active = 1;
+        let part = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _running = Running(&verifier);
+            panic!("a part panics");
+        }));
+        assert!(part.is_err());
+        assert_eq!(lock(&verifier.queue).active, 0);
+        assert!(verifier.failed.load(Ordering::Acquire));
     }
 
     #[test]

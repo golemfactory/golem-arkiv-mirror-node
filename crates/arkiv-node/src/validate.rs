@@ -50,25 +50,12 @@ pub enum TxFault {
         bytes: usize,
     },
     /// Operation `op` names a cell starting with `$` (host-owned).
-    HostOwnedCell {
-        /// Index of the operation.
-        op: u32,
-    },
+    HostOwnedCell { op: u32 },
     /// Operation `op` carries an invalid expiry pair.
-    Expiry {
-        /// Index of the operation.
-        op: u32,
-        /// Why.
-        fault: ExpiryArgumentFault,
-    },
+    Expiry { op: u32, fault: ExpiryArgumentFault },
     /// Operation `op`, as it will execute, fails the engine's argument
     /// validation.
-    Argument {
-        /// Index of the operation.
-        op: u32,
-        /// Why.
-        fault: ArgumentFault,
-    },
+    Argument { op: u32, fault: ArgumentFault },
 }
 
 impl fmt::Display for TxFault {
@@ -99,31 +86,19 @@ pub enum AdminFault {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockFault {
     /// Admin input `index` is invalid.
-    Admin {
-        /// Its position.
-        index: u32,
-        /// Why.
-        fault: AdminFault,
-    },
+    Admin { index: u32, fault: AdminFault },
     /// Transaction `index` is invalid.
-    Tx {
-        /// Its position.
-        index: u32,
-        /// Why.
-        fault: TxFault,
-    },
+    Tx { index: u32, fault: TxFault },
     /// The inputs break a selection limit.
     Selection(SelectionFault),
     /// A request identity appears twice in the block.
     DuplicateIdentity {
-        /// Its scope.
         scope: Scope,
         /// Position of the second occurrence.
         index: u32,
     },
     /// A request identity was already included in an earlier block.
     AlreadyIncluded {
-        /// Its scope.
         scope: Scope,
         /// Its position in this block.
         index: u32,

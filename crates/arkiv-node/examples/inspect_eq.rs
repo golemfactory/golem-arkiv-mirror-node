@@ -1,5 +1,6 @@
 //! Reproducible, in-memory inspection fixture; no service or stored run is touched.
 //! `cargo run -q -p arkiv-node --example inspect_eq -- 20 u64 1 2`
+
 use arkiv_db::durable::Options;
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::simulator::{

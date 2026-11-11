@@ -3,8 +3,8 @@
 //! A request is identified by `(scope, chain_id, actor, request_id)`, with
 //! scope `0x00` for user transactions and `0x01` for admin inputs, so the
 //! same request id may be used once as a transaction and once as an admin
-//! input. Its content is identified by its digest (`arkiv/tx/v1` or
-//! `arkiv/admin/v1`).
+//! input. Its content is identified by its digest
+//! ([`crate::block::TX_DOMAIN`] or [`crate::block::ADMIN_DOMAIN`]).
 //!
 //! [`RequestIndex`] is the state machine the node keeps under one mutex:
 //!
@@ -21,7 +21,7 @@
 //! block that is being produced, or whose commit is indeterminate, stay
 //! pending. Pending means held in memory only: a restart forgets it, and
 //! only an inclusion survives. This module is a pure data structure; the
-//! node runtime (step N1) wraps it with the queue.
+//! node runtime wraps it with the queue.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -69,7 +69,6 @@ impl Decode for Scope {
 pub struct RequestIdentity {
     /// Transaction or admin input.
     pub scope: Scope,
-    /// The chain.
     pub chain_id: u64,
     /// The authenticated actor.
     pub actor: OwnerId,
@@ -134,7 +133,6 @@ impl Decode for RequestIdentity {
 /// Where a request was included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inclusion {
-    /// The block height.
     pub height: u64,
     /// Transaction or admin input.
     pub scope: Scope,
@@ -206,7 +204,6 @@ pub struct RequestIndex {
 }
 
 impl RequestIndex {
-    /// Empty indexes.
     pub const fn new() -> Self {
         Self {
             included: BTreeMap::new(),

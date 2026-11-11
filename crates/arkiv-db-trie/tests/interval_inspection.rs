@@ -1,53 +1,11 @@
+mod support;
+
 use alloy_primitives::keccak256;
 use arkiv_db_trie::{
-    EMPTY_ROOT_HASH, IntervalDecision, IntervalLimits, KeyRange, MAX_INTERVAL_TRACE_NODES,
-    MemoryOnly, MerkleMap, NodeKind, PathChild, PathSource, Probe, ProofError,
+    EMPTY_ROOT_HASH, IntervalDecision, KeyRange, MAX_INTERVAL_TRACE_NODES, MemoryOnly, MerkleMap,
+    NodeKind, PathChild, PathSource, Probe, ProofError,
 };
-
-/// The closed-interval form these tests were written against.
-#[allow(dead_code)]
-fn walk_interval<N: AsRef<[u8]>>(
-    root: arkiv_db_trie::ObjectId,
-    lower: &[u8],
-    upper: &[u8],
-    nodes: &[N],
-    max_entries: usize,
-) -> Result<arkiv_db_trie::IntervalEntries, ProofError> {
-    arkiv_db_trie::walk_interval(
-        root,
-        &KeyRange::closed(lower, upper),
-        nodes,
-        IntervalLimits {
-            max_entries,
-            max_key_len: 256,
-        },
-    )
-}
-
-#[allow(dead_code)]
-fn inspect_interval<N: AsRef<[u8]>>(
-    root: arkiv_db_trie::ObjectId,
-    lower: &[u8],
-    upper: &[u8],
-    nodes: &[N],
-    max_entries: usize,
-) -> Result<
-    (
-        arkiv_db_trie::IntervalEntries,
-        arkiv_db_trie::VerifiedInterval,
-    ),
-    ProofError,
-> {
-    arkiv_db_trie::inspect_interval(
-        root,
-        &KeyRange::closed(lower, upper),
-        nodes,
-        IntervalLimits {
-            max_entries,
-            max_key_len: 256,
-        },
-    )
-}
+use support::{inspect_closed, walk_closed};
 
 fn map<const N: usize>(
     entries: impl IntoIterator<Item = ([u8; N], Vec<u8>)>,
@@ -75,13 +33,13 @@ fn proof<const N: usize>(
 fn branch_trace_distinguishes_open_opaque_and_authenticated_empty_slots() {
     let map = map([9, 10, 15, 20, 21].map(|key| ([key], vec![key; 40])));
     let proof = proof(&map, &[10], &[19]);
-    let (entries, trace) = inspect_interval(map.root_hash(), &[10], &[19], &proof, 5).unwrap();
+    let (entries, trace) = inspect_closed(map.root_hash(), &[10], &[19], &proof, 5).unwrap();
     assert_eq!(
         entries,
         vec![(vec![10], vec![10; 40]), (vec![15], vec![15; 40])]
     );
     assert_eq!(
-        walk_interval(map.root_hash(), &[10], &[19], &proof, 5).unwrap(),
+        walk_closed(map.root_hash(), &[10], &[19], &proof, 5).unwrap(),
         entries
     );
     assert_eq!(trace.nodes.len(), 5);
@@ -137,7 +95,7 @@ fn inline_visits_keep_their_supplied_ancestor_after_a_hashed_sibling() {
     ]);
     let proof = proof(&map, &[0], &[255]);
     assert_eq!(proof.len(), 2);
-    let (entries, trace) = inspect_interval(map.root_hash(), &[0], &[255], &proof, 4).unwrap();
+    let (entries, trace) = inspect_closed(map.root_hash(), &[0], &[255], &proof, 4).unwrap();
     assert_eq!(entries.len(), 4);
     assert_eq!(trace.nodes.len(), 6);
     assert_eq!(trace.nodes[1].path_node.source, PathSource::Hash);
@@ -165,7 +123,7 @@ fn extension_edges_record_prefixes_and_outside_decisions() {
     let outside_proof = proof(&map, &[0xab, 0], &[255, 255]);
     assert_eq!(outside_proof.len(), 1);
     let (entries, outside) =
-        inspect_interval(map.root_hash(), &[0xab, 0], &[255, 255], &outside_proof, 0).unwrap();
+        inspect_closed(map.root_hash(), &[0xab, 0], &[255, 255], &outside_proof, 0).unwrap();
     assert!(entries.is_empty());
     assert_eq!(outside.nodes.len(), 1);
     assert_eq!(outside.nodes[0].path_node.kind, NodeKind::Extension);
@@ -180,7 +138,7 @@ fn extension_edges_record_prefixes_and_outside_decisions() {
     ));
 
     let all_proof = proof(&map, &[0, 0], &[255, 255]);
-    let (_, all) = inspect_interval(map.root_hash(), &[0, 0], &[255, 255], &all_proof, 2).unwrap();
+    let (_, all) = inspect_closed(map.root_hash(), &[0, 0], &[255, 255], &all_proof, 2).unwrap();
     assert_eq!(all.nodes[0].child_decisions, [IntervalDecision::Open]);
     assert_eq!(all.nodes[1].parent_index, Some(0));
     assert_eq!(all.nodes[1].parent_slot, None);
@@ -192,7 +150,7 @@ fn a_visited_boundary_leaf_can_be_excluded_from_results() {
     let map = map([([0x10, 0], vec![1; 40]), ([0x20, 0], vec![2; 40])]);
     let proof = proof(&map, &[0x10, 1], &[0x11, 0]);
     let (entries, trace) =
-        inspect_interval(map.root_hash(), &[0x10, 1], &[0x11, 0], &proof, 0).unwrap();
+        inspect_closed(map.root_hash(), &[0x10, 1], &[0x11, 0], &proof, 0).unwrap();
     assert!(entries.is_empty());
     assert_eq!(trace.nodes.len(), 2);
     let leaf = &trace.nodes[1];
@@ -207,11 +165,11 @@ fn a_visited_boundary_leaf_can_be_excluded_from_results() {
 fn empty_and_reversed_intervals_have_no_visited_nodes() {
     let nodes: Vec<Vec<u8>> = Vec::new();
     for (root, lower, upper) in [(EMPTY_ROOT_HASH, [0], [255]), (keccak256([]), [255], [0])] {
-        let (entries, trace) = inspect_interval(root, &lower, &upper, &nodes, 0).unwrap();
+        let (entries, trace) = inspect_closed(root, &lower, &upper, &nodes, 0).unwrap();
         assert!(entries.is_empty());
         assert!(trace.nodes.is_empty());
         assert_eq!(
-            inspect_interval(root, &lower, &upper, &[vec![0xc0]], 0),
+            inspect_closed(root, &lower, &upper, &[vec![0xc0]], 0),
             Err(ProofError::TrailingNodes { index: 0 })
         );
     }
@@ -224,29 +182,29 @@ fn inspected_witnesses_reject_missing_reordered_mutated_and_trailing_nodes() {
     for omitted in 0..proof.len() {
         let mut incomplete = proof.clone();
         incomplete.remove(omitted);
-        assert!(inspect_interval(map.root_hash(), &[10], &[19], &incomplete, 5).is_err());
+        assert!(inspect_closed(map.root_hash(), &[10], &[19], &incomplete, 5).is_err());
     }
     let mut reordered = proof.clone();
     reordered.swap(2, 3);
     assert!(matches!(
-        inspect_interval(map.root_hash(), &[10], &[19], &reordered, 5),
+        inspect_closed(map.root_hash(), &[10], &[19], &reordered, 5),
         Err(ProofError::HashMismatch { index: 2 })
     ));
     let mut trailing = proof.clone();
     trailing.push(vec![0xc0]);
     assert_eq!(
-        inspect_interval(map.root_hash(), &[10], &[19], &trailing, 5),
+        inspect_closed(map.root_hash(), &[10], &[19], &trailing, 5),
         Err(ProofError::TrailingNodes { index: proof.len() })
     );
     let mut mutated = proof.clone();
     mutated[2][0] ^= 1;
-    assert!(inspect_interval(map.root_hash(), &[10], &[19], &mutated, 5).is_err());
+    assert!(inspect_closed(map.root_hash(), &[10], &[19], &mutated, 5).is_err());
     assert_eq!(
-        inspect_interval(map.root_hash(), &[10], &[19], &proof, 1),
+        inspect_closed(map.root_hash(), &[10], &[19], &proof, 1),
         Err(ProofError::EntryLimitExceeded)
     );
     assert!(matches!(
-        inspect_interval(map.root_hash(), &[10], &[19], &proof[..proof.len() - 1], 5),
+        inspect_closed(map.root_hash(), &[10], &[19], &proof[..proof.len() - 1], 5),
         Err(ProofError::Incomplete { .. })
     ));
 }
@@ -259,13 +217,13 @@ fn inspection_node_limit_rejects_instead_of_truncating_an_otherwise_valid_walk()
     let upper = [255; 4];
     let proof = proof(&map, &lower, &upper);
     assert_eq!(
-        walk_interval(map.root_hash(), &lower, &upper, &proof, count)
+        walk_closed(map.root_hash(), &lower, &upper, &proof, count)
             .unwrap()
             .len(),
         count
     );
     assert_eq!(
-        inspect_interval(map.root_hash(), &lower, &upper, &proof, count),
+        inspect_closed(map.root_hash(), &lower, &upper, &proof, count),
         Err(ProofError::EntryLimitExceeded)
     );
 }

@@ -1,6 +1,7 @@
 //! Build-once streaming genesis through the proposer binary: `stream-build
 //! --state-out` keeps the built state and `producer --prebuilt-state` serves it
-//! without rebuilding, while the legacy producer rebuild remains available.
+//! without rebuilding; the default producer rebuild reaches the same state.
+
 use alloy_primitives::U256;
 use arkiv_db::{Cell, CellName, Value, encode};
 use arkiv_node::{
@@ -23,6 +24,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_arkiv-proposer");
 const MARKER: &[u8] = b"prebuilt-tamper-marker-5b0c1e7f";
 
 struct Temp(PathBuf);
+
 impl Temp {
     fn new(tag: &str) -> Self {
         let path =
@@ -32,6 +34,7 @@ impl Temp {
         Self(path)
     }
 }
+
 impl Drop for Temp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -41,9 +44,11 @@ impl Drop for Temp {
 fn signer() -> Signer {
     Signer::from_bytes([1; 32]).unwrap()
 }
+
 fn address() -> String {
     format!("0x{}", hex(signer().address().as_bytes()))
 }
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -103,6 +108,7 @@ fn inputs(dir: &Path, run: u8) -> (PathBuf, PathBuf, PathBuf) {
 fn run(args: &[&Path]) -> std::process::Output {
     Command::new(BIN).args(args).output().unwrap()
 }
+
 fn stream_build(
     dir: &Path,
     base: &Path,
@@ -148,6 +154,7 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
 fn status(port: u16) -> Option<serde_json::Value> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -167,6 +174,7 @@ struct Producer {
     log: PathBuf,
     port: u16,
 }
+
 impl Producer {
     fn start(
         dir: &Path,
@@ -200,6 +208,7 @@ impl Producer {
             .unwrap();
         Self { child, log, port }
     }
+
     /// The served height-zero status, or the exit status if the producer failed.
     fn ready(&mut self) -> Result<serde_json::Value, std::process::ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -214,10 +223,12 @@ impl Producer {
         }
         panic!("producer readiness timed out: {}", self.log());
     }
+
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 }
+
 impl Drop for Producer {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -233,7 +244,7 @@ fn assert_genesis_head(status: &serde_json::Value, report: &serde_json::Value) {
 }
 
 #[test]
-fn producer_serves_the_prebuilt_state_without_rebuilding_and_legacy_rebuild_agrees() {
+fn producer_serves_the_prebuilt_state_without_rebuilding_and_the_default_rebuild_agrees() {
     let tmp = Temp::new("once");
     let (base, input, key) = inputs(&tmp.0, 7);
     let (bundle, state) = (tmp.0.join("bundle"), tmp.0.join("genesis-state"));
@@ -267,13 +278,13 @@ fn producer_serves_the_prebuilt_state_without_rebuilding_and_legacy_rebuild_agre
     assert!(restarted.log().contains(r#""result":"initialized""#));
     drop(restarted);
 
-    // The legacy producer rebuild from the same bundle reaches the same root.
-    let legacy_node = tmp.0.join("legacy-node");
-    let mut legacy = Producer::start(&tmp.0, &legacy_node, &bundle, &key, None, "legacy");
-    assert_genesis_head(&legacy.ready().unwrap(), &report);
-    assert!(legacy.log().contains("bulk_normalize"));
-    assert!(!legacy.log().contains("prefill_prebuilt_install"));
-    drop(legacy);
+    // The default producer rebuild from the same bundle reaches the same root.
+    let rebuild_node = tmp.0.join("rebuild-node");
+    let mut rebuild = Producer::start(&tmp.0, &rebuild_node, &bundle, &key, None, "rebuild");
+    assert_genesis_head(&rebuild.ready().unwrap(), &report);
+    assert!(rebuild.log().contains("bulk_normalize"));
+    assert!(!rebuild.log().contains("prefill_prebuilt_install"));
+    drop(rebuild);
 
     // And a bundle authored without --state-out is byte-identical.
     let plain = tmp.0.join("plain-bundle");

@@ -4,6 +4,7 @@
 //!
 //! The library tests drive the same steps as the producer and stop between
 //! them, as a crash would; the binary tests run `arkiv-proposer` itself.
+
 use alloy_primitives::U256;
 use arkiv_db::{
     Budget, Cell, CellName, Literal, Projection, Query, RecordKey, Term, Value, decode_exact,
@@ -40,6 +41,7 @@ const MARKER: &[u8] = b"adopt-tamper-marker-7f3e9a21";
 const SOURCE: [u8; 16] = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1];
 
 struct Temp(PathBuf);
+
 impl Temp {
     fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!("arkiv-adopt-{tag}-{}", std::process::id()));
@@ -48,6 +50,7 @@ impl Temp {
         Self(path)
     }
 }
+
 impl Drop for Temp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -57,9 +60,11 @@ impl Drop for Temp {
 fn signer() -> Signer {
     Signer::from_bytes([1; 32]).unwrap()
 }
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
 fn address() -> String {
     format!("0x{}", hex(signer().address().as_bytes()))
 }
@@ -145,6 +150,7 @@ fn history(run: &Path, genesis: &SignedGenesis) -> History {
         History::create(store, genesis.hash()).unwrap()
     }
 }
+
 fn certificate(genesis: &SignedGenesis) -> SignedHeader {
     SignedHeader::sign(genesis, genesis.header(), &signer()).unwrap()
 }
@@ -407,6 +413,7 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
 fn http(
     port: u16,
     method: &str,
@@ -422,7 +429,13 @@ fn http(
     let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Connection: close\r\n\
+         {auth}Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {body}",
         body.len()
     )
     .ok()?;
@@ -440,6 +453,7 @@ struct Producer {
     port: u16,
     private: u16,
 }
+
 impl Producer {
     fn start(
         dir: &Path,
@@ -481,6 +495,7 @@ impl Producer {
             private,
         }
     }
+
     fn ready(&mut self) -> Result<serde_json::Value, std::process::ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
@@ -494,6 +509,7 @@ impl Producer {
         }
         panic!("producer readiness timed out: {}", self.log());
     }
+
     /// The full node's equality-page proof bytes for every fixture entity
     /// at height zero: identical state gives identical bytes.
     fn query(&self) -> serde_json::Value {
@@ -516,10 +532,12 @@ impl Producer {
         )
         .unwrap()
     }
+
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 }
+
 impl Drop for Producer {
     fn drop(&mut self) {
         let _ = self.child.kill();

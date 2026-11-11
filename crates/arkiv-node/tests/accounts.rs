@@ -18,12 +18,15 @@ use arkiv_node::{
     },
 };
 use std::sync::Arc;
+
 fn signer(n: u8) -> Signer {
     Signer::from_bytes([n; 32]).unwrap()
 }
+
 fn glm(n: u64) -> U256 {
     U256::from(n) * U256::from(1_000_000_000_000_000_000u64)
 }
+
 fn genesis() -> SignedGenesis {
     SignedGenesis::new(
         default_native_genesis(9300, 1000, 1000),
@@ -38,6 +41,7 @@ fn genesis() -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn create_host(
     g: &SignedGenesis,
     p: bool,
@@ -56,6 +60,7 @@ fn create_host(
     )
     .unwrap()
 }
+
 fn host(g: &SignedGenesis, p: bool) -> Host {
     create_host(
         g,
@@ -64,6 +69,7 @@ fn host(g: &SignedGenesis, p: bool) -> Host {
         Arc::new(MemoryVersionedStore::new()),
     )
 }
+
 fn tx(g: &SignedGenesis, who: u8, nonce: u64, budget: u64, ops: Vec<TxOp>) -> SignedTx {
     let mut request = [who; 32];
     request[24..].copy_from_slice(&nonce.to_be_bytes());
@@ -81,12 +87,14 @@ fn tx(g: &SignedGenesis, who: u8, nonce: u64, budget: u64, ops: Vec<TxOp>) -> Si
     )
     .unwrap()
 }
+
 fn transfer(who: u8, amount: U256) -> TxOp {
     TxOp::Transfer {
         to: signer(who).address(),
         amount,
     }
 }
+
 fn create(salt: u128) -> TxOp {
     TxOp::Arkiv {
         namespace: arkiv::entity_namespace(),
@@ -110,11 +118,13 @@ fn create(salt: u128) -> TxOp {
         },
     }
 }
+
 fn balance(h: &Host, n: u8) -> U256 {
     h.account(h.head.height, signer(n).address())
         .unwrap()
         .balance
 }
+
 fn proofs(h: &Host, l: &Light, n: u8, height: u64) -> (accounts::Account, U256, U256) {
     let snapshot = h
         .engine
@@ -131,6 +141,7 @@ fn proofs(h: &Host, l: &Light, n: u8, height: u64) -> (accounts::Account, U256, 
     )
     .unwrap()
 }
+
 fn relay(p: &Host, f: &mut Host, l: &mut Light) {
     let block = p.block(p.head.height).unwrap();
     f.import(block.clone()).unwrap();
@@ -139,6 +150,7 @@ fn relay(p: &Host, f: &mut Host, l: &mut Light) {
     assert_eq!(p.head, f.head);
     assert_eq!(p.head, l.head);
 }
+
 #[test]
 fn funded_lifecycle_fee_burn_replay_proofs_and_restart() {
     let g = genesis();
@@ -214,6 +226,7 @@ fn funded_lifecycle_fee_burn_replay_proofs_and_restart() {
     assert_eq!(p.submit(send).unwrap(), status);
     assert_eq!(proofs(&p, &l, 3, 3).0, account);
 }
+
 #[test]
 fn insufficient_funds_pending_reservation_and_exact_zero_balance() {
     let mut g = genesis();
@@ -274,6 +287,7 @@ fn insufficient_funds_pending_reservation_and_exact_zero_balance() {
         U256::ZERO
     );
 }
+
 #[test]
 fn failed_operations_rollback_value_and_entities_but_pay_and_consume_nonce() {
     let g = genesis();
@@ -369,6 +383,7 @@ fn failed_operations_rollback_value_and_entities_but_pay_and_consume_nonce() {
     relay(&p, &mut f, &mut l);
     assert_eq!(balance(&p, 2), before - accounts::fee(21_000));
 }
+
 #[test]
 fn genesis_and_signature_commit_accounts() {
     let g = genesis();
@@ -404,6 +419,7 @@ fn genesis_and_signature_commit_accounts() {
     bad.accounts = AccountConfig::new(vec![(signer(2).address(), glm(1))]).unwrap();
     assert_eq!(bad.validate().unwrap_err().0, "UnfundedBootstrap");
 }
+
 #[test]
 fn proofs_reject_wrong_key_root_truncation_and_tampering() {
     let g = genesis();
@@ -438,6 +454,7 @@ fn proofs_reject_wrong_key_root_truncation_and_tampering() {
     assert!(f.import(block).is_err());
     assert_eq!(f.head.height, 1);
 }
+
 #[test]
 fn overflow_and_insufficient_value_are_atomic_with_charged_account_receipt() {
     // Deliberately construct impossible supply state in a standalone engine to
@@ -482,6 +499,7 @@ fn overflow_and_insufficient_value_are_atomic_with_charged_account_receipt() {
     ));
     assert_eq!(config.read(&branch, a).unwrap(), before);
 }
+
 #[test]
 fn full_u256_balance_can_be_spent_without_overflow() {
     let mut g = genesis();
@@ -499,6 +517,7 @@ fn full_u256_balance_can_be_spent_without_overflow() {
     assert_eq!(response["initialSupplyWei"], U256::MAX.to_string());
     assert_eq!(response["totalSupplyWei"], sent.to_string());
 }
+
 #[test]
 fn publication_retry_and_lost_ack_charge_fee_once() {
     use arkiv_db_storage::{

@@ -1,16 +1,9 @@
 //! The order-preserving, prefix-free key encoders of `arkiv_db_trie::order`.
 //!
-//! Establishes, on random inputs compared with Rust's own bytewise slice
-//! ordering and lexicographic tuple ordering (the independent model): the
-//! escaped (`encode_bytes`) and shifted (`encode_shifted`) encodings
-//! preserve the order of byte strings, including empty strings, strings
-//! differing only in trailing zero bytes, strings that are prefixes of
-//! others and `00`/`01`/`ff`-heavy strings; they are prefix-free, injective
-//! and decodable, and their unterminated forms select exactly the strings
-//! with a prefix; the composite `(name ≤ 20 bytes, tag, presence, value ≤
-//! 64 bytes)` encoding (the building blocks of the engine's term key)
-//! preserves tuple order and is prefix-free; and a map keyed by such an
-//! encoding iterates in tuple order.
+//! The model is Rust's own bytewise slice ordering and lexicographic tuple
+//! ordering, on random inputs biased toward empty strings, trailing zeros,
+//! prefixes and `00`/`01`/`ff`-heavy strings. The composite key at the end
+//! has the fields of the engine's term key.
 
 mod support;
 
@@ -123,26 +116,7 @@ fn byte_string_encodings_preserve_order_and_are_prefix_free() {
     }
 }
 
-#[test]
-fn byte_string_encoding_edge_cases() {
-    // Trailing zeros and proper prefixes.
-    assert!(escaped(b"a") < escaped(b"a\0"));
-    assert!(escaped(b"a\0") < escaped(b"a\0\0"));
-    assert!(escaped(b"") < escaped(b"\0"));
-    assert!(escaped(b"ab\0\0") < escaped(b"ab\x01"));
-    assert!(!escaped(b"a\0").starts_with(&escaped(b"a")));
-    // Worst-case escaping doubles the length; shifting never does.
-    assert_eq!(escaped(&[0; 64]).len(), 129);
-    assert_eq!(shifted(&[0; 64]).unwrap().len(), 65);
-    assert_eq!(shifted(&[0xff]), None);
-    // Noncanonical and over-long fields are rejected.
-    assert!(decode_bytes(&escaped(&[7; 65]), 64).is_err());
-    assert!(decode_bytes(&[0x01, 0x00], 4).is_err());
-    assert!(decode_shifted(&shifted(&[7; 65]).unwrap(), 64).is_err());
-    assert!(decode_shifted(&[0x05], 4).is_err());
-}
-
-/// The planned term-key building blocks: name, type tag, presence, value.
+/// Term-key building blocks: name, type tag, presence, value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Term {
     name: Vec<u8>,

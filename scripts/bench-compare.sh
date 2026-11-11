@@ -12,6 +12,14 @@
 #       [--cpus LIST] [--timeout MIN] [--full-large] [--no-cache-sweep]
 #       [--no-readers] [--dry-run]
 #
+# Environment:
+#   BENCH_WORK       required: work directory (exports, builds, databases,
+#                    results); needs tens of GiB on a real disk, not tmpfs
+#   BENCH_REPO       repository to take revisions from (default: this checkout)
+#   BENCH_CONF_SEED  optional local clone of golem-db-conformance-testing to
+#                    copy instead of cloning
+#   GITHUB_TOKEN     optional; used only if an anonymous fetch fails
+#
 # Exit codes: 0 all runs succeeded; 1 some runs failed (summary still
 # written); 2 prepare/build failed or bad usage; 3 another instance holds the
 # lock.
@@ -21,11 +29,11 @@ set -uo pipefail
 # ---------------------------------------------------------------- defaults --
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO="${BENCH_REPO:-/home/ubuntu/arkiv-network/arkiv-state-db-experiment}"
-WORK="${BENCH_WORK:-/home/ubuntu/arkiv-bench}"
+REPO="${BENCH_REPO:-$SCRIPT_REPO}"
+WORK="${BENCH_WORK:-}"
 CONF_URL="https://github.com/golemfactory/golem-db-conformance-testing.git"
 CONF_REV="686ddfc"
-CONF_LOCAL_SEED="${BENCH_CONF_SEED:-/tmp/claude-1000/-home-ubuntu-arkiv-network-arkiv-state-db-experiment/450179c7-8b6e-4354-9e17-57fd9bab9836/scratchpad/conf/repo}"
+CONF_LOCAL_SEED="${BENCH_CONF_SEED:-}"
 
 MODE="all"
 SCENARIO_FILTER=""
@@ -57,7 +65,7 @@ MIN_FREE_GB=30
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 export PYTHONDONTWRITEBYTECODE=1
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -127,6 +135,10 @@ has_engine() { case " $ENGINES " in *" $1 "*) return 0 ;; esac; return 1; }
 if [ "$MODE" = "quick" ]; then
   [ "$RUNS_SET" = 1 ] || RUNS=1
   [ "$MAX_WAIT_SET" = 1 ] || MAX_WAIT_LOAD=0
+fi
+
+if [ -z "$WORK" ]; then
+  echo "BENCH_WORK is not set: export BENCH_WORK=<work directory> (see --help)" >&2; exit 2
 fi
 
 [ -n "$OUT" ] || OUT="$WORK/results/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -238,7 +250,6 @@ select_scenarios() {
       fi
     done
   done
-  # --full-large together with a filter: also allow large/* ids by name.
   if [ "${#SELECTED[@]}" -eq 0 ]; then
     die "no scenarios match '$SCENARIO_FILTER'"
   fi
@@ -254,13 +265,9 @@ scenario_path() { # id -> relative path
 
 # --------------------------------------------------------------- git helpers --
 git_with_token() {
-  # Runs git with the workspace GitHub token as an HTTP header, passed through
+  # Runs git with $GITHUB_TOKEN as an HTTP header, passed through
   # GIT_CONFIG_* environment variables (never argv, never logged).
-  local token=""
-  local envfile="/home/ubuntu/arkiv-network/.env"
-  if [ -r "$envfile" ]; then
-    token="$(sed -n 's/^GITHUB_TOKEN=//p' "$envfile" | head -n1 | tr -d '"'"'"'\r')"
-  fi
+  local token="${GITHUB_TOKEN:-}"
   [ -n "$token" ] || return 1
   local header
   header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 -w0)"
@@ -318,7 +325,7 @@ prepare_conformance() {
     log "conformance repo: reusing $dst"
   else
     rm -rf "$dst"
-    if [ -d "$CONF_LOCAL_SEED/.git" ] && [ -d "$CONF_LOCAL_SEED/golem-db" ]; then
+    if [ -n "$CONF_LOCAL_SEED" ] && [ -d "$CONF_LOCAL_SEED/.git" ] && [ -d "$CONF_LOCAL_SEED/golem-db" ]; then
       log "conformance repo: copying local clone $CONF_LOCAL_SEED"
       mkdir -p "$dst"
       (cd "$CONF_LOCAL_SEED" && tar -c --exclude=./target --exclude=./golem-db/target \
@@ -339,8 +346,8 @@ prepare_conformance() {
     git -C "$dst" submodule foreach -q git reset -q --hard >>"$LOG" 2>&1
     git -C "$dst" rev-parse HEAD >"$dst/.copy-ok"
   fi
-  # Seed the shared target dir with the old clone's build (registry deps).
-  if [ ! -d "$WORK/target" ] && [ -d "$CONF_LOCAL_SEED/target/release" ]; then
+  # Seed the shared target dir with the local clone's build (registry deps).
+  if [ -n "$CONF_LOCAL_SEED" ] && [ ! -d "$WORK/target" ] && [ -d "$CONF_LOCAL_SEED/target/release" ]; then
     log "seeding $WORK/target from $CONF_LOCAL_SEED/target"
     cp -a "$CONF_LOCAL_SEED/target" "$WORK/target" 2>>"$LOG" || rm -rf "$WORK/target"
   fi

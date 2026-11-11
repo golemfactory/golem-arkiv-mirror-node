@@ -2,16 +2,15 @@
 //!
 //! Two layers live here:
 //!
-//! - [`Database`]: the raw byte-key KV facade over a [`KvStore`] backend. It
-//!   is the storage foundation and the boundary a future durable backend
-//!   implements. It has no namespaces, snapshots or metering.
+//! - [`Database`]: a raw byte-key KV facade over a [`KvStore`] backend,
+//!   unrelated to the engine. It has no namespaces, snapshots or metering.
 //! - [`Engine`]: the application-facing block engine. Every read and write
 //!   names a namespace, is metered with checked integer arithmetic under
 //!   counting-rule version [`MODEL_VERSION`], and runs against an immutable
 //!   snapshot or a candidate branch. Each namespace holds a raw byte map and,
 //!   as sibling fields, a typed record store: key bindings, rows and a term
 //!   index that every record write maintains in the same operation. The
-//!   declared query subset (typed equality, inequality, integer ranges,
+//!   declared query subset (typed equality, inequality, ordered ranges,
 //!   string prefixes, existence and negation in an ordered flat DNF) is
 //!   evaluated lazily in record-id order with projection and keyset
 //!   pagination; `count` and `terms` (the distinct indexed values of an
@@ -63,13 +62,12 @@
 //! [`CODEC_VERSION`]) of the engine's types, with the domain-separated
 //! [`digest`] that every block and state hash uses.
 //!
-//! [`proof`] supplies bounded complete equality pages, complete numeric ranges
-//! without pagination, and stateless
-//! verifier, with separately versioned advisory proof-read accounting.
-//! [`durable::DurableEngine`] persists the same state and historical proof
-//! material with lazy reads and bounded encoded caching/preparation. The
-//! ordinary [`Engine`] remains volatile. Broader proofs and durable node
-//! integration remain separate work.
+//! [`proof`] supplies bounded complete equality pages, complete ordered
+//! ranges without pagination, and a stateless verifier, with separately
+//! versioned advisory proof-read accounting. [`durable::DurableEngine`]
+//! persists the same state and historical proof material with lazy reads, a
+//! bounded decoded-node cache and bounded preparation. The ordinary
+//! [`Engine`] remains volatile.
 
 pub mod codec;
 pub mod durable;
@@ -112,9 +110,7 @@ pub use record::{
     ArgumentFault, Cell, CellKind, CellName, Float32, Float64, Limits, NameFault, RecordId,
     RecordKey, Row, TypeTag, Value,
 };
-pub use state::{
-    MapKind, NamespaceRoots, STATE_FORMAT, STATE_ROOT_DOMAIN, StagedObject, StateHeader,
-};
+pub use state::{MapKind, NamespaceRoots, STATE_FORMAT, StagedObject, StateHeader};
 
 /// A small embedded KV API over a chosen storage backend.
 ///

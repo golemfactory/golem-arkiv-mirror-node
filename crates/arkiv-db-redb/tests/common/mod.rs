@@ -1,4 +1,4 @@
-//! Helpers shared by the redb experiment tests and `examples/redb_experiment.rs`.
+//! Helpers shared by the redb experiment tests and the examples.
 //!
 //! Measurement directories live on a real disk, never in
 //! `std::env::temp_dir()` (a RAM tmpfs here, where `fsync` does nothing):
@@ -178,8 +178,7 @@ pub fn commit(store: &dyn VersionedStore, batch: CommitBatch) {
     assert_eq!(outcome, CommitOutcome::Committed);
 }
 
-/// Asserts that every object and record of `batch` is stored and the head
-/// is at least its new head.
+/// Asserts that every object and record of `batch` is stored.
 pub fn assert_applied(store: &dyn VersionedStore, batch: &CommitBatch) {
     for (space, id, bytes) in &batch.objects {
         assert_eq!(
@@ -226,7 +225,6 @@ pub fn crash_store(disk: &CrashDisk, config: RedbConfig) -> RedbStore {
     RedbStore::with_backend(move || Ok(disk.backend()), config).expect("open store on crash disk")
 }
 
-/// Wall-clock timer.
 pub fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
     let started = Instant::now();
     let value = work();

@@ -33,7 +33,6 @@ pub struct IoProbe {
 }
 
 impl IoProbe {
-    /// Creates zeroed counters.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -106,7 +105,6 @@ impl<B: StorageBackend> CountingBackend<B> {
         Self { inner, probe }
     }
 
-    /// The shared counters.
     pub fn probe(&self) -> &Arc<IoProbe> {
         &self.probe
     }

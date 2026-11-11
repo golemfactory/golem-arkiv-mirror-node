@@ -2,22 +2,21 @@
 
 ## Status and scope
 
-Node step N3a of the [node and storage plan](node-storage-plan.md) is
-implemented as the standalone crate `crates/arkiv-db-trie`: a persistent
+The standalone crate `crates/arkiv-db-trie` is a persistent
 Merkle Patricia map (`MerkleMap`) with in-memory and stored nodes, lazy
 fallible loading, a staging walk for atomic commits, point-proof
 generation and a strict proof verifier (`walk`), plus the order-preserving
-key encoders the engine's maps will use. It depends only on the vendored
+key encoders the engine's maps use. It depends only on the vendored
 `alloy-trie`, `alloy-primitives` and `alloy-rlp`; it has no dependency on
-`arkiv-db` or on the N2 storage contract, and it defines its own loader and
+`arkiv-db` or on the storage contract, and it defines its own loader and
 error types for the engine to map onto its own.
 
-Node step N3b built the engine on it: every engine map is a `MerkleMap`
+The engine is built on it: every engine map is a `MerkleMap`
 with the key encodings below, and every engine state has a state root (see
-[Engine integration](#engine-integration-node-step-n3b)). N3c now persists
+[Engine integration](#engine-integration)). `DurableEngine` persists
 the engine with bounded preflight/staging and stored-root publication; the
-demo composes the point proofs needed for complete Eq pages. Broader
-point-read APIs remain N3d (see
+proof module composes the point proofs needed for complete Eq pages and
+ranges. General point-read APIs are not implemented (see
 [remaining work](#durable-integration-and-remaining-work)). Every statement about the crate is
 backed by the tests listed in [Evidence](#evidence); the engine integration
 section cites its own tests.
@@ -141,7 +140,7 @@ composite `(name ≤ 20, tag, presence, value ≤ 64)` orders exactly as the
 Rust tuple ordering, is prefix-free, puts existence (`presence = 0`) before
 an empty value, and a map keyed by it iterates in tuple order.
 
-The engine key encodings (implemented in node step N3b, in
+The engine key encodings (implemented in
 `crates/arkiv-db/src/layout.rs`) and the resulting bounds (see
 [Depth bound](#depth-bound) and
 [Nodes an update creates](#nodes-an-update-creates)):
@@ -202,8 +201,8 @@ according to the reference construction; removing it again stages exactly
 `2L`. Random histories on reopened maps stage no more than `2L + 2`
 objects per update in total. A per-entry-write bound for the engine's
 metering (`RootUpdate`) has to use `2L + 2`, not the path bound `2L + 1`,
-when it counts rehashed nodes; node step N3b measures the engine against it
-(see [Engine integration](#engine-integration-node-step-n3b)).
+when it counts rehashed nodes; the engine is measured against it
+(see [Engine integration](#engine-integration)).
 
 ## Links, handles, loading and errors
 
@@ -257,7 +256,7 @@ ends) and proof generation; it is never reported as an absent key.
 ### Visit counting
 
 Every operation reports a `Probe { nodes, loads }`. `nodes` follows the
-trie visit semantics of the engine's `PhysicalTrace` (node step N3b): every
+trie visit semantics of the engine's `PhysicalTrace`: every
 node an operation examines counts once, whether it was in memory, served by
 a cache or loaded, inline children included; a lookup and an insert count
 the key's path, a removal also the collapse sibling, an iterator its seek
@@ -339,7 +338,8 @@ and absence (it ends at a leaf or extension diverging from `k`, or at a
 branch whose slot for `k` is empty). The empty map's proof is empty.
 `MerkleMap::proof` yields the nodes lazily, one per `next`, so a host can
 charge each node before it is produced and stop without further work
-(node step N3d plans to charge `{ProofNode 1, ProofByte len}` per node).
+(the engine's proof generators charge `ProofNode` and `ProofByte` per node;
+see [proof charges](eq-proof-charges.md)).
 
 ### The strict verifier
 
@@ -433,7 +433,7 @@ hand-derived literals from the crafted key sets.
 | `tests/store.rs` | Staging equals the reference object set; reopened maps read lazily with residency-independent visit counts; lazy updates load only touched paths; restaging is complete, minimal and bounded; the per-update creation bounds (`2L + 2` for an insert, `2L` for a removal) reached exactly; history readable; missing and corrupt objects and host loader errors surface as errors; caching loader; nested maps through the hook and `stage_with`, also when another value type staged a byte-identical leaf into the same sink first; hash-valid noncanonical tries rejected by the map and by `walk` |
 | `tests/encoding.rs` | Order preservation, prefix-freeness and uniqueness of the escaped, shifted and composite encodings |
 
-## Engine integration (node step N3b)
+## Engine integration
 
 The engine (`crates/arkiv-db`) keeps every map in a `MerkleMap`: the
 catalog, the host map, and per namespace the raw records, key bindings,
@@ -452,8 +452,8 @@ orders equal the orders the engine used before (bytewise, and
 Every map operation takes a loader naming the map's object space and kind:
 the crate's `MemoryOnly` loader for a memory engine, or an
 `arkiv_db_storage::versioned::ObjectReader` for a state reopened from its
-committed objects (the hidden `Engine::from_state` test aid, until node
-step N3c supplies the store context and cache). Storage errors reach the
+committed objects (the hidden `Engine::from_state` test aid in tests;
+`DurableEngine` supplies the store context and cache). Storage errors reach the
 engine's `try_` forms unchanged and poison a branch.
 
 Evidence in `crates/arkiv-db/tests`:
@@ -505,7 +505,7 @@ Evidence in `crates/arkiv-db/tests`:
 
 ## Durable integration and remaining work
 
-- **N3c is implemented.** `DurableEngine` supplies a gated store context,
+- `DurableEngine` supplies a gated store context,
   bounded decoded-node cache, manifests, durable head and lazy historical
   snapshots over redb. `preflight_with` checks new node/value bounds before
   encoding/hashing; `try_stage_with` stops on work/sink failures and visits
@@ -513,15 +513,13 @@ Evidence in `crates/arkiv-db/tests`:
   nested maps of another type. Weak-reference tests establish dirty-node
   release and that stored handles retain no decoded trees after reads.
   `Engine::from_state` and unbounded staging helpers remain test aids.
-- **Broader N3d APIs remain open.** The implemented demo composes catalog,
-  term, row and key proofs with StateHeader binding for bounded complete Eq
-  pages; every block header carries the state root. General point-read/proof APIs and
+- The proof module composes catalog, term, row and key proofs with
+  StateHeader binding for bounded complete Eq pages and ranges; every block
+  header carries the state root. General point-read/proof APIs and
   other complete query profiles are separate work.
-- [Engine storage measurements](engine-storage-v1-report.md) now cover
+- [Engine storage measurements](engine-storage-v1-report.md) cover
   10,000 publications, lazy opens, cache sizes, isolation and incremental
   writes. Paths are stored unpacked (one byte per nibble) for simplicity;
-  nodes are not size-optimized. The engine's tests take about 2.5 times as
-  long on the trie as they did on the AVL tree in debug builds and about 1.9
-  times in release builds (see `docs/testing.md`).
+  nodes are not size-optimized.
 - The reference oracle for keys over 32 bytes lives in the crate's tests;
   the engine's tests include it by path.

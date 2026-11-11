@@ -1,45 +1,14 @@
-//! Query operator semantics checked against an independent full-scan
-//! reference, the validation order of every `QueryFault`, and a handful of
-//! hand-derived query charges.
+//! Query operator semantics against an independent full-scan reference, the
+//! validation order of every `QueryFault`, and a few hand-derived query
+//! charges on a second, six-record fixture.
 //!
 //! The semantics fixture is one namespace of 45 records whose cell names
-//! deliberately overlap: `n` is a `Str`, `I64`, `U64` or `Bool` attribute in
-//! different records, a field holding the very same values in others, and
-//! absent in the rest; `m` and `k` overlap the same way; `q` never occurs.
-//! Values include the empty string, prefixes that are also full values,
-//! non-ASCII text, `i64::MIN`, `i64::MAX`, `u64::MAX`, negative integers and
-//! duplicates across records.
-//!
-//! What this file establishes:
-//! - Every single-literal term over every (name, value) of the fixture,
-//!   positive and negated, and a deterministic set of AND groups and ORs of
-//!   groups, returns exactly the records that a literal full scan of the
-//!   brief's semantics selects (a `BTreeMap` model maintained beside the
-//!   engine; no engine index is consulted), in ascending id, page after page
-//!   under varying limits, with `next` present iff a further match exists,
-//!   with the projected rows equal to the model's, and with `count` equal to
-//!   the number of matches. Every such check runs twice: as written (the
-//!   canonical evaluation) and planned (`Budget::planned`), which must return
-//!   exactly the same pages and counts.
-//! - Fields never match; a cell of another type is absent; `NotEq` needs the
-//!   attribute; `lower > upper` is empty; an empty prefix matches every `Str`
-//!   attribute of the name; negation is the complement over live records.
-//! - Patches move records between indexes (type change, attribute/field
-//!   change, removal, addition, no-op), deletes remove them, a recreated key
-//!   gets a fresh id, and `index_consistent` plus the record and term counts
-//!   hold after every mutation and after a rollback.
-//! - Every `QueryFault` is reported in the brief's validation order, before
-//!   any charge (spent 0, a receipt still issued), for `query`, `count` and
-//!   `get_record`; the cursor check comes last.
-//! - A few single-group and two-group query charges are the hand-derived
-//!   literals below (FIXTURE weights: DirectoryLookup 1, QueryGroup 5,
-//!   TermSeek 4, TermVisit 3, PostingEntry 1, RowVisit 1, RecordProbe 2,
-//!   ResultRow 3, ReadByte 1).
-//!
-//! What it does not establish: write charges (create, patch and delete
-//! receipts are not asserted here), physical traces, snapshot isolation
-//! beyond one before/after check, the full cursor-binding matrix, expiry, or
-//! anything about the raw byte operations.
+//! overlap on purpose: `n`, `m` and `k` are attributes of different types in
+//! some records, fields holding the same values in others and absent in the
+//! rest; `q` never occurs. Expected pages and counts come from a `BTreeMap`
+//! model beside the engine, never from an engine index, and every check runs
+//! as written and planned. Write charges are in `query_metering.rs`, the
+//! cursor-binding matrix in `pagination.rs`.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -59,10 +28,6 @@ const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 const MODEL_VERSION: u32 = 3;
 /// The id `PriceSchedule::FIXTURE` carries.
 const FIXTURE_ID: u32 = 1;
-
-// ---------------------------------------------------------------------------
-// Small constructors
-// ---------------------------------------------------------------------------
 
 fn name(text: &str) -> CellName {
     CellName::new(text).expect("fixture names follow the grammar")
@@ -136,10 +101,8 @@ fn ordinals(rows: &[Row]) -> Vec<u64> {
     rows.iter().map(|row| row.id.ordinal()).collect()
 }
 
-// ---------------------------------------------------------------------------
 // The independent model: records as sorted cell maps, and a full-scan
-// evaluator that applies the brief's semantics literally.
-// ---------------------------------------------------------------------------
+// evaluator that applies the query semantics literally.
 
 type Cells = BTreeMap<CellName, Cell>;
 
@@ -281,7 +244,7 @@ fn type_of(value: &Value) -> TypeTag {
     }
 }
 
-/// The brief's semantics of one term on one live record, verbatim.
+/// The query semantics of one term on one live record.
 fn term_holds(term: &Term, cells: &Cells) -> bool {
     let Some(cell) = cells.get(term.name()) else {
         return false;
@@ -338,10 +301,6 @@ fn in_range(held: &Value, lower: &Bound<Value>, upper: &Bound<Value>) -> bool {
         _ => false,
     }
 }
-
-// ---------------------------------------------------------------------------
-// The semantics fixture: 45 records with overlapping names.
-// ---------------------------------------------------------------------------
 
 /// Created in this order, so `rNN` has id NN.
 fn fixture_records() -> Vec<(&'static str, Vec<(&'static str, Cell)>)> {
@@ -636,10 +595,8 @@ fn semantics_fixture() -> (Engine, NamespaceId, Model) {
     (engine, ns, world.model)
 }
 
-// ---------------------------------------------------------------------------
 // Query generation: every single-literal term over the value universe, both
 // polarities, plus deterministic AND / OR combinations.
-// ---------------------------------------------------------------------------
 
 /// `q` never occurs in any record.
 const NAMES: [&str; 4] = ["n", "m", "k", "q"];
@@ -893,13 +850,8 @@ fn combined_queries(pool: &[Literal]) -> Vec<Query> {
     queries
 }
 
-// ---------------------------------------------------------------------------
-// Page walking and comparison with the model
-// ---------------------------------------------------------------------------
-
 /// A read handle: a snapshot or a branch.
 trait Reader {
-    #[allow(clippy::too_many_arguments)]
     fn page_with(
         &self,
         ns: NamespaceId,
@@ -1094,10 +1046,6 @@ fn eq(text: &str, value: Value) -> Query {
     Query::term(Term::eq(name(text), value))
 }
 
-// ---------------------------------------------------------------------------
-// Semantics against the reference
-// ---------------------------------------------------------------------------
-
 #[test]
 fn every_single_literal_matches_the_full_scan_reference() {
     let (engine, ns, model) = semantics_fixture();
@@ -1249,11 +1197,11 @@ fn projections_return_only_what_they_name() {
             check_query(&snapshot, &model, ns, query, projection, &[3, 200]);
         }
     }
-    // A named projection skips names the record lacks without charging them.
+    // A named projection skips names the record lacks.
     let page = snapshot
         .query(
             ns,
-            &eq("n", s("only")),
+            &eq("k", s("only")),
             &Projection::named(true, [name("n"), name("q")]),
             5,
             None,
@@ -1261,7 +1209,14 @@ fn projections_return_only_what_they_name() {
         )
         .expect("a valid query")
         .value;
-    assert!(page.rows.is_empty());
+    assert_eq!(
+        page.rows,
+        [Row {
+            id: id(35),
+            key: Some(key("r35")),
+            cells: Vec::new(),
+        }]
+    );
     let row = snapshot
         .get_record(
             ns,
@@ -1281,10 +1236,6 @@ fn projections_return_only_what_they_name() {
         }
     );
 }
-
-// ---------------------------------------------------------------------------
-// Mutations: records move between indexes and disappear
-// ---------------------------------------------------------------------------
 
 #[test]
 fn patches_and_deletes_move_records_between_indexes() {
@@ -1539,10 +1490,6 @@ fn deleted_records_disappear_and_a_rollback_brings_them_back() {
     assert_eq!(ids_of(&world.branch, ns, &query), [5, 46]);
 }
 
-// ---------------------------------------------------------------------------
-// Validation order of every QueryFault (spent 0, receipt issued)
-// ---------------------------------------------------------------------------
-
 /// Small limits so every fault is a few literals away.
 const SMALL: Limits = Limits {
     max_cells: 3,
@@ -1771,61 +1718,12 @@ fn query_faults_are_reported_in_the_validation_order_before_any_charge() {
     ] {
         assert!(query(&Query::term(term), &wide_ok, 5).is_ok());
     }
-    // 7. ProjectionTooLarge comes after every literal and before the cursor.
-    let bogus = query(&Query::match_all(), &Projection::ID_ONLY, 1)
-        .expect("one row, one more to come")
-        .value
-        .next;
-    assert_eq!(bogus, None, "the small fixture has one record");
-    let foreign = {
-        let (other, other_ns) = small_fixture();
-        let mut branch = other.begin(other.head(), None).expect("begin on the head");
-        branch
-            .execute(
-                ALICE,
-                WriteOp::CreateRecord {
-                    namespace: other_ns,
-                    key: key("two"),
-                    cells: Vec::new(),
-                },
-                Budget::unlimited(),
-            )
-            .expect("an empty record applies");
-        branch
-            .query(
-                other_ns,
-                &Query::match_all(),
-                &all,
-                1,
-                None,
-                Budget::unlimited(),
-            )
-            .expect("a valid query")
-            .value
-            .next
-            .expect("two records, one per page")
-    };
-    let result = snapshot.query(
-        ns,
-        &Query::match_all(),
-        &too_wide,
-        5,
-        Some(&foreign),
-        Budget::unlimited(),
+    // 7. ProjectionTooLarge comes after every literal. The cursor check, which
+    // comes last, is covered in `pagination.rs`.
+    expect_fault(
+        query(&Query::match_all(), &too_wide, 5),
+        QueryFault::ProjectionTooLarge,
     );
-    expect_fault(result, QueryFault::ProjectionTooLarge);
-    // 8. CursorMismatch is last and also costs nothing.
-    let result = snapshot.query(
-        ns,
-        &Query::match_all(),
-        &all,
-        5,
-        Some(&foreign),
-        Budget::unlimited(),
-    );
-    let rejected = result.expect_err("a branch cursor of another engine");
-    assert_eq!(rejected.reason, Rejection::CursorMismatch);
-    assert_eq!(rejected.receipt, zero_cost_read(Rejection::CursorMismatch));
 
     // Validation precedes the directory lookup and ignores the budget.
     expect_fault(
@@ -1935,9 +1833,12 @@ fn count_and_get_record_validate_like_query() {
     );
 }
 
+/// A snapshot's own cursor on an unknown namespace is refused before the
+/// directory lookup. The rest of the cursor-binding matrix is in
+/// `pagination.rs`.
 #[test]
-fn a_cursor_is_bound_to_its_context_query_and_projection() {
-    let (mut engine, ns, _) = semantics_fixture();
+fn a_cursor_on_an_unknown_namespace_is_a_mismatch_before_any_lookup() {
+    let (engine, ns, _) = semantics_fixture();
     let first = engine.head_snapshot();
     let query = Query::term(Term::exists(name("n"), TypeTag::Str));
     let cursor = first
@@ -1946,153 +1847,19 @@ fn a_cursor_is_bound_to_its_context_query_and_projection() {
         .value
         .next
         .expect("fifteen Str attributes of n");
-    assert_eq!(cursor.after(), id(2));
-    assert_eq!(cursor.snapshot(), Some(first.id()));
-    let mismatch = |result: ReadResult<QueryPage>| {
-        let rejected = result.expect_err("cursor mismatch");
-        assert_eq!(rejected.reason, Rejection::CursorMismatch);
-        assert_eq!(rejected.receipt, zero_cost_read(Rejection::CursorMismatch));
-    };
-
-    // The same request continues; the limit is not bound.
-    let page = first
+    let rejected = first
         .query(
-            ns,
+            ns_id(9),
             &query,
             &Projection::ALL,
             5,
             Some(&cursor),
             Budget::unlimited(),
         )
-        .expect("the cursor matches")
-        .value;
-    assert_eq!(ordinals(&page.rows), [3, 4, 5, 6, 7]);
-    // Another projection, query or namespace: rejected before any lookup.
-    mismatch(first.query(
-        ns,
-        &query,
-        &Projection::ID_ONLY,
-        5,
-        Some(&cursor),
-        Budget::unlimited(),
-    ));
-    mismatch(first.query(
-        ns,
-        &Query::match_all(),
-        &Projection::ALL,
-        5,
-        Some(&cursor),
-        Budget::unlimited(),
-    ));
-    mismatch(first.query(
-        ns_id(9),
-        &query,
-        &Projection::ALL,
-        5,
-        Some(&cursor),
-        Budget::unlimited(),
-    ));
-    // A branch, even one begun from the pinned snapshot.
-    let mut branch = engine
-        .begin(engine.head(), None)
-        .expect("begin on the head");
-    mismatch(branch.query(
-        ns,
-        &query,
-        &Projection::ALL,
-        5,
-        Some(&cursor),
-        Budget::unlimited(),
-    ));
-    // A branch cursor survives rejected writes, not applied ones.
-    let branch_cursor = branch
-        .query(ns, &query, &Projection::ALL, 2, None, Budget::unlimited())
-        .expect("a valid query")
-        .value
-        .next
-        .expect("more matches");
-    assert_eq!(branch_cursor.snapshot(), None);
-    mismatch(first.query(
-        ns,
-        &query,
-        &Projection::ALL,
-        5,
-        Some(&branch_cursor),
-        Budget::unlimited(),
-    ));
-    let rejected = branch.execute(
-        ALICE,
-        WriteOp::CreateRecord {
-            namespace: ns,
-            key: key("r01"),
-            cells: Vec::new(),
-        },
-        Budget::unlimited(),
-    );
-    assert_eq!(
-        rejected.expect_err("r01 is bound").reason,
-        Rejection::AlreadyExists
-    );
-    assert!(
-        branch
-            .query(
-                ns,
-                &query,
-                &Projection::ALL,
-                5,
-                Some(&branch_cursor),
-                Budget::unlimited()
-            )
-            .is_ok()
-    );
-    branch
-        .execute(
-            ALICE,
-            WriteOp::DeleteRecord {
-                namespace: ns,
-                key: key("r45"),
-            },
-            Budget::unlimited(),
-        )
-        .expect("r45 is live");
-    mismatch(branch.query(
-        ns,
-        &query,
-        &Projection::ALL,
-        5,
-        Some(&branch_cursor),
-        Budget::unlimited(),
-    ));
-    // A later snapshot does not accept the earlier snapshot's cursor.
-    let published = engine
-        .publish(&branch.seal())
-        .expect("publishes on snapshot 1");
-    let second = engine.snapshot(published).expect("just published");
-    mismatch(second.query(
-        ns,
-        &query,
-        &Projection::ALL,
-        5,
-        Some(&cursor),
-        Budget::unlimited(),
-    ));
-    assert!(
-        first
-            .query(
-                ns,
-                &query,
-                &Projection::ALL,
-                5,
-                Some(&cursor),
-                Budget::unlimited()
-            )
-            .is_ok()
-    );
+        .expect_err("cursor mismatch");
+    assert_eq!(rejected.reason, Rejection::CursorMismatch);
+    assert_eq!(rejected.receipt, zero_cost_read(Rejection::CursorMismatch));
 }
-
-// ---------------------------------------------------------------------------
-// Hand-derived charges on a six-record namespace
-// ---------------------------------------------------------------------------
 
 /// Snapshot 1 of a separate engine: namespace 1 with, in id order,
 ///
@@ -2183,7 +1950,7 @@ fn exc(value: i64) -> Bound<Value> {
     Bound::Excluded(Value::I64(value))
 }
 
-/// Runs one page and returns `(ids, next.after, receipt)`.
+/// Runs one page and returns `(ids, next.after, receipt, next)`.
 fn page(
     snapshot: &Snapshot,
     ns: NamespaceId,

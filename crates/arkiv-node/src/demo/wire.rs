@@ -1,4 +1,5 @@
 //! JSON is transport only. Canonical objects are bounded lowercase hex.
+
 use super::{DemoError, Result};
 use arkiv_db::{Decode, Encode, decode_exact, encode};
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,13 @@ pub fn hex(bytes: &[u8]) -> String {
     }
     s
 }
+
 pub fn unhex(s: &str, cap: usize) -> Result<Vec<u8>> {
     let s = s.strip_prefix("0x").ok_or(DemoError::InvalidRequest)?;
     if s.len() % 2 != 0 || s.len() / 2 > cap {
         return Err(DemoError::ProofLimitExceeded);
     }
+
     fn nibble(b: u8) -> Result<u8> {
         match b {
             b'0'..=b'9' => Ok(b - b'0'),
@@ -38,9 +41,11 @@ pub fn unhex(s: &str, cap: usize) -> Result<Vec<u8>> {
         .map(|p| Ok(nibble(p[0])? * 16 + nibble(p[1])?))
         .collect()
 }
+
 pub fn packed<T: Encode>(value: &T) -> String {
     hex(&encode(value))
 }
+
 pub fn unpack<T: Decode>(text: &str, cap: usize) -> Result<T> {
     decode_exact(&unhex(text, cap)?).map_err(|e| {
         if matches!(e, arkiv_db::DecodeError::UnsupportedVersion { .. }) {
@@ -50,6 +55,7 @@ pub fn unpack<T: Decode>(text: &str, cap: usize) -> Result<T> {
         }
     })
 }
+
 pub fn number(text: &str) -> Result<u64> {
     if text.is_empty()
         || (text.len() > 1 && text.starts_with('0'))
@@ -66,6 +72,7 @@ pub struct RpcRequest {
     pub rpc_version: u32,
     pub request: Request,
 }
+
 impl RpcRequest {
     pub fn new(request: Request) -> Self {
         Self {
@@ -74,6 +81,7 @@ impl RpcRequest {
         }
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -126,6 +134,7 @@ pub enum Request {
         paused: bool,
     },
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RpcResponse {
@@ -133,6 +142,7 @@ pub struct RpcResponse {
     pub result: Option<serde_json::Value>,
     pub error: Option<DemoError>,
 }
+
 impl RpcResponse {
     pub fn from_result(result: Result<serde_json::Value>) -> Self {
         match result {
@@ -148,6 +158,7 @@ impl RpcResponse {
             },
         }
     }
+
     pub fn into_result(self) -> Result<serde_json::Value> {
         if self.rpc_version != 1 {
             return Err(DemoError::UnsupportedVersion);
@@ -159,6 +170,7 @@ impl RpcResponse {
         }
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Status {
@@ -181,6 +193,7 @@ pub struct Status {
     pub pending: String,
     pub conflict_evidence: Vec<String>,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Headers {
@@ -188,12 +201,14 @@ pub struct Headers {
     pub sampled_height: String,
     pub sampled_hash: String,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SignedBlock {
     pub block: String,
     pub signed_header: String,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Blocks {
@@ -201,12 +216,14 @@ pub struct Blocks {
     pub sampled_height: String,
     pub sampled_hash: String,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Proof {
     pub proof: String,
     pub receipt: String,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GenesisResponse {
@@ -216,6 +233,7 @@ pub struct GenesisResponse {
 pub fn json<T: Serialize>(value: &T) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|_| DemoError::InvalidRequest)
 }
+
 pub fn parse<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| DemoError::InvalidRequest)
 }
@@ -261,6 +279,7 @@ pub async fn rpc(
         serde_json::from_slice(&bytes).map_err(|_| DemoError::InvalidRequest)?;
     decoded.into_result()
 }
+
 pub fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(DEADLINE)

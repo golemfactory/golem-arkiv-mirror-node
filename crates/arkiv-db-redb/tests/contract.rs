@@ -5,9 +5,7 @@
 //! - `RedbStore` on a real file (in Cargo's target temporary directory, on
 //!   disk, so every commit really syncs), reopened from its path;
 //! - `RedbStore` on a simulated `CrashDisk`, reopened on the same device;
-//! - `FaultyStore<RedbStore>` without armed faults;
-//! - `MemoryVersionedStore` and `FaultyStore<MemoryVersionedStore>`, so the
-//!   durable store and the reference run the identical suite in one binary.
+//! - `FaultyStore<RedbStore>` without armed faults (the cases that arm none).
 //!
 //! The `faulty_*` cases wrap each store in a latching `FaultyStore`
 //! themselves. Object ids are `keccak256`, which the redb store verifies on
@@ -15,9 +13,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_db_redb::{RedbConfig, RedbStore, testing::CrashDisk};
 use arkiv_db_storage::{
     testing::{
@@ -34,7 +29,7 @@ fn config() -> RedbConfig {
 }
 
 fn file_store() -> TestStore {
-    let dir = Arc::new(BenchDir::new("contract"));
+    let dir = BenchDir::new("contract");
     let path = dir.file("store.redb");
     let store = RedbStore::create(&path, config()).expect("create store");
     TestStore {
@@ -95,36 +90,6 @@ impl StoreFactory for WrappedRedb {
     }
 }
 
-struct Memory;
-
-impl StoreFactory for Memory {
-    fn object_id(&self, bytes: &[u8]) -> ObjectId {
-        keccak(bytes)
-    }
-
-    fn create(&self) -> TestStore {
-        TestStore {
-            store: Box::new(MemoryVersionedStore::new()),
-            reopen: None,
-        }
-    }
-}
-
-struct WrappedMemory;
-
-impl StoreFactory for WrappedMemory {
-    fn object_id(&self, bytes: &[u8]) -> ObjectId {
-        keccak(bytes)
-    }
-
-    fn create(&self) -> TestStore {
-        TestStore {
-            store: Box::new(FaultyStore::new(MemoryVersionedStore::new())),
-            reopen: None,
-        }
-    }
-}
-
 mod redb_file {
     arkiv_db_storage::versioned_store_contract!(super::RedbFile);
 }
@@ -134,13 +99,5 @@ mod redb_crash_disk {
 }
 
 mod faulty_redb {
-    arkiv_db_storage::versioned_store_contract!(super::WrappedRedb);
-}
-
-mod memory {
-    arkiv_db_storage::versioned_store_contract!(super::Memory);
-}
-
-mod faulty_memory {
-    arkiv_db_storage::versioned_store_contract!(super::WrappedMemory);
+    arkiv_db_storage::versioned_store_contract!(@base super::WrappedRedb);
 }

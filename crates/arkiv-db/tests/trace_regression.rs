@@ -1,50 +1,18 @@
-//! Physical traces of queries and counts that stop part way (node step N0a).
+//! Physical traces of queries and counts that stop part way.
 //!
-//! A read's `PhysicalTrace` is not canonical, but the isolation tests and the
-//! planned disk-adapter measurements read it, so a rejected read must report
-//! the nodes it actually visited. Before N0a, a rejection while a query was
-//! opening a later group or pulling a head dropped every source opened so
-//! far, and a `Range`/`StartsWith` run stopped at a `TermVisit` dropped the
-//! postings it had positioned. A rejection during an advance or a row
-//! emission was already reported in full.
+//! A read's `PhysicalTrace` is not canonical, but the isolation tests and
+//! disk measurements read it, so a rejected read must report the nodes it
+//! actually visited. The bug these tests guard against: a rejection while a
+//! query was opening a later group or pulling a head dropped every source
+//! opened so far, and a `Range`/`StartsWith` run stopped at a `TermVisit`
+//! dropped the postings it had positioned.
 //!
-//! What this file establishes, on one small published namespace:
-//! - Exact traces at every charge point. Each read below runs under every
-//!   budget from 0 to its success total: a three-group page (an `Eq` posting
-//!   with a probe, a three-term `StartsWith` run, a negated row-map group)
-//!   and the `count` of the same query; a three-group page whose later
-//!   groups fail to open after the earlier ones looked up their terms; a
-//!   `Range` and a `StartsWith` run that fail at each `TermVisit`; a
-//!   `NotEq` page whose probes reject candidates and a match-all page (head
-//!   pulls and advances failing at `PostingEntry`, `RecordProbe` and
-//!   `RowVisit`); an `Eq` page failing at its row emissions. Each rejection
-//!   reports exactly the directory, record and index nodes visited before
-//!   the charge that failed. The success reports the whole traversal.
-//! - Monotonicity: for budgets b1 < b2 that both fail, every trace component
-//!   at b1 is at most the one at b2, and every failing trace is at most the
-//!   success trace.
-//! - No double count: every success trace is a literal written as the sum
-//!   of independently derived parts (a lookup path, a whole posting, a term
-//!   run, the row map, row loads), each counted once. A run's postings are
-//!   counted once whether the run completes or stops at a `TermVisit`.
-//! - Receipts are the charge table's: `spent` is the units charged before
-//!   the failing charge with `OutOfBudget`, or the total with `Applied`,
-//!   hand-derived from the plan's charge points under
-//!   `PriceSchedule::FIXTURE` (DirectoryLookup 1, QueryGroup 5, TermSeek 4,
-//!   TermVisit 3, PostingEntry 1, RowVisit 1, RecordProbe 2, ResultRow 3,
-//!   ReadByte 1). Each table checks itself: every charge starts where the
-//!   previous one ended and the last ends at the total. They are the same
-//!   receipts as before the engine moved to tries (node step N3b).
-//!
-//! Every expected count is a literal derived by hand from the Merkle
-//! Patricia trie shapes documented at the fixture (node step N3b re-derived
-//! them from the AVL-era literals of N0a), never by running the engine
-//! first. Expected rows come from evaluating the fixture by hand.
-//!
-//! What it does not establish: charge rules beyond the receipts repeated
-//! here (`query_metering.rs` owns them), query semantics (`queries.rs`), the
-//! traces of writes, and anything about a durable backend. The counts
-//! describe the trie layout of state format 2 and change with it.
+//! Each read runs under every budget from 0 to its success total. Every
+//! expected count is a literal derived by hand from the trie shapes
+//! documented at the fixture, each part counted once; every receipt is
+//! hand-derived from the FIXTURE weights. The counts describe the trie
+//! layout of state format 2 and change with it. Charge rules are owned by
+//! `query_metering.rs`, query semantics by `queries.rs`.
 
 use std::{fmt::Debug, ops::Bound};
 
@@ -63,10 +31,6 @@ const FIXTURE_ID: u32 = 1;
 
 /// Every page in this file fits in one page of this size.
 const LIMIT: usize = 10;
-
-// ---------------------------------------------------------------------------
-// The fixture and its tree shapes
-// ---------------------------------------------------------------------------
 
 /// The records, created in this order in one block: ids 1 to 4, each with
 /// the attributes `c: Str` and `n: I64`.
@@ -108,7 +72,7 @@ const RECORDS: [(&str, &str, i64); 4] = [
 /// 0x7a, each then 00) share 0x73 (nibbles 7, 3), then split on 6 (`f`,
 /// `j`) or 7 (`v`), and `red`/`rise` split on 6 or a. The I64 term bytes of
 /// 1 to 4 are 0x80 00 00 00 00 00 00 0k: 15 shared nibbles, then k. (The
-/// fixture uses `rise` rather than layout 1's `rose`: shifted, `o` is 0x70
+/// fixture uses `rise` rather than `rose`: shifted, `o` is 0x70
 /// and would move `rose` under `ruby`'s branch; `rise` keeps the shape the
 /// counts below were derived for.)
 ///
@@ -213,10 +177,6 @@ fn id(ordinal: u64) -> RecordId {
 fn eq_c(value: &str) -> Literal {
     Literal::of(Term::eq(name("c"), Value::str(value)))
 }
-
-// ---------------------------------------------------------------------------
-// Charge-point tables
-// ---------------------------------------------------------------------------
 
 /// `PhysicalTrace` as `(directory, record, index)` node counts.
 const fn nodes(directory_nodes: u64, record_nodes: u64, index_nodes: u64) -> PhysicalTrace {
@@ -403,10 +363,6 @@ fn rows(ids: &[u64], keys: bool) -> Page {
     (rows, false)
 }
 
-// ---------------------------------------------------------------------------
-// A three-group page and count, every budget
-// ---------------------------------------------------------------------------
-
 /// `[Eq(c, "red"), Range(n, >= 2)] OR [StartsWith(c, "r")] OR
 /// [NOT Eq(c, "red")]`. G1's source is c:red's posting with one probe; G2's
 /// is the run c:red, c:rise, c:ruby; G3's is the row map, probed by its own
@@ -447,14 +403,14 @@ fn three_groups_opening_and_heads() -> Vec<Point> {
         point("G2 TermVisit c:red", 3, 19, nodes(1, 0, 8 + 8)),
         // c:red's posting is positioned (its first step: 3) and the step
         // revealing c:rise visits T3 (run 9). The positioned posting was
-        // lost before N0a.
+        // lost before the fix.
         point("G2 TermVisit c:rise", 3, 22, nodes(1, 0, 8 + 9 + 3)),
         // c:rise's posting is positioned (1); revealing c:ruby pops Bcv6
         // and visits T4 (run 10).
         point("G2 TermVisit c:ruby", 3, 25, nodes(1, 0, 8 + 10 + 3 + 1)),
         // c:ruby's posting is positioned (1); the step to T5, which ends
         // the run, visits En, Bn and T5 (run 13). G2 is open with 13 + 5
-        // nodes; its positioned postings were lost before N0a when a later
+        // nodes; its positioned postings were lost before the fix when a later
         // group failed to open.
         point("G3 QueryGroup", 5, 28, nodes(1, 0, 8 + 13 + 5)),
         // G3 is open with no seek. G1's first pull steps its posting (3).
@@ -559,10 +515,6 @@ fn every_budget_of_a_three_group_count_notes_each_visited_node_once() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Later groups failing to open
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_later_group_failing_to_open_keeps_the_earlier_groups_visits() {
     let (snapshot, ns) = fixture();
@@ -650,10 +602,6 @@ fn a_later_group_failing_to_open_keeps_the_earlier_groups_visits() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Term runs failing at the k-th TermVisit
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_prefix_run_failing_at_each_term_visit_keeps_its_positioned_postings() {
     let (snapshot, ns) = fixture();
@@ -666,12 +614,12 @@ fn a_prefix_run_failing_at_each_term_visit_keeps_its_positioned_postings() {
         // visits Bcv6 and T2 (run 8).
         point("TermVisit c:red", 3, 10, nodes(1, 0, 8)),
         // c:red positioned (3); revealing c:rise visits T3 (run 9). Before
-        // N0a only the run's nodes were reported.
+        // the fix only the run's nodes were reported.
         point("TermVisit c:rise", 3, 13, nodes(1, 0, 9 + 3)),
         // c:rise positioned (1); revealing c:ruby visits T4 (run 10).
         point("TermVisit c:ruby", 3, 16, nodes(1, 0, 10 + 3 + 1)),
         // c:ruby positioned (1); the step to T5 ending the run visits En,
-        // Bn and T5 (run 13). Before N0a a failing first head pull
+        // Bn and T5 (run 13). Before the fix a failing first head pull
         // reported the run's nodes only.
         point("PostingEntry id 1", 1, 19, nodes(1, 0, 13 + 3 + 1 + 1)),
         // c:red steps to id 3 (1) after the charge. Every head holds no
@@ -722,7 +670,7 @@ fn a_range_run_failing_at_each_term_visit_keeps_its_positioned_postings() {
         // n:2 positioned (1); revealing n:3 visits T8 (run 9).
         point("TermVisit n:3", 3, 16, nodes(1, 0, 9 + 1 + 1)),
         // n:3 positioned (1); n:4 (T9, run 10) is excluded and ends the
-        // run. Before N0a a failing first head pull reported the run only.
+        // run. Before the fix a failing first head pull reported the run only.
         point("PostingEntry id 1", 1, 19, nodes(1, 0, 10 + 3)),
         point("emit id 1", 3, 20, nodes(1, 3, 13)),
         point("PostingEntry id 2", 1, 23, nodes(1, 3, 13)),
@@ -748,10 +696,6 @@ fn a_range_run_failing_at_each_term_visit_keeps_its_positioned_postings() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Head pulls and row emission
-// ---------------------------------------------------------------------------
-
 #[test]
 fn pulls_failing_at_posting_entries_probes_and_row_visits_keep_the_source() {
     let (snapshot, ns) = fixture();
@@ -764,7 +708,7 @@ fn pulls_failing_at_posting_entries_probes_and_row_visits_keep_the_source() {
         point("QueryGroup", 5, 1, nodes(1, 0, 0)),
         point("TermSeek", 4, 6, nodes(1, 0, 0)),
         // The lookup of c:∅ (5) and the posting's first step (3). Before
-        // N0a only the lookup was reported.
+        // the fix only the lookup was reported.
         point("PostingEntry id 1", 1, 10, nodes(1, 0, 5 + 3)),
         point("RecordProbe id 1", 2, 11, nodes(1, 0, 8)),
         // Row 1 loaded (3) and rejected; the posting steps to id 2 (1).
@@ -805,7 +749,7 @@ fn pulls_failing_at_posting_entries_probes_and_row_visits_keep_the_source() {
     let points = [
         point("DirectoryLookup", 1, 0, nodes(0, 0, 0)),
         point("QueryGroup", 5, 1, nodes(1, 0, 0)),
-        // The row map's first step (3). Before N0a a match-all read failing
+        // The row map's first step (3). Before the fix a match-all read failing
         // here reported no record node at all.
         point("RowVisit id 1", 1, 6, nodes(1, 3, 0)),
         point("emit id 1", 3, 7, nodes(1, 3, 0)),
@@ -844,7 +788,7 @@ fn row_emission_failures_keep_every_source_and_row_load() {
         point("QueryGroup", 5, 1, nodes(1, 0, 0)),
         point("TermSeek", 4, 6, nodes(1, 0, 0)),
         // The lookup of c:red (8) and the posting's first step to id 1
-        // (3). Before N0a only the lookup was reported.
+        // (3). Before the fix only the lookup was reported.
         point("PostingEntry id 1", 1, 10, nodes(1, 0, 8 + 3)),
         // Row 1 loaded for emission (3), before the emission charge.
         point("emit id 1", 4, 11, nodes(1, 3, 11)),

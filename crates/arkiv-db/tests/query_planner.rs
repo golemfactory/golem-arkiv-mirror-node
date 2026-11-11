@@ -56,10 +56,6 @@ fn s(text: &str) -> Value {
     Value::str(text)
 }
 
-// ---------------------------------------------------------------------------
-// The model
-// ---------------------------------------------------------------------------
-
 type Cells = BTreeMap<CellName, Cell>;
 
 fn tag_of(value: &Value) -> TypeTag {
@@ -127,10 +123,6 @@ fn matches(live: &BTreeMap<RecordId, Cells>, query: &Query) -> Vec<u64> {
         .map(|(id, _)| id.ordinal())
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// The fixture
-// ---------------------------------------------------------------------------
 
 struct Generator(u64);
 
@@ -322,10 +314,6 @@ fn fixture() -> Fixture {
     Fixture { engine, ns, live }
 }
 
-// ---------------------------------------------------------------------------
-// Queries
-// ---------------------------------------------------------------------------
-
 fn eq(text: &str, value: Value) -> Literal {
     Literal::of(Term::eq(name(text), value))
 }
@@ -447,10 +435,6 @@ fn reversed(query: &Query) -> Query {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reads
-// ---------------------------------------------------------------------------
-
 fn page(
     snapshot: &Snapshot,
     ns: NamespaceId,
@@ -511,10 +495,6 @@ fn flat(pages: &[(Vec<u64>, Option<u64>)]) -> Vec<u64> {
 
 const WRITTEN: Budget = Budget::unlimited();
 const PLANNED: Budget = Budget::unlimited().planned();
-
-// ---------------------------------------------------------------------------
-// Equivalence
-// ---------------------------------------------------------------------------
 
 #[test]
 fn planned_pages_and_counts_equal_the_written_ones_and_the_model() {
@@ -577,10 +557,6 @@ fn projections_and_rows_are_byte_identical() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Charges
-// ---------------------------------------------------------------------------
-
 fn spent(snapshot: &Snapshot, ns: NamespaceId, query: &Query, limit: usize, budget: Budget) -> u64 {
     snapshot
         .query(ns, query, &Projection::ID_ONLY, limit, None, budget)
@@ -613,8 +589,8 @@ fn planned_charges_ignore_the_written_order() {
         eq("scope", s("all")),
         eq("owner", s("o1")),
         eq("kind", s("contract")),
-        eq("lang", lang.clone()),
-        eq("addr", target.clone()),
+        eq("lang", lang),
+        eq("addr", target),
     ]);
     let selective_first = reversed(&broad_first);
     let rows = |query: &Query, budget| flat(&walk(&snapshot, ns, query, &[20], &[budget]));
@@ -794,10 +770,6 @@ fn intersections_count_without_loading_rows() {
     // At most an entry and a repositioning (3 units) per match plus the
     // jumps between the clusters, where stepping every `clus` entry and
     // probing each would cost 3 per `clus` entry.
-    eprintln!(
-        "clustered count: {} units for {both} of {clus}",
-        planned.receipt.spent.units()
-    );
     assert!(planned.receipt.spent.units() < 1 + 5 + 8 + 3 * both + 40);
     assert!(3 * clus > 3 * both + 40 + 400);
 }

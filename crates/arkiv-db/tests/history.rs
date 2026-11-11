@@ -3,7 +3,7 @@
 //! The oracle predicts every verdict, receipt, effect, namespace ordinal and
 //! read result from its own published log plus the open candidate's pending
 //! entries, and only then looks at what the engine did. Costs are computed
-//! from the CHARGE table below (transcribed from the decisions file), never
+//! from the CHARGE table below, never
 //! from the engine's pricing API.
 
 use std::{collections::BTreeMap, fmt, ops::Range};
@@ -77,11 +77,8 @@ fn total(charges: &[u64]) -> u64 {
     charges.iter().sum()
 }
 
-// ---------------------------------------------------------------------------
-// CHARGE table: unit prices and charge points, transcribed from the decisions
-// file. Plain u64 arithmetic; the engine's pricing API is never consulted.
-// ---------------------------------------------------------------------------
-
+/// The CHARGE table: unit prices and charge points in plain u64 arithmetic;
+/// the engine's pricing API is never consulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Weights {
     id: u32,
@@ -99,7 +96,7 @@ struct Weights {
     root_update: u64,
 }
 
-/// `PriceSchedule::FIXTURE` as listed in the decisions file (id 1).
+/// The weights of `PriceSchedule::FIXTURE` (id 1).
 const FIXTURE: Weights = Weights {
     id: 1,
     directory_lookup: 1,
@@ -210,7 +207,7 @@ fn charges_for(weights: &Weights, op: &WriteOp) -> Vec<u64> {
         WriteOp::CreateRecord { .. }
         | WriteOp::PatchRecord { .. }
         | WriteOp::DeleteRecord { .. } => {
-            unreachable!("the milestone-1 oracle issues no typed record operations")
+            unreachable!("this oracle issues no typed record operations")
         }
     }
 }
@@ -292,10 +289,6 @@ const DIRECTORY_READ_BOUND: u64 = 2 * 8 + 1;
 /// path of the updated catalog leaf, each at most 17 nodes (a namespace
 /// creation walks only the insert path).
 const DIRECTORY_WRITE_BOUND: u64 = 2 * DIRECTORY_READ_BOUND;
-
-// ---------------------------------------------------------------------------
-// Oracle: published log, projected views and the open candidate.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Mutation {
@@ -594,7 +587,7 @@ impl Pending {
             WriteOp::CreateRecord { .. }
             | WriteOp::PatchRecord { .. }
             | WriteOp::DeleteRecord { .. } => {
-                unreachable!("the milestone-1 oracle issues no typed record operations")
+                unreachable!("this oracle issues no typed record operations")
             }
         }
     }
@@ -673,7 +666,7 @@ fn expect(
         WriteOp::CreateRecord { .. }
         | WriteOp::PatchRecord { .. }
         | WriteOp::DeleteRecord { .. } => {
-            unreachable!("the milestone-1 oracle issues no typed record operations")
+            unreachable!("this oracle issues no typed record operations")
         }
     };
     let (outcome, spent) = verdict(&charges_for(&pending.weights, op), semantic, limit);
@@ -683,10 +676,6 @@ fn expect(
         effect: (outcome == Outcome::Applied).then_some(effect),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Comparable shapes, transcript and coverage.
-// ---------------------------------------------------------------------------
 
 type Flat<T> = Result<(T, Receipt), (Rejection, Receipt)>;
 
@@ -841,10 +830,6 @@ struct Retained {
     namespaces: Vec<NamespaceId>,
     receipts: Vec<Receipt>,
 }
-
-// ---------------------------------------------------------------------------
-// Metered reads on branches and snapshots, checked against a view.
-// ---------------------------------------------------------------------------
 
 trait Reader {
     fn get_metered(
@@ -1047,10 +1032,6 @@ fn short_prefixes() -> Vec<Vec<u8>> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Workload generation.
-// ---------------------------------------------------------------------------
-
 struct Generator(u32);
 
 impl Generator {
@@ -1212,10 +1193,6 @@ fn op_namespace(op: &WriteOp) -> Option<NamespaceId> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Checked execution.
-// ---------------------------------------------------------------------------
-
 #[allow(clippy::too_many_arguments)]
 fn execute_checked(
     branch: &mut Branch,
@@ -1266,7 +1243,7 @@ fn execute_checked(
         pending.receipts.len(),
         "{ctx} after op={op:?}: admission rejections are never recorded"
     );
-    // Physical rules stated in the decisions file.
+    // Physical rules of the charge model.
     if matches!(op, WriteOp::TransferNamespace { .. }) {
         assert_eq!(
             physical.record_nodes, 0,
@@ -1324,10 +1301,6 @@ fn rollback_checked(
     coverage.discarded_creates += creates;
     transcript.events.push(Event::Rollback(discarded));
 }
-
-// ---------------------------------------------------------------------------
-// Admin candidates, stale losers and the per-seed run.
-// ---------------------------------------------------------------------------
 
 /// Publishes a pricing change as its own snapshot before the block's data
 /// candidate. The block maps to the data snapshot only.
@@ -1975,27 +1948,13 @@ fn assert_replay(seed: u32) {
     let first = run_seed(seed, false);
     let second = run_seed(seed, false);
     let (a, b) = (&first.transcript, &second.transcript);
-    for (index, (x, y)) in a.events.iter().zip(&b.events).enumerate() {
-        assert_eq!(
-            x, y,
-            "seed={seed:#010x}: transcript event {index} differs on replay"
-        );
-    }
     assert_eq!(
-        a.events.len(),
-        b.events.len(),
-        "seed={seed:#010x}: transcript length"
+        a.events, b.events,
+        "seed={seed:#010x}: the transcript differs on replay"
     );
-    for (index, (x, y)) in a.physical.iter().zip(&b.physical).enumerate() {
-        assert_eq!(
-            x, y,
-            "seed={seed:#010x}: physical trace {index} differs on replay"
-        );
-    }
     assert_eq!(
-        a.physical.len(),
-        b.physical.len(),
-        "seed={seed:#010x}: trace count"
+        a.physical, b.physical,
+        "seed={seed:#010x}: the physical traces differ on replay"
     );
     assert!(
         a.events
@@ -2005,15 +1964,11 @@ fn assert_replay(seed: u32) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Tests.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn charge_table_reproduces_the_decisions_file_totals() {
+fn charge_table_reproduces_the_worked_totals() {
     let w = FIXTURE;
-    // Totals quoted in the decisions file under FIXTURE (model version 3:
-    // RootUpdate 2 per logical entry write).
+    // Totals under FIXTURE (model version 3: RootUpdate 2 per logical entry
+    // write).
     assert_eq!(total(&w.create_charges()), 53);
     assert_eq!(total(&w.transfer_charges()), 23);
     assert_eq!(total(&w.put_charges(3, 7)), 1 + 10 + 2 * 3 + 7 + 2 * 2);

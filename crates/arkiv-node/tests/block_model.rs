@@ -12,16 +12,16 @@
 //!
 //! - its own weight table per schedule (`Weights`, named fields; the
 //!   engine's `PriceSchedule` is built from it, never read back), and the
-//!   model-3 charge table transcribed from the brief as lists of atomic
+//!   model-3 charge table transcribed as lists of atomic
 //!   charge groups with the semantic check points between them;
 //! - a `BTreeMap` model of every namespace (descriptor, raw entries,
 //!   records with their cells) with its own id allocators, and term newness
 //!   derived from the live records;
 //! - its own due schedule (`(height, namespace) → count`, `height →
-//!   total`), updated by the rules of the brief, and its own expiry
+//!   total`), updated by the rules of `docs/block-format.md`, and its own expiry
 //!   resolution, extend-only and capacity checks;
-//! - the reservation and sweep-bound arithmetic of the brief for admin
-//!   inputs, and the pricing in force.
+//! - the reservation and sweep-bound arithmetic for admin inputs, and the
+//!   pricing in force.
 //!
 //! Before each block is produced the oracle predicts its complete
 //! `BlockOutcomes` (every admin outcome, expiry deletion with its receipt,
@@ -35,7 +35,7 @@
 //! of both chains is compared with the model's state at that height.
 //!
 //! Coverage counters assert that every seed set reached every outcome kind
-//! the brief lists.
+//! listed in `Coverage`.
 
 mod support;
 
@@ -83,14 +83,14 @@ const LIMITS: Limits = Limits {
     ..Limits::DEFAULT
 };
 
+/// The model's own copy of the executor's spill search bound.
+const SPILL_WINDOW: u64 = 64;
+
 /// The block budget is `user_budget + expiry_per_block ×` the dearest
 /// deletion among the valid schedules the generator proposes: under
 /// `reads_x100`, `DirectoryLookup 100 + PointRead 300 + RecordDelete 20 +
 /// 5 × CellRemove 4 + 3 × RootUpdate 2 + 10 × (IndexRemove 6 + 2 ×
 /// RootUpdate 2)` = 546, so 50,000 + 3 × 546 = 51,638.
-/// The model's own copy of the executor's spill search bound.
-const SPILL_WINDOW: u64 = 64;
-
 const PARAMS: ChainParams = ChainParams {
     block_budget: 51_638,
     user_budget: 50_000,
@@ -109,9 +109,6 @@ const PARAMS: ChainParams = ChainParams {
 
 /// Budget of transactions that should not run out.
 const AMPLE: u64 = 6_000;
-
-// ---------------------------------------------------------------------------
-// Weights: the oracle's own price table.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Weights {
@@ -322,7 +319,7 @@ impl Weights {
         self.index_remove + 2 * self.root_update
     }
 
-    /// The brief's reservation: `block_budget ≥ user_budget +
+    /// The reservation: `block_budget ≥ user_budget +
     /// expiry_per_block × (DirectoryLookup + PointRead + RecordDelete +
     /// c·CellRemove + 3·RootUpdate + 2a·(IndexRemove + 2·RootUpdate))` with
     /// `c = a = max_cells`, and a representable sweep read bound
@@ -373,9 +370,6 @@ impl Weights {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// The record model.
 
 type Cells = BTreeMap<CellName, Cell>;
 
@@ -559,9 +553,6 @@ impl Model {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Admin inputs.
-
     fn admin(&mut self, weights: &Weights) -> AdminOutcome {
         if let Err(reason) = weights.reservation() {
             return AdminOutcome::Rejected(reason);
@@ -574,9 +565,6 @@ impl Model {
         self.pending = *weights;
         AdminOutcome::Applied
     }
-
-    // -----------------------------------------------------------------------
-    // The expiry sweep.
 
     fn delete_charges(&self, cells: &Cells) -> Vec<u64> {
         let w = &self.in_force;
@@ -638,10 +626,7 @@ impl Model {
         deletions
     }
 
-    // -----------------------------------------------------------------------
-    // User operations.
-
-    /// Resolves an expiry pair at `height` per the brief.
+    /// Resolves an expiry pair at `height`.
     fn resolve(expiry: &Expiry, height: u64) -> Result<Life, ExpiryFault> {
         let floor = height
             .checked_add(expiry.min_lifetime)
@@ -951,7 +936,7 @@ impl Model {
         (charges, None, Some(Effect::RecordCreated { id }))
     }
 
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn patch_charges(
         &self,
         actor: OwnerId,
@@ -1187,9 +1172,6 @@ impl Model {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Queries: a catalogue evaluated by full scan over the model.
-
 fn catalogue(height: u64) -> Vec<Query> {
     let name = |text| CellName::new(text).unwrap();
     vec![
@@ -1270,9 +1252,6 @@ fn model_query(state: &NsModel, query: &Query) -> Vec<(u64, Vec<u8>)> {
     rows.sort();
     rows
 }
-
-// ---------------------------------------------------------------------------
-// Comparison of a snapshot with the model.
 
 /// Every key the generator uses; each is checked present or absent.
 fn keys() -> Vec<Vec<u8>> {
@@ -1375,7 +1354,7 @@ fn verify(snapshot: &Snapshot, model: &Model, height: u64, context: &str) {
             assert_eq!(counted, count(expected.len()), "{context}: count");
         }
     }
-    // The due schedule, entry by entry, with keys built from the brief.
+    // The due schedule, entry by entry.
     let mut expected: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
     for ((at, namespace), n) in &model.due {
         expected.insert(due_key(*at, *namespace), n.to_be_bytes().to_vec());
@@ -1389,9 +1368,6 @@ fn verify(snapshot: &Snapshot, model: &Model, height: u64, context: &str) {
         "{context}: due schedule"
     );
 }
-
-// ---------------------------------------------------------------------------
-// The generator.
 
 struct Rng(u64);
 
@@ -2050,25 +2026,36 @@ fn generated_blocks_match_the_oracle() {
     assert!(!kinds.contains_key("admission rejected"));
 }
 
-/// The oracle's reservation arithmetic agrees with the parameters: every
-/// schedule the generator treats as valid fits, the others do not.
+/// The oracle's reservation arithmetic and `params::check_reservation`
+/// classify every schedule alike: those the generator treats as valid fit,
+/// the others do not.
 #[test]
 fn oracle_reservation_matches_the_parameters() {
+    use arkiv_node::params::{ReservationFault, check_reservation};
+    let check = |weights: Weights, expected: Result<(), AdminRejection>| {
+        assert_eq!(weights.reservation(), expected, "{weights:?}");
+        let node =
+            check_reservation(&PARAMS, &LIMITS, &weights.schedule()).map_err(|fault| match fault {
+                ReservationFault::Violated { .. } => AdminRejection::ReservationViolated,
+                ReservationFault::Overflow => AdminRejection::ReservationOverflow,
+            });
+        assert_eq!(node, expected, "{weights:?}");
+    };
     for weights in [
         FIXTURE,
         Weights::uniform(2, 2),
         Weights::reads_x100(3),
         Weights::reshaped(4),
     ] {
-        assert_eq!(weights.reservation(), Ok(()), "{weights:?}");
+        check(weights, Ok(()));
     }
-    assert_eq!(
-        Weights::too_dear(5).reservation(),
-        Err(AdminRejection::ReservationViolated)
+    check(
+        Weights::too_dear(5),
+        Err(AdminRejection::ReservationViolated),
     );
-    assert_eq!(
-        Weights::overflowing(6).reservation(),
-        Err(AdminRejection::ReservationOverflow)
+    check(
+        Weights::overflowing(6),
+        Err(AdminRejection::ReservationOverflow),
     );
     // The dearest valid deletion is exactly the one the block budget
     // reserves for: one more unit breaks it.
@@ -2076,10 +2063,7 @@ fn oracle_reservation_matches_the_parameters() {
         record_delete: 21,
         ..Weights::reads_x100(7)
     };
-    assert_eq!(
-        tight.reservation(),
-        Err(AdminRejection::ReservationViolated)
-    );
+    check(tight, Err(AdminRejection::ReservationViolated));
 }
 
 #[path = "support/block_roots.rs"]

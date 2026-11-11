@@ -1,5 +1,9 @@
 # Bulk prefill scaling: matched 100k and 200k samples
 
+Dated run record (2026-10-19). The samples were converted with the payload-era
+Sourcify converter (row codec 2), since removed; the producer phases measured
+here are unchanged.
+
 This experiment checks how startup cost changes when the selected contract count
 doubles. The Rust runtime remains `b0f05c7`, using release binary SHA-256
 `dbfb2e720683f2f07affadd17ad1e84ba7c3d7825fd803feec4919d81096142e`.
@@ -178,16 +182,8 @@ acceptance, query throughput or broad-proof-capacity test.
 | Prefill SHA-256 | `94b10c509992f22804fcacd38df019b2db65d3c3c8e1b4871c4ce21e734bec02` | `462578cc3d8da4a08e46ae57d2268bcf6912a8af386b235f6e3c1d3dec5bdd51` |
 | State root | `0x8074f966a7984e696b911829c4c180d7f12d9b11ced7c63f108513715589aec0` | `0xc3ae5668224ea28777e15ad99fef731fdece811daf6ebfb411cca40908f381c2` |
 
-Raw evidence is retained in the parent workspace under
-`operations/runs/bulk-prefill-200k`: source report and pinned input, conversion
-reports, bundle reports, preparation logs/resource samples, producer
-`events.jsonl`, `samples.jsonl`, `result.json`, `comparison.json`, `ratios.json`
-and `final-disk.json`. Producer 200k also has `disk-snapshots.jsonl`.
-
 Reproduce selection with the converter's `--contract-limit 100000` or `200000`
 against the same source; use the same funded base genesis and sponsor
-`0x1a642f0e3c3af545e7acbd38b07251b3990914f1`. The evidence directory contains
-`measure-producer.py`, `run-phase.py`, and `benchmark-plan.json` for the exact
-measurement setup. Each producer must receive a fresh run directory and run
+`0x1a642f0e3c3af545e7acbd38b07251b3990914f1`. Each producer must receive a fresh run directory and run
 sequentially under `MemoryMax=32G`, `MemorySwapMax=0`, and
 `ARKIV_PREFILL_RESERVE_GIB=80`.

@@ -44,8 +44,7 @@ impl Mutation {
     }
 }
 
-// A block is test workload metadata for now: the database receives one batch
-// and exposes only the resulting head. It does not yet retain block snapshots.
+// A block is one `WriteBatch`; the facade exposes only the resulting head.
 struct BlockPacket {
     number: usize,
     mutations: Vec<Mutation>,

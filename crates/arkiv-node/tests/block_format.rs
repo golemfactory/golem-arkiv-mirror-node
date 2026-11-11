@@ -1,4 +1,4 @@
-//! Golden vectors for block format version 1.
+//! Golden vectors for the block format (`FORMAT_VERSION`).
 //!
 //! Every expected byte string is assembled here from the specification in
 //! `docs/block-format.md` (big-endian integers, `u32 length ‖ bytes`,
@@ -27,9 +27,6 @@ use arkiv_node::{
     arkiv::{ArkivFault, ArkivOperation},
 };
 use support::*;
-
-// ---------------------------------------------------------------------------
-// Byte builders, written from the codec rules.
 
 fn be32(value: u32) -> Vec<u8> {
     value.to_be_bytes().to_vec()
@@ -97,9 +94,6 @@ fn unknown_tag<T: Decode + Debug>(kind: &'static str, tag: u8, rest: &[u8]) {
     rejects::<T>(&bytes, DecodeError::UnknownTag { kind, tag });
 }
 
-// ---------------------------------------------------------------------------
-// Pieces reused by several vectors.
-
 /// `PriceSchedule::FIXTURE`: id 1, 31 classes, the weights in
 /// `OperationClass::ALL` order transcribed from the charge table.
 fn fixture_schedule_bytes() -> Vec<u8> {
@@ -154,11 +148,9 @@ fn params_bytes() -> Vec<u8> {
 
 fn genesis_bytes() -> Vec<u8> {
     cat(&[
-        // Format 5: chain parameters carry the rent clock and the storage cap,
-        // outcomes the rent.
+        // format version
         &be32(5),
-        // Protocol 5: user-defined columns, live permanent entities, capped
-        // rent per second outside gas and a per-block storage cap.
+        // protocol version
         &be32(5),
         &be64(CHAIN),
         &be64(1_000),
@@ -189,8 +181,6 @@ fn hash(byte: u8) -> B256 {
     B256::new([byte; 32])
 }
 
-// ---------------------------------------------------------------------------
-
 #[test]
 fn chain_params_and_genesis() {
     golden(&PARAMS, &params_bytes());
@@ -206,7 +196,6 @@ fn chain_params_and_genesis() {
 #[test]
 fn genesis_versions_are_checked() {
     let mut bytes = genesis_bytes();
-    // Format 1 is the retired bare-value entity operation layout.
     for version in [0u32, 1, 2, 3, 4, 6, u32::MAX] {
         bytes[..4].copy_from_slice(&version.to_be_bytes());
         rejects::<Genesis>(
@@ -218,7 +207,6 @@ fn genesis_versions_are_checked() {
         );
     }
     let mut bytes = genesis_bytes();
-    // Protocol 1 is the retired payload entity model.
     for version in [0u32, 1, 2, 3, 4, 6, u32::MAX] {
         bytes[4..8].copy_from_slice(&version.to_be_bytes());
         rejects::<Genesis>(

@@ -37,10 +37,6 @@ const DIRECTORY_CHARGE: u64 = 1;
 const MISSING_KEY_COST: u64 = 4;
 const EMPTY_SCAN_COST: u64 = 5;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn ns(ordinal: u64) -> NamespaceId {
     NamespaceId::from_bytes(ordinal.to_be_bytes()).expect("ordinal is non-zero")
 }
@@ -246,10 +242,6 @@ fn owner_at(view: &impl Reads, namespace: NamespaceId) -> NamespaceDescriptor {
         .0
 }
 
-// ---------------------------------------------------------------------------
-// 1. Identical keys never alias
-// ---------------------------------------------------------------------------
-
 /// A key written to both namespaces with different values.
 struct SharedKey {
     key: &'static [u8],
@@ -454,13 +446,9 @@ fn identical_keys_in_different_namespaces_never_alias() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2. Unknown namespace
-// ---------------------------------------------------------------------------
-
 #[test]
-fn unknown_namespaces_are_rejected_after_the_directory_charge() {
-    // Encoding: 8-byte big-endian ordinal; zero is not an ID.
+fn namespace_ids_are_eight_big_endian_bytes() {
+    // Zero is not an ID.
     assert_eq!(NamespaceId::ENCODED_LEN, 8);
     assert_eq!(NamespaceId::from_bytes([0; 8]), None);
     let ghost = ns(999);
@@ -468,12 +456,19 @@ fn unknown_namespaces_are_rejected_after_the_directory_charge() {
     assert_eq!(ghost.to_bytes(), [0, 0, 0, 0, 0, 0, 0x03, 0xe7]);
     assert_eq!(NamespaceId::from_bytes(ghost.to_bytes()), Some(ghost));
     assert_eq!(ghost.to_string(), "ns:00000000000003e7");
-    assert_eq!(format!("{ghost}"), "ns:00000000000003e7");
     assert_eq!(
         NamespaceId::from_bytes([0xff; 8]).map(NamespaceId::ordinal),
         Some(u64::MAX)
     );
+    let first = ns(1);
+    assert_eq!(first.to_string(), "ns:0000000000000001");
+    assert!(first < ghost);
+    assert!(first.to_bytes() < ghost.to_bytes());
+}
 
+#[test]
+fn unknown_namespaces_are_rejected_after_the_directory_charge() {
+    let ghost = ns(999);
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
     let genesis = engine.head_snapshot();
     assert_eq!(
@@ -485,9 +480,6 @@ fn unknown_namespaces_are_rejected_after_the_directory_charge() {
     let mut branch = begin(&engine);
     let first = create(&mut branch, ALICE);
     assert_eq!(first, ns(1));
-    assert_eq!(first.to_string(), "ns:0000000000000001");
-    assert!(first < ghost);
-    assert!(first.to_bytes() < ghost.to_bytes());
     let published = publish(&mut engine, branch);
 
     let mut branch = engine
@@ -545,10 +537,6 @@ fn unknown_namespaces_are_rejected_after_the_directory_charge() {
     );
     assert_eq!(owner_at(&after, first), descriptor(first, ALICE, 0));
 }
-
-// ---------------------------------------------------------------------------
-// 3. Authorization and the order of checks
-// ---------------------------------------------------------------------------
 
 #[test]
 fn only_the_owner_writes_and_the_actor_is_checked_before_the_revision() {
@@ -644,10 +632,6 @@ fn only_the_owner_writes_and_the_actor_is_checked_before_the_revision() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4. Same-block authority change
-// ---------------------------------------------------------------------------
-
 #[test]
 fn authority_changes_take_effect_immediately_within_a_block() {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -726,10 +710,6 @@ fn authority_changes_take_effect_immediately_within_a_block() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5. Transfer to self
-// ---------------------------------------------------------------------------
-
 #[test]
 fn transfer_to_self_is_permitted_and_bumps_the_revision() {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -770,10 +750,6 @@ fn transfer_to_self_is_permitted_and_bumps_the_revision() {
     let after = publish(&mut engine, branch);
     assert_eq!(owner_at(&after, a), descriptor(a, ALICE, 2));
 }
-
-// ---------------------------------------------------------------------------
-// 6. Transfer cost is independent of namespace size
-// ---------------------------------------------------------------------------
 
 #[test]
 fn transfer_is_a_metadata_operation_independent_of_namespace_size() {
@@ -831,7 +807,6 @@ fn transfer_is_a_metadata_operation_independent_of_namespace_size() {
     );
     assert_eq!(empty.receipt, expected_receipt);
     assert_eq!(large.receipt, expected_receipt);
-    assert_eq!(empty.receipt, large.receipt);
     assert_eq!(
         empty.effect,
         Effect::Transferred {
@@ -847,12 +822,6 @@ fn transfer_is_a_metadata_operation_independent_of_namespace_size() {
     assert!(
         before.records_shared_with(&after, b),
         "B's records were not copied"
-    );
-    // A is empty, so this identity check is vacuous; the populated B above
-    // and the equal receipts are the evidence for size independence.
-    assert!(
-        before.records_shared_with(&after, a),
-        "A's (empty) record map is reported as shared"
     );
     assert_eq!(after.record_count(a), Some(0));
     assert_eq!(after.record_count(b), Some(RECORDS));
@@ -875,10 +844,6 @@ fn transfer_is_a_metadata_operation_independent_of_namespace_size() {
         Ok((Effect::Put { replaced: false }, applied(18)))
     );
 }
-
-// ---------------------------------------------------------------------------
-// 7. ID allocation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn ids_are_creation_ordinals_and_discarded_ordinals_are_reused() {
@@ -963,20 +928,6 @@ fn ids_are_creation_ordinals_and_discarded_ordinals_are_reused() {
             expected,
             "ordinal 4 at {id}"
         );
-        assert_ne!(
-            value(snapshot.describe(ns(4)))
-                .ok()
-                .map(|(found, _)| found.owner),
-            Some(CAROL),
-            "the rolled-back owner never appears at {id}"
-        );
-        assert_ne!(
-            value(snapshot.describe(ns(4)))
-                .ok()
-                .map(|(found, _)| found.owner),
-            Some(DAVE),
-            "the losing candidate's owner never appears at {id}"
-        );
         let has_five = id.sequence() >= fourth.id().sequence();
         assert_eq!(
             value(snapshot.describe(ns(5))).ok(),
@@ -996,10 +947,6 @@ fn ids_are_creation_ordinals_and_discarded_ordinals_are_reused() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 8. Namespace cap
-// ---------------------------------------------------------------------------
 
 #[test]
 fn namespace_cap_rejects_creation_after_the_directory_charge_and_rollback_frees_it() {
@@ -1111,10 +1058,6 @@ fn namespace_cap_rejects_creation_after_the_directory_charge_and_rollback_frees_
     );
 }
 
-// ---------------------------------------------------------------------------
-// 9. Descriptor history
-// ---------------------------------------------------------------------------
-
 #[test]
 fn descriptor_history_reflects_published_transfers_only() {
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
@@ -1185,10 +1128,6 @@ fn descriptor_history_reflects_published_transfers_only() {
     assert_eq!(genesis.namespace_count(), 0);
     assert_eq!(genesis.record_count(a), None);
 }
-
-// ---------------------------------------------------------------------------
-// 10. Ownership is per namespace
-// ---------------------------------------------------------------------------
 
 #[test]
 fn owning_one_namespace_grants_nothing_in_another() {

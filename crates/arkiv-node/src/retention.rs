@@ -15,6 +15,7 @@
 //!
 //! Headers, bodies, feed records, inclusions and the hash index are retained
 //! in full and never refused.
+
 use crate::simulator::{Error, Result};
 use arkiv_db::{
     EngineError, Snapshot, SnapshotId,
@@ -32,6 +33,7 @@ impl Refusal {
         self.0.set(Some((requested, floor)));
         Error("HistoryPruned")
     }
+
     /// Takes the details of the last refusal, if one is pending.
     pub fn take(&self) -> Option<(u64, u64)> {
         self.0.take()

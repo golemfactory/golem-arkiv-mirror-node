@@ -1,5 +1,6 @@
 //! Canonical native signed envelopes. Every layout starts with a version
 //! field, and decoders accept only the versions defined here.
+
 use std::collections::BTreeSet;
 
 use super::{
@@ -69,6 +70,7 @@ pub struct SignedLimits {
     pub max_input_bytes: u32,
     pub max_body_bytes: u32,
 }
+
 impl Default for SignedLimits {
     fn default() -> Self {
         Self {
@@ -78,6 +80,7 @@ impl Default for SignedLimits {
         }
     }
 }
+
 impl Encode for SignedLimits {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(self.max_tx_bytes);
@@ -85,6 +88,7 @@ impl Encode for SignedLimits {
         e.u32(self.max_body_bytes);
     }
 }
+
 impl Decode for SignedLimits {
     const MIN_ENCODED_LEN: usize = 12;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -110,6 +114,7 @@ pub struct SignedGenesis {
     pub accounts: crate::accounts::AccountConfig,
     pub prefill: Option<crate::genesis_bundle::PrefillLaunch>,
 }
+
 /// The gas profile of every signed chain: GLM pricing, balances and burnt fees.
 pub const GAS_PROFILE: &str = "glm-v2";
 
@@ -144,6 +149,7 @@ pub fn default_native_genesis(chain_id: u64, timestamp_ms: u64, block_period_ms:
     native.params.expiry_per_block = MAX_EXPIRY_PER_BLOCK;
     native
 }
+
 impl SignedGenesis {
     pub fn new(
         genesis: Genesis,
@@ -164,6 +170,7 @@ impl SignedGenesis {
         value.validate()?;
         Ok(value)
     }
+
     pub fn validate(&self) -> Result<()> {
         self.accounts
             .validate()
@@ -222,11 +229,13 @@ impl SignedGenesis {
         self.timestamp(1)?;
         Ok(())
     }
+
     /// The native execution parameters; signed chain identity comes from `self.hash()`.
     pub fn spec(&self) -> Result<ChainSpec> {
         self.validate()?;
         ChainSpec::new(self.genesis.clone()).map_err(|_| Error("InvalidSignedGenesis"))
     }
+
     pub fn header(&self) -> Header {
         Header {
             inputs_digest: digest(GENESIS_DOMAIN, &encode(self)),
@@ -237,9 +246,11 @@ impl SignedGenesis {
             ..self.genesis.header()
         }
     }
+
     pub fn hash(&self) -> B256 {
         self.header().hash()
     }
+
     pub fn timestamp(&self, height: u64) -> Result<u64> {
         height
             .checked_mul(self.block_period_ms)
@@ -247,6 +258,7 @@ impl SignedGenesis {
             .ok_or(Error("TimestampOverflow"))
     }
 }
+
 impl Encode for SignedGenesis {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(VERSION);
@@ -259,6 +271,7 @@ impl Encode for SignedGenesis {
         e.put(&self.prefill);
     }
 }
+
 impl Decode for SignedGenesis {
     const MIN_ENCODED_LEN: usize = 4
         + Genesis::MIN_ENCODED_LEN
@@ -298,6 +311,7 @@ pub struct SignedTx {
     /// intent signature.
     pub ethereum_raw: Option<Vec<u8>>,
 }
+
 impl SignedTx {
     fn intent(&self, e: &mut Encoder) {
         e.u32(VERSION);
@@ -305,17 +319,20 @@ impl SignedTx {
         e.u64(self.nonce);
         e.put(&self.tx);
     }
+
     pub fn intent_digest(&self) -> B256 {
         let mut e = Encoder::new();
         self.intent(&mut e);
         digest(TX_INTENT_DOMAIN, e.as_bytes())
     }
+
     pub fn hash(&self) -> B256 {
         self.ethereum_raw.as_ref().map_or_else(
             || digest(TX_DOMAIN, &encode(self)),
             alloy_primitives::keccak256,
         )
     }
+
     pub fn identity(&self) -> RequestIdentity {
         RequestIdentity {
             scope: Scope::Tx,
@@ -324,6 +341,7 @@ impl SignedTx {
             request_id: self.tx.request_id,
         }
     }
+
     pub fn sign(
         genesis: &SignedGenesis,
         nonce: u64,
@@ -341,6 +359,7 @@ impl SignedTx {
         value.validate(genesis)?;
         Ok(value)
     }
+
     pub fn validate(&self, genesis: &SignedGenesis) -> Result<()> {
         let spec = genesis.spec()?;
         if self.genesis_hash != genesis.hash() || self.tx.chain_id != genesis.genesis.chain_id {
@@ -384,9 +403,11 @@ impl SignedTx {
         }
         Ok(())
     }
+
     pub fn from_ethereum(genesis: &SignedGenesis, bytes: &[u8]) -> Result<Self> {
         super::ethereum::decode(genesis, bytes)
     }
+
     /// Bounded exact transport decode, before signature verification or pool insertion.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > TX_CAP as usize {
@@ -395,6 +416,7 @@ impl SignedTx {
         decode_exact(bytes).map_err(|_| Error("InvalidTransactionEncoding"))
     }
 }
+
 impl Encode for SignedTx {
     fn encode_to(&self, e: &mut Encoder) {
         if let Some(raw) = &self.ethereum_raw {
@@ -410,6 +432,7 @@ impl Encode for SignedTx {
         }
     }
 }
+
 impl Decode for SignedTx {
     const MIN_ENCODED_LEN: usize = SIGNED_TX_OVERHEAD as usize + TxEnvelope::MIN_ENCODED_LEN;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -444,16 +467,19 @@ impl Decode for SignedTx {
 pub struct SignedInputs {
     pub txs: Vec<SignedTx>,
 }
+
 impl SignedInputs {
     pub fn digest(&self) -> B256 {
         digest(INPUTS_DOMAIN, &encode(self))
     }
+
     pub fn native(&self) -> BlockInputs {
         BlockInputs {
             admin: vec![],
             txs: self.txs.iter().map(|t| t.tx.clone()).collect(),
         }
     }
+
     pub fn validate(&self, genesis: &SignedGenesis, height: u64) -> Result<()> {
         let spec = genesis.spec()?;
         if encode(self).len() > genesis.limits.max_input_bytes as usize {
@@ -467,7 +493,10 @@ impl SignedInputs {
             && (self.txs.len() != 1
                 || self.txs[0].tx.actor != OwnerId::new(genesis.proposer)
                 || self.txs[0].nonce != 0
-                || !matches!(self.txs[0].tx.ops.as_slice(), [TxOp::CreateNamespace {name}] if name.as_str() == "entities"))
+                || !matches!(
+                    self.txs[0].tx.ops.as_slice(),
+                    [TxOp::CreateNamespace { name }] if name.as_str() == "entities"
+                ))
         {
             return Err(Error("InvalidBootstrap"));
         }
@@ -481,12 +510,14 @@ impl SignedInputs {
         validate::check_block(&spec, &self.native()).map_err(|_| Error("InvalidInputs"))
     }
 }
+
 impl Encode for SignedInputs {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(VERSION);
         e.put(&self.txs);
     }
 }
+
 impl Decode for SignedInputs {
     const MIN_ENCODED_LEN: usize = 8;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -513,6 +544,7 @@ pub struct SignedHeader {
     pub header: Header,
     pub signature: [u8; 65],
 }
+
 impl SignedHeader {
     pub fn intent_digest(&self) -> B256 {
         let mut e = Encoder::new();
@@ -521,6 +553,7 @@ impl SignedHeader {
         e.put(&self.header.hash());
         digest(HEADER_DOMAIN, e.as_bytes())
     }
+
     pub fn sign(genesis: &SignedGenesis, header: Header, signer: &Signer) -> Result<Self> {
         let mut value = Self {
             genesis_hash: genesis.hash(),
@@ -531,6 +564,7 @@ impl SignedHeader {
         value.authenticate(genesis)?;
         Ok(value)
     }
+
     pub fn authenticate(&self, genesis: &SignedGenesis) -> Result<()> {
         genesis.validate()?;
         if self.genesis_hash != genesis.hash() || self.header.chain_id != genesis.genesis.chain_id {
@@ -547,6 +581,7 @@ impl SignedHeader {
         Ok(())
     }
 }
+
 impl Encode for SignedHeader {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(VERSION);
@@ -555,6 +590,7 @@ impl Encode for SignedHeader {
         e.fixed(&self.signature);
     }
 }
+
 impl Decode for SignedHeader {
     const MIN_ENCODED_LEN: usize = 4 + 32 + Header::MIN_ENCODED_LEN + 65;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -575,10 +611,12 @@ pub struct SignedBlock {
     pub inputs: SignedInputs,
     pub outcomes: BlockOutcomes,
 }
+
 impl SignedBlock {
     pub fn hash(&self) -> B256 {
         self.header.header.hash()
     }
+
     /// Authenticate commitments and static structure. Independent execution is still required.
     pub fn authenticate(&self, genesis: &SignedGenesis) -> Result<()> {
         self.header.authenticate(genesis)?;
@@ -608,6 +646,7 @@ impl SignedBlock {
         }
         Ok(())
     }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > BODY_CAP as usize {
             return Err(Error("BlockTooLarge"));
@@ -615,6 +654,7 @@ impl SignedBlock {
         decode_exact(bytes).map_err(|_| Error("InvalidBlockEncoding"))
     }
 }
+
 impl Encode for SignedBlock {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(VERSION);
@@ -623,6 +663,7 @@ impl Encode for SignedBlock {
         e.put(&self.outcomes);
     }
 }
+
 impl Decode for SignedBlock {
     const MIN_ENCODED_LEN: usize = 4
         + SignedHeader::MIN_ENCODED_LEN

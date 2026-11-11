@@ -1,4 +1,5 @@
 //! Explicit opt-in unsigned durable simulator; see --help.
+
 use arkiv_db::{decode_exact, durable::Options};
 use arkiv_db_redb::{RedbConfig, RedbStore};
 use arkiv_db_storage::versioned::VersionedStore;
@@ -28,6 +29,7 @@ fn args() -> Result<(String, BTreeMap<String, String>)> {
     }
     Ok((role, out))
 }
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -35,6 +37,7 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
 async fn run() -> Result<()> {
     let (role, args) = args()?;
     if role == "--version" {
@@ -42,11 +45,29 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if role == "--help" {
-        println!(
-            "arkiv-simulator producer|full|light --unsigned-simulator --run-dir DIR [--listen 127.0.0.1:9400] [--admin-listen 127.0.0.1:9401] [--resume | --start paused|running] [--interval-ms 1000]\nProducer: [--source-id UUID] [--chain-id 9001] [--seed 7] [--block-period-ms 1000] [--payload-bytes 64] [--cache-bytes 8388608] [--state-retention archive|N]\nFollowers: --peer URL --source-id UUID --run-id HEX32 --genesis-hash 0xHEX64 [--chain-id 9001] (full also: [--state-retention archive|N])\nPrivate listener requires SIMULATOR_ADMIN_TOKEN (>=32 bytes). Full follower additionally requires --replication-peer URL and SIMULATOR_REPLICATION_TOKEN (same private bearer).\nUnsigned source: proofs verify state against the explicitly trusted source, without consensus authentication. Restart opens retained history from one redb file; producer starts paused unless --resume (or --start running, the deployment form of the same startup policy). --state-retention N serves state reads only for the head and the N snapshots before it (older heights: 410 HistoryPruned); archive (default) serves all. Nothing is deleted yet; a pruned floor never moves back."
-        );
+        println!(concat!(
+            "arkiv-simulator producer|full|light --unsigned-simulator --run-dir DIR [--listen ",
+            "127.0.0.1:9400] [--admin-listen 127.0.0.1:9401] [--resume | --start ",
+            "paused|running] [--interval-ms 1000]\n",
+            "Producer: [--source-id UUID] [--chain-id 9001] [--seed 7] [--block-period-ms ",
+            "1000] [--payload-bytes 64] [--cache-bytes 8388608] [--state-retention ",
+            "archive|N]\n",
+            "Followers: --peer URL --source-id UUID --run-id HEX32 --genesis-hash 0xHEX64 ",
+            "[--chain-id 9001] (full also: [--state-retention archive|N])\n",
+            "Private listener requires SIMULATOR_ADMIN_TOKEN (>=32 bytes). Full follower ",
+            "additionally requires --replication-peer URL and SIMULATOR_REPLICATION_TOKEN ",
+            "(same private bearer).\n",
+            "Unsigned source: proofs verify state against the explicitly trusted source, ",
+            "without consensus authentication. Restart opens retained history from one redb ",
+            "file; producer starts paused unless --resume (or --start running, the deployment ",
+            "form of the same startup policy). --state-retention N serves state reads only ",
+            "for the head and the N snapshots before it (older heights: 410 HistoryPruned); ",
+            "archive (default) serves all. Nothing is deleted yet; a pruned floor never moves ",
+            "back.",
+        ));
         return Ok(());
     }
+
     const FLAGS: &[&str] = &[
         "--unsigned-simulator",
         "--run-dir",
@@ -136,11 +157,28 @@ async fn run() -> Result<()> {
         };
         let mut report = match &opened_node {
             Node::Light(light) => {
-                serde_json::json!({"role":"light","sourceId":light.identity.source_id,"runId":light.identity.run_id,"genesisHash":light.identity.genesis_hash,"height":light.head.height.to_string(),"residentHeaders":1,"continuations":light.continuation_count()})
+                serde_json::json!({
+                    "role": "light",
+                    "sourceId": light.identity.source_id,
+                    "runId": light.identity.run_id,
+                    "genesisHash": light.identity.genesis_hash,
+                    "height": light.head.height.to_string(),
+                    "residentHeaders": 1,
+                    "continuations": light.continuation_count(),
+                })
             }
             Node::Full(host) => {
                 let stats = host.engine.stats();
-                serde_json::json!({"role":"full","sourceId":host.identity.source_id,"runId":host.identity.run_id,"genesisHash":host.identity.genesis_hash,"height":host.head.height.to_string(),"residentManifests":stats.resident_manifests,"cacheRetainedBytes":stats.cache.retained_bytes,"cacheEntries":stats.cache.entries})
+                serde_json::json!({
+                    "role": "full",
+                    "sourceId": host.identity.source_id,
+                    "runId": host.identity.run_id,
+                    "genesisHash": host.identity.genesis_hash,
+                    "height": host.head.height.to_string(),
+                    "residentManifests": stats.resident_manifests,
+                    "cacheRetainedBytes": stats.cache.retained_bytes,
+                    "cacheEntries": stats.cache.entries,
+                })
             }
         };
         let reads = store.stats().since(&before);
@@ -150,9 +188,25 @@ async fn run() -> Result<()> {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         });
-        report.as_object_mut().ok_or(Error("StorageUnavailable"))?.extend(
-            serde_json::json!({"coldRecordReads":reads.record_reads,"coldHeadReads":reads.head_reads,"coldObjectReads":reads.object_reads(),"fileBytes":std::fs::metadata(&file).map_err(|_|Error("StorageUnavailable"))?.len(),"fullRepair":store.last_open().full_repair,"processMemory":memory}).as_object().ok_or(Error("StorageUnavailable"))?.clone()
-        );
+        let file_bytes = std::fs::metadata(&file)
+            .map_err(|_| Error("StorageUnavailable"))?
+            .len();
+        report
+            .as_object_mut()
+            .ok_or(Error("StorageUnavailable"))?
+            .extend(
+                serde_json::json!({
+                    "coldRecordReads": reads.record_reads,
+                    "coldHeadReads": reads.head_reads,
+                    "coldObjectReads": reads.object_reads(),
+                    "fileBytes": file_bytes,
+                    "fullRepair": store.last_open().full_repair,
+                    "processMemory": memory,
+                })
+                .as_object()
+                .ok_or(Error("StorageUnavailable"))?
+                .clone(),
+            );
         println!("{report}");
         return Ok(());
     }
@@ -312,6 +366,7 @@ fn create_store(opened: Option<Arc<RedbStore>>, file: &std::path::Path) -> Resul
         None => Ok(Arc::new(RedbStore::create(file, RedbConfig::default())?)),
     }
 }
+
 async fn bootstrap(
     endpoint: &str,
     expected: &Identity,

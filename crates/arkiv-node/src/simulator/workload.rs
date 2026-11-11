@@ -1,5 +1,6 @@
 //! Reproducible Arkiv entity trace with a configurable size of its unindexed
 //! `bytes` column (`payload_bytes`, kept as the workload's knob name).
+
 use super::{Error, Result};
 use arkiv_db::{
     Cell, CellName, Decode, DecodeError, Decoder, Encode, Encoder, RecordKey, Value, digest,
@@ -14,6 +15,7 @@ pub struct Workload {
     pub block_period_ms: String,
     pub payload_bytes: u32,
 }
+
 impl Default for Workload {
     fn default() -> Self {
         Self {
@@ -24,6 +26,7 @@ impl Default for Workload {
         }
     }
 }
+
 impl Workload {
     /// Finite, reproducible Arkiv fixture followed by empty advancing blocks.
     /// Fixed history makes samples repeatable while headers continue to advance.
@@ -138,6 +141,7 @@ impl Workload {
         };
         Ok(crate::BlockInputs { admin: vec![], txs })
     }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != arkiv_db::LAYOUT_VERSION
             || super::wire::number(&self.block_period_ms)? == 0
@@ -148,6 +152,7 @@ impl Workload {
         super::wire::number(&self.seed)?;
         Ok(())
     }
+
     pub fn update_allowed(&self, next: &Self) -> Result<()> {
         next.validate()?;
         if (self.version, &self.seed, &self.block_period_ms)
@@ -157,6 +162,7 @@ impl Workload {
         }
         Ok(())
     }
+
     pub fn timestamp(&self, genesis: u64, height: u64) -> Result<u64> {
         super::wire::number(&self.block_period_ms)?
             .checked_mul(height)
@@ -164,6 +170,7 @@ impl Workload {
             .ok_or(Error("CapacityReached"))
     }
 }
+
 impl Encode for Workload {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(self.version);
@@ -172,6 +179,7 @@ impl Encode for Workload {
         e.u32(self.payload_bytes);
     }
 }
+
 impl Decode for Workload {
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
         let w = Self {

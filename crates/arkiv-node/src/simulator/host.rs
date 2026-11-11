@@ -1,4 +1,5 @@
 //! One durable writer. Published headers are exposed only after Committed.
+
 use super::{Error, Result, metadata, wire::*, workload::Workload};
 use crate::{
     Block, BlockInputs, BlockOutcomes, ChainSpec, Genesis, Header, Inclusion, RequestIdentity,
@@ -16,11 +17,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
 const NODE_VERSION: u32 = arkiv_db::LAYOUT_VERSION;
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub genesis: Genesis,
     pub workload: Workload,
 }
+
 impl Encode for RunConfig {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(NODE_VERSION);
@@ -28,6 +31,7 @@ impl Encode for RunConfig {
         e.put(&self.workload);
     }
 }
+
 impl Decode for RunConfig {
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
         if d.u32()? != NODE_VERSION {
@@ -42,20 +46,20 @@ impl Decode for RunConfig {
         })
     }
 }
+
 impl RunConfig {
     pub fn validate(&self) -> Result<ChainSpec> {
         self.workload.validate()?;
         let g = &self.genesis;
         let selected = crate::demo::workload::genesis(g.chain_id, g.timestamp_ms);
-        // Genesis fixes the resource profile. Unindexed field values become
-        // bounded descriptors in the feed. Every published feed is separately
-        // capped at 4 MiB.
+        // Only the development workload's limits and params are supported.
         if g.limits != selected.limits || g.params != selected.params {
             return Err(Error("UnsupportedVersion"));
         }
         ChainSpec::new(g.clone()).map_err(|_| Error("InvalidRequest"))
     }
 }
+
 pub fn uuid(bytes: &[u8; 16]) -> String {
     let s = hex(bytes);
     let s = &s[2..];
@@ -68,6 +72,7 @@ pub fn uuid(bytes: &[u8; 16]) -> String {
         &s[20..]
     )
 }
+
 pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     if s.len() != 36 || [8, 13, 18, 23].iter().any(|&i| s.as_bytes()[i] != b'-') {
         return Err(Error("InvalidRequest"));
@@ -79,6 +84,7 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     }
     Ok(a)
 }
+
 pub fn identity(i: &SimulatorIdentity, g: &Genesis) -> Identity {
     Identity {
         source_id: uuid(&i.source_id),
@@ -87,6 +93,7 @@ pub fn identity(i: &SimulatorIdentity, g: &Genesis) -> Identity {
         chain_id: g.chain_id.to_string(),
     }
 }
+
 pub fn engine_genesis(i: &SimulatorIdentity, g: &Genesis) -> EngineGenesis {
     EngineGenesis {
         initial_state: None,
@@ -107,6 +114,7 @@ pub struct Control {
     pub action: String,
     pub config: Option<Workload>,
 }
+
 impl Control {
     pub fn validate(&self) -> Result<([u8; 32], B256)> {
         let id: [u8; 32] = unhex(&self.command_id, 32)?
@@ -141,17 +149,20 @@ impl Control {
         Ok((id, digest("arkiv/simulator-control/v1", &e.into_bytes())))
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct ControlReceipt {
     pub id: [u8; 32],
     pub digest: B256,
 }
+
 impl Encode for ControlReceipt {
     fn encode_to(&self, e: &mut Encoder) {
         e.fixed(&self.id);
         e.put(&self.digest);
     }
 }
+
 impl Decode for ControlReceipt {
     const MIN_ENCODED_LEN: usize = 64;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -161,6 +172,7 @@ impl Decode for ControlReceipt {
         })
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct StoredBlock {
     pub block: Block,
@@ -169,6 +181,7 @@ pub struct StoredBlock {
     pub revision: u64,
     pub controls: Vec<ControlReceipt>,
 }
+
 impl StoredBlock {
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let feed = json_bytes(&self.feed, FEED_CAP)?;
@@ -189,6 +202,7 @@ impl StoredBlock {
         }
         Ok(bytes)
     }
+
     pub fn from_bytes(bytes: &[u8], id: &Identity, genesis: &Genesis) -> Result<Self> {
         if bytes.len() > ENVELOPE_CAP || bytes.len() * 2 + 4096 > RESPONSE_CAP {
             return Err(Error("StorageCorrupt"));
@@ -289,6 +303,7 @@ pub struct Host {
     /// The last state-retention refusal, for API error details.
     pub refusal: crate::retention::Refusal,
 }
+
 impl Host {
     pub fn create(
         store: Arc<dyn VersionedStore>,
@@ -353,6 +368,7 @@ impl Host {
             refusal: Default::default(),
         })
     }
+
     pub fn open(
         store: Arc<dyn VersionedStore>,
         expected: Option<&Identity>,
@@ -404,6 +420,7 @@ impl Host {
             refusal: Default::default(),
         })
     }
+
     pub fn block(&self, height: u64) -> Result<StoredBlock> {
         if height > self.head.height {
             return Err(Error("UnknownBlock"));
@@ -417,6 +434,7 @@ impl Host {
         }
         Ok(block)
     }
+
     pub fn header(&self, height: u64) -> Result<Header> {
         if height == self.head.height {
             Ok(self.head)
@@ -424,6 +442,7 @@ impl Host {
             Ok(self.block(height)?.block.header)
         }
     }
+
     fn existing_control(&self, id: &[u8; 32], digest: B256) -> Result<Option<u64>> {
         let mut key = vec![2];
         key.extend_from_slice(id);
@@ -438,6 +457,7 @@ impl Host {
         }
         Ok(Some(u64::from_be_bytes(bytes[32..].try_into().unwrap())))
     }
+
     pub fn control(&mut self, c: Control) -> Result<serde_json::Value> {
         if self.role != "producer" {
             return Err(Error("InvalidRequest"));
@@ -447,9 +467,11 @@ impl Host {
             return Err(Error("IdentityMismatch"));
         }
         if let Some(height) = self.existing_control(&id, digest)? {
-            return Ok(
-                serde_json::json!({"status":"committed","height":height.to_string(),"configRevision":self.revision.to_string()}),
-            );
+            return Ok(serde_json::json!({
+                "status": "committed",
+                "height": height.to_string(),
+                "configRevision": self.revision.to_string(),
+            }));
         }
         if let Some(old) = self.volatile_controls.get(&id) {
             if *old != digest {
@@ -488,22 +510,31 @@ impl Host {
                     return Err(Error("QueueFull"));
                 }
                 self.pending_config = Some((ControlReceipt { id, digest }, config));
-                Ok(
-                    serde_json::json!({"status":"pending","effectiveHeight":self.head.height.checked_add(1).ok_or(Error("CapacityReached"))?.to_string()}),
-                )
+                let effective = self
+                    .head
+                    .height
+                    .checked_add(1)
+                    .ok_or(Error("CapacityReached"))?;
+                Ok(serde_json::json!({
+                    "status": "pending",
+                    "effectiveHeight": effective.to_string(),
+                }))
             }
             "step" => {
                 if !self.paused {
                     return Err(Error("RequestConflict"));
                 }
                 let h = self.produce(Some(ControlReceipt { id, digest }))?;
-                Ok(
-                    serde_json::json!({"status":"committed","height":h.height.to_string(),"configRevision":self.revision.to_string()}),
-                )
+                Ok(serde_json::json!({
+                    "status": "committed",
+                    "height": h.height.to_string(),
+                    "configRevision": self.revision.to_string(),
+                }))
             }
             _ => Err(Error("InvalidRequest")),
         }
     }
+
     pub fn produce(&mut self, command: Option<ControlReceipt>) -> Result<Header> {
         if self.pending.is_some() {
             return Err(Error("CommitUncertain"));
@@ -536,6 +567,7 @@ impl Host {
         }
         self.execute_publish(inputs, timestamp, workload, revision, controls, None)
     }
+
     pub fn import(&mut self, record: StoredBlock) -> Result<Header> {
         let height = record.block.header.height;
         if height <= self.head.height {
@@ -576,6 +608,7 @@ impl Host {
             Some(&record),
         )
     }
+
     fn execute_publish(
         &mut self,
         inputs: BlockInputs,
@@ -684,6 +717,7 @@ impl Host {
         self.pending = Some(record);
         self.commit_prepared()
     }
+
     fn commit_prepared(&mut self) -> Result<Header> {
         match self.engine.commit()? {
             Publication::Committed(info) => {
@@ -712,6 +746,7 @@ impl Host {
             }
         }
     }
+
     /// Explicit operator/test recovery; only the engine's exact retained retry can publish.
     pub fn retry_pending(&mut self) -> Result<Header> {
         match self.engine.recover_pending()? {
@@ -720,6 +755,7 @@ impl Host {
             Recovery::Ready => Err(Error("InvalidRequest")),
         }
     }
+
     pub fn request(&self, r: &arkiv_db::proof::EqRequest) -> Result<arkiv_db::Snapshot> {
         let h = self.header(r.snapshot.height)?;
         if r.snapshot.genesis_hash != self.durable_identity.node_genesis_hash
@@ -730,6 +766,7 @@ impl Host {
         }
         crate::retention::state(&self.engine, &self.refusal, h.height)
     }
+
     pub fn proof(&self, r: &arkiv_db::proof::EqRequest) -> Result<Vec<u8>> {
         Ok(self
             .request(r)?

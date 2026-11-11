@@ -1,5 +1,6 @@
 //! Ethereum JSON-RPC compatibility over the native, authenticated Arkiv chain.
 //! Block/state hashes identify native commitments, not Ethereum MPT roots.
+
 use super::{
     Error, Result, ethereum,
     host::Host,
@@ -28,6 +29,7 @@ const FILTER_CAP: usize = 1024;
 const FILTER_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const ADDRESS: &str = "0x4400000000000000000000000000000000000044";
 const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
 #[derive(Default)]
 pub struct RpcState {
     indexed: Option<u64>,
@@ -39,17 +41,20 @@ pub struct RpcState {
     /// The detail of a refused SDK query answered under the lock.
     query_error: Option<super::rpc_reads::QueryError>,
 }
+
 struct Filter {
     spec: Value,
     next: u64,
     blocks: bool,
     touched: std::time::Instant,
 }
+
 fn expire_filters(state: &mut RpcState, now: std::time::Instant) {
     state
         .filters
         .retain(|_, f| now.saturating_duration_since(f.touched) < FILTER_TTL);
 }
+
 /// Bound retained filters as well as reject silently ignored selector typos.
 pub fn validate_filter(filter: &Value) -> Result<()> {
     let object = filter.as_object().ok_or(Error("InvalidParams"))?;
@@ -119,12 +124,15 @@ fn filter_height(head: u64, value: Option<&Value>) -> Result<u64> {
         },
     }
 }
+
 pub fn hex(bytes: &[u8]) -> String {
     crate::simulator::wire::hex(bytes)
 }
-pub fn quantity(n: u64) -> String {
+
+fn quantity(n: u64) -> String {
     format!("0x{n:x}")
 }
+
 fn uint(v: &Value) -> Result<u64> {
     let s = v.as_str().ok_or(Error("InvalidParams"))?;
     if !s.starts_with("0x") || s.len() < 3 || (s.len() > 3 && s.as_bytes()[2] == b'0') {
@@ -132,6 +140,7 @@ fn uint(v: &Value) -> Result<u64> {
     }
     u64::from_str_radix(&s[2..], 16).map_err(|_| Error("InvalidParams"))
 }
+
 fn bytes(v: &Value, len: Option<usize>) -> Result<Vec<u8>> {
     let s = v.as_str().ok_or(Error("InvalidParams"))?;
     let s = s.strip_prefix("0x").ok_or(Error("InvalidParams"))?;
@@ -147,6 +156,7 @@ fn bytes(v: &Value, len: Option<usize>) -> Result<Vec<u8>> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error("InvalidParams")))
         .collect()
 }
+
 fn actor(v: &Value) -> Result<OwnerId> {
     Ok(OwnerId::new(
         bytes(v, Some(20))?
@@ -154,6 +164,7 @@ fn actor(v: &Value) -> Result<OwnerId> {
             .map_err(|_| Error("InvalidParams"))?,
     ))
 }
+
 fn at(host: &Host, v: Option<&Value>) -> Result<u64> {
     match v
         .map(|v| v.as_str().ok_or(Error("InvalidParams")))
@@ -171,11 +182,13 @@ fn at(host: &Host, v: Option<&Value>) -> Result<u64> {
         }
     }
 }
+
 fn args(v: &Value) -> Result<&[Value]> {
     v.as_array()
         .map(Vec::as_slice)
         .ok_or(Error("InvalidParams"))
 }
+
 fn index(host: &Host, state: &mut RpcState) -> Result<()> {
     let start = state.indexed.map_or(0, |n| n + 1);
     for h in start..=host.head.height {
@@ -193,6 +206,7 @@ fn index(host: &Host, state: &mut RpcState) -> Result<()> {
     }
     Ok(())
 }
+
 /// Rebuild the derived lookup index before accepting public requests. Source
 /// blocks remain authoritative; this cache contains no separately trusted state.
 pub(super) fn initial_state(node: &Node) -> Result<RpcState> {
@@ -205,12 +219,31 @@ pub(super) fn initial_state(node: &Node) -> Result<RpcState> {
     }
     Ok(state)
 }
+
 fn locate(host: &Host, state: &mut RpcState, hash: &str) -> Result<Option<(u64, usize)>> {
     index(host, state)?;
     Ok(state.transactions.get(&hash.to_ascii_lowercase()).copied())
 }
+
 fn transaction(tx: &SignedTx, block: Option<(&crate::Header, usize)>) -> Result<Value> {
-    let mut v = json!({"hash":hex(tx.hash().as_slice()),"nonce":quantity(tx.nonce),"from":hex(tx.tx.actor.as_bytes()),"gas":quantity(tx.tx.tx_budget),"gasPrice":quantity(crate::accounts::GAS_PRICE_WEI),"value":"0x0","input":"0x","to":ADDRESS,"type":"0x0","chainId":quantity(tx.tx.chain_id),"r":hex(&tx.signature[..32]),"s":hex(&tx.signature[32..64]),"v":quantity(tx.signature[64] as u64),"blockHash":null,"blockNumber":null,"transactionIndex":null});
+    let mut v = json!({
+        "hash": hex(tx.hash().as_slice()),
+        "nonce": quantity(tx.nonce),
+        "from": hex(tx.tx.actor.as_bytes()),
+        "gas": quantity(tx.tx.tx_budget),
+        "gasPrice": quantity(crate::accounts::GAS_PRICE_WEI),
+        "value": "0x0",
+        "input": "0x",
+        "to": ADDRESS,
+        "type": "0x0",
+        "chainId": quantity(tx.tx.chain_id),
+        "r": hex(&tx.signature[..32]),
+        "s": hex(&tx.signature[32..64]),
+        "v": quantity(tx.signature[64] as u64),
+        "blockHash": null,
+        "blockNumber": null,
+        "transactionIndex": null,
+    });
     if let Some(raw) = &tx.ethereum_raw {
         let p = ethereum::parse(raw)?;
         v["to"] = json!(hex(&p.to));
@@ -239,7 +272,8 @@ fn transaction(tx: &SignedTx, block: Option<(&crate::Header, usize)>) -> Result<
     }
     Ok(v)
 }
-pub fn block_json(host: &Host, height: u64, full: bool) -> Result<Value> {
+
+fn block_json(host: &Host, height: u64, full: bool) -> Result<Value> {
     let b = host.shared_block(height)?;
     let h = &b.header.header;
     let txs = b
@@ -256,10 +290,31 @@ pub fn block_json(host: &Host, height: u64, full: bool) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     let gas = b.outcomes.spent;
-    Ok(
-        json!({"number":quantity(height),"hash":hex(h.hash().as_slice()),"parentHash":hex(h.parent_hash.as_slice()),"timestamp":quantity(h.timestamp_ms/1000),"nonce":"0x0000000000000000","sha3Uncles":hex(keccak256([0xc0]).as_slice()),"logsBloom":bloom(&block_logs(host,height)?),"transactionsRoot":hex(h.inputs_digest.as_slice()),"stateRoot":hex(h.state_root.as_slice()),"receiptsRoot":hex(h.outcomes_digest.as_slice()),"miner":hex(&host.genesis.proposer),"difficulty":"0x0","totalDifficulty":"0x0","extraData":"0x","size":quantity(arkiv_db::encode(&*b).len() as u64),"gasLimit":quantity(host.genesis.genesis.params.block_budget),"gasUsed":quantity(gas),"baseFeePerGas":quantity(crate::accounts::GAS_PRICE_WEI),"mixHash":ZERO_HASH,"uncles":[],"transactions":txs}),
-    )
+    Ok(json!({
+        "number": quantity(height),
+        "hash": hex(h.hash().as_slice()),
+        "parentHash": hex(h.parent_hash.as_slice()),
+        "timestamp": quantity(h.timestamp_ms / 1000),
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": hex(keccak256([0xc0]).as_slice()),
+        "logsBloom": bloom(&block_logs(host, height)?),
+        "transactionsRoot": hex(h.inputs_digest.as_slice()),
+        "stateRoot": hex(h.state_root.as_slice()),
+        "receiptsRoot": hex(h.outcomes_digest.as_slice()),
+        "miner": hex(&host.genesis.proposer),
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "extraData": "0x",
+        "size": quantity(arkiv_db::encode(&*b).len() as u64),
+        "gasLimit": quantity(host.genesis.genesis.params.block_budget),
+        "gasUsed": quantity(gas),
+        "baseFeePerGas": quantity(crate::accounts::GAS_PRICE_WEI),
+        "mixHash": ZERO_HASH,
+        "uncles": [],
+        "transactions": txs,
+    }))
 }
+
 fn entity_nonce(host: &Host, height: u64, a: &[u8; 20]) -> Result<u64> {
     let s = host.state(height)?;
     match s.try_host_get(&arkiv::nonce_key(a))? {
@@ -269,6 +324,7 @@ fn entity_nonce(host: &Host, height: u64, a: &[u8; 20]) -> Result<u64> {
         )),
     }
 }
+
 fn previous_owner(host: &Host, height: u64, key: &RecordKey) -> Result<[u8; 20]> {
     let s = host.state(height)?;
     let r = s
@@ -285,6 +341,7 @@ fn previous_owner(host: &Host, height: u64, key: &RecordKey) -> Result<[u8; 20]>
         .map_err(|_| Error("StorageCorrupt"))?
         .owner)
 }
+
 /// The expiry heights the committed operations of one block resolved to,
 /// replayed from the state before the block: a height that is full moves the
 /// operation to the next with room ([`crate::exec::spill_expiry`]), so the
@@ -300,6 +357,7 @@ struct ExpiryReplay<'a> {
     /// Expiries of the entities the block's operations touched so far.
     expiries: BTreeMap<Vec<u8>, Option<u64>>,
 }
+
 impl<'a> ExpiryReplay<'a> {
     fn new(host: &'a Host, height: u64) -> Result<Self> {
         Ok(Self {
@@ -309,6 +367,7 @@ impl<'a> ExpiryReplay<'a> {
             expiries: BTreeMap::new(),
         })
     }
+
     fn expiry(&mut self, key: &RecordKey) -> Result<Option<u64>> {
         if let Some(known) = self.expiries.get(key.as_bytes()) {
             return Ok(*known);
@@ -327,11 +386,13 @@ impl<'a> ExpiryReplay<'a> {
             .transpose()?
             .map(|p| p.expires_at))
     }
+
     fn shift(&mut self, height: Option<u64>, by: i64) {
         if let Some(h) = height.filter(|h| *h != u64::MAX) {
             *self.totals.entry(h).or_default() += by;
         }
     }
+
     /// Schedules `key` for the expiry `asked` at block `height` and returns
     /// the height it resolved to.
     fn set(&mut self, key: &[u8], asked: &crate::Expiry, height: u64) -> Result<u64> {
@@ -374,6 +435,7 @@ impl<'a> ExpiryReplay<'a> {
         self.expiries.insert(key.to_vec(), Some(resolved));
         Ok(resolved)
     }
+
     fn delete(&mut self, key: &RecordKey) -> Result<()> {
         let old = self.expiry(key)?;
         self.shift(old, -1);
@@ -381,12 +443,15 @@ impl<'a> ExpiryReplay<'a> {
         Ok(())
     }
 }
+
 fn word(n: u64) -> String {
     format!("{n:064x}")
 }
+
 fn topic_address(a: &[u8; 20]) -> String {
     format!("0x{}{}", "0".repeat(24), &hex(a)[2..])
 }
+
 /// Logs of block `height`, derived from its body and the state after
 /// `height - 1`; refused up front below the receipt floor (see
 /// `crate::retention`), whether or not the block has Arkiv operations.
@@ -472,11 +537,22 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
             };
             let mut all = vec![hex(keccak256(signature.as_bytes()).as_slice()), hex(&key)];
             all.extend(topics);
-            logs.push(json!({"address":ADDRESS,"topics":all,"data":data,"blockNumber":quantity(height),"transactionHash":tx_hash,"transactionIndex":quantity(ti as u64),"blockHash":block_hash,"logIndex":quantity(logs.len() as u64),"removed":false}));
+            logs.push(json!({
+                "address": ADDRESS,
+                "topics": all,
+                "data": data,
+                "blockNumber": quantity(height),
+                "transactionHash": tx_hash,
+                "transactionIndex": quantity(ti as u64),
+                "blockHash": block_hash,
+                "logIndex": quantity(logs.len() as u64),
+                "removed": false,
+            }));
         }
     }
     Ok(logs)
 }
+
 fn bloom(logs: &[Value]) -> String {
     let mut bloom = [0u8; 256];
     for l in logs {
@@ -501,6 +577,7 @@ fn bloom(logs: &[Value]) -> String {
     }
     hex(&bloom)
 }
+
 fn receipt(host: &Host, h: u64, i: usize) -> Result<Value> {
     let b = host.shared_block(h)?;
     let tx = &b.inputs.txs[i];
@@ -535,7 +612,8 @@ fn receipt(host: &Host, h: u64, i: usize) -> Result<Value> {
     obj.insert("logs".into(), json!(logs));
     Ok(v)
 }
-pub fn matches_log(log: &Value, filter: &Value) -> bool {
+
+fn matches_log(log: &Value, filter: &Value) -> bool {
     if let Some(a) = filter.get("address") {
         let address = log["address"].as_str().unwrap_or_default();
         let yes = if let Some(s) = a.as_str() {
@@ -575,12 +653,10 @@ pub fn matches_log(log: &Value, filter: &Value) -> bool {
     }
     true
 }
-pub fn logs(host: &Host, state: &mut RpcState, filter: &Value) -> Result<Value> {
+
+fn logs(host: &Host, state: &mut RpcState, filter: &Value) -> Result<Value> {
     validate_filter(filter)?;
     let (start, end) = if let Some(hash) = filter.get("blockHash").and_then(Value::as_str) {
-        if filter.get("fromBlock").is_some() || filter.get("toBlock").is_some() {
-            return Err(Error("InvalidParams"));
-        }
         index(host, state)?;
         let h = *state
             .blocks
@@ -608,6 +684,7 @@ pub fn logs(host: &Host, state: &mut RpcState, filter: &Value) -> Result<Value> 
     }
     Ok(json!(out))
 }
+
 fn revert_data(
     host: &Host,
     tx: &crate::TxEnvelope,
@@ -761,6 +838,7 @@ fn revert_data(
         args
     )))
 }
+
 /// Revert data of a Solidity `revert(reason)`: `Error(string)`.
 fn error_string(reason: &str) -> String {
     let mut text = reason.as_bytes().to_vec();
@@ -774,11 +852,13 @@ fn error_string(reason: &str) -> String {
         &hex(&text)[2..]
     )
 }
+
 #[derive(Clone, Copy)]
 enum Simulation {
     Call,
     Estimate,
 }
+
 fn simulation(
     host: &Host,
     call: &Value,
@@ -813,7 +893,7 @@ fn simulation(
         if value != U256::ZERO {
             return Err(Error("NonpayableCall"));
         }
-        ethereum::call_ops(&host.genesis, &data)?
+        ethereum::call_ops(&data)?
     } else {
         if !data.is_empty() {
             return Err(Error("UnsupportedContractCall"));
@@ -939,6 +1019,7 @@ fn simulation(
     };
     Ok((out.spent, json!(result)))
 }
+
 fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value) -> Result<Value> {
     state.revert_data = None;
     state.query_error = None;
@@ -1259,19 +1340,24 @@ fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value)
                 let used = b.outcomes.spent;
                 ratios.push(used as f64 / host.genesis.genesis.params.block_budget as f64);
             }
-            Ok(
-                json!({"oldestBlock":quantity(start),"baseFeePerGas":vec![quantity(crate::accounts::GAS_PRICE_WEI);count as usize+1],"gasUsedRatio":ratios,"reward":vec![vec!["0x0";percentiles.map_or(0,Vec::len)];count as usize]}),
-            )
+            Ok(json!({
+                "oldestBlock": quantity(start),
+                "baseFeePerGas": vec![quantity(crate::accounts::GAS_PRICE_WEI); count as usize + 1],
+                "gasUsedRatio": ratios,
+                "reward": vec![vec!["0x0"; percentiles.map_or(0, Vec::len)]; count as usize],
+            }))
         }
         _ => Err(Error("MethodNotFound")),
     }
 }
+
 /// JSON-RPC code of a state-retention refusal (`HistoryPruned`) on every
 /// method: the SDK's `block` kind, a height outside the retained range.
 pub const HISTORY_PRUNED_CODE: i64 = QueryErrorKind::Block.code();
 /// JSON-RPC code of a detached read refused at admission (`ServerBusy`).
 /// Retryable; outside the SDK's query table (-32001 to -32006).
 pub const SERVER_BUSY_CODE: i64 = -32010;
+
 /// The response to a refused SDK read.
 fn read_error(id: Value, e: ReadError, pruned: Option<(u64, u64)>) -> Value {
     match e {
@@ -1279,9 +1365,11 @@ fn read_error(id: Value, e: ReadError, pruned: Option<(u64, u64)>) -> Value {
         ReadError::Query(q) => json!({"jsonrpc":"2.0","id":id,"error":q.to_json()}),
     }
 }
+
 fn error(id: Value, e: Error) -> Value {
     error_with(id, e, None)
 }
+
 /// `pruned` carries `(requested, floor)` of a `HistoryPruned` refusal.
 fn error_with(id: Value, e: Error, pruned: Option<(u64, u64)>) -> Value {
     if e.0 == "HistoryPruned" {
@@ -1307,10 +1395,17 @@ fn error_with(id: Value, e: Error, pruned: Option<(u64, u64)>) -> Value {
         }
         _ => e.0,
     };
-    // A refused detached read is retryable; its code stays outside the SDK's
-    // query table (-32001 to -32006).
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":match e.0{"MethodNotFound"=>-32601,"InvalidParams"=>-32602,"InvalidRequest"=>-32600,"ExecutionReverted"=>3,"ServerBusy"=>SERVER_BUSY_CODE,_=>-32000},"message":message}})
+    let code = match e.0 {
+        "MethodNotFound" => -32601,
+        "InvalidParams" => -32602,
+        "InvalidRequest" => -32600,
+        "ExecutionReverted" => 3,
+        "ServerBusy" => SERVER_BUSY_CODE,
+        _ => -32000,
+    };
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
+
 async fn single(rt: &Shared, request: Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if !matches!(id, Value::Null | Value::String(_) | Value::Number(_)) {
@@ -1350,6 +1445,7 @@ async fn single(rt: &Shared, request: Value) -> Value {
         result.unwrap_or_else(|e| error(id, e))
     }
 }
+
 /// A response computed under the node lock, or `None` to forward the request.
 async fn locked(rt: &Shared, method: String, params: Value, id: Value) -> Result<Option<Value>> {
     // RPC bursts wait for the node mutex in the blocking pool instead of
@@ -1359,40 +1455,33 @@ async fn locked(rt: &Shared, method: String, params: Value, id: Value) -> Result
     let response_id = id;
     let job = tokio::task::spawn_blocking(move || {
         let mut node = runtime.rpc_node()?;
-        let forward = matches!(&*node, Node::Light { .. })
-            || matches!(&*node,Node::Full(h) if method=="eth_sendRawTransaction"&&!h.is_producer());
-        let local = if forward {
-            None
-        } else {
-            let mut state = runtime
-                .rpc
-                .lock()
-                .map_err(|_| Error("StorageUnavailable"))?;
-            Some(match &mut *node {
-                Node::Full(h) => match dispatch(h, &mut state, &method, &params) {
-                    Ok(v) => Ok(json!({"jsonrpc":"2.0","id":response_id,"result":v})),
-                    Err(e) => {
-                        let mut response = error_with(response_id.clone(), e, h.refusal.take());
-                        if let Some(query) = state.query_error.take() {
-                            response = read_error(response_id, query.into(), None);
-                        } else if let Some(data) = state.revert_data.take() {
-                            response["error"]["data"] = json!(data);
-                        }
-                        Ok(response)
-                    }
-                },
-                _ => Err(Error("FullNodeRequired")),
-            })
+        let Node::Full(h) = &mut *node else {
+            return Ok(None);
         };
-        Ok::<_, Error>(local)
+        if method == "eth_sendRawTransaction" && !h.is_producer() {
+            return Ok(None);
+        }
+        let mut state = runtime
+            .rpc
+            .lock()
+            .map_err(|_| Error("StorageUnavailable"))?;
+        Ok(Some(match dispatch(h, &mut state, &method, &params) {
+            Ok(v) => json!({"jsonrpc":"2.0","id":response_id,"result":v}),
+            Err(e) => {
+                let mut response = error_with(response_id.clone(), e, h.refusal.take());
+                if let Some(query) = state.query_error.take() {
+                    response = read_error(response_id, query.into(), None);
+                } else if let Some(data) = state.revert_data.take() {
+                    response["error"]["data"] = json!(data);
+                }
+                response
+            }
+        }))
     })
     .await;
-    match job {
-        Ok(Ok(local)) => local.transpose(),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(Error("StorageUnavailable")),
-    }
+    job.unwrap_or(Err(Error("StorageUnavailable")))
 }
+
 /// `arkiv_query`, `arkiv_getEntity` and `arkiv_getEntityCount` on a full node, as detached reads
 /// (see [`super::reads`]): admitted before touching the node lock, planned
 /// under it, and evaluated against the pinned snapshot after releasing it.
@@ -1421,6 +1510,7 @@ async fn detached(rt: &Shared, method: String, params: Value, id: Value) -> Resu
         })
         .await
 }
+
 pub async fn handle_request(rt: &Shared, request: Value) -> Value {
     const CAP: usize = 8 * 1024 * 1024;
     if let Some(batch) = request.as_array() {
@@ -1454,6 +1544,7 @@ pub async fn handle_request(rt: &Shared, request: Value) -> Value {
         }
     }
 }
+
 pub async fn http(State(rt): State<Shared>, body: Body) -> Response {
     let input = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -1500,6 +1591,7 @@ mod tests {
     fn host() -> Host {
         host_with(crate::signed::protocol::MAX_EXPIRY_PER_BLOCK)
     }
+
     fn host_with(expiry_per_block: u32) -> Host {
         let signer = Signer::from_bytes([2; 32]).unwrap();
         let mut native = crate::signed::protocol::default_native_genesis(9300, 1000, 1000);
@@ -1531,6 +1623,7 @@ mod tests {
         host.produce().unwrap();
         host
     }
+
     fn native(host: &Host, nonce: u64, ops: Vec<ArkivOperation>) -> SignedTx {
         let signer = Signer::from_bytes([2; 32]).unwrap();
         let mut id = [0; 32];
@@ -1555,6 +1648,7 @@ mod tests {
         )
         .unwrap()
     }
+
     /// A create that finds every height of the spill search full reverts
     /// with a Solidity `Error(string)` naming the height and the capacity.
     #[test]
@@ -1605,6 +1699,7 @@ mod tests {
              the 1 expiring entities one block may have; choose another expiry"
         );
     }
+
     #[test]
     fn log_owners_follow_operations_and_failed_batches_emit_nothing() {
         let mut h = host();
@@ -1674,6 +1769,7 @@ mod tests {
         assert_eq!(paid["status"], "0x1");
         assert_eq!(receipt(&h, 3, 0).unwrap()["rentFee"], "0x0");
     }
+
     #[tokio::test]
     async fn a_dropped_transaction_answers_with_a_definite_error() {
         let mut h = host();
@@ -1709,31 +1805,30 @@ mod tests {
             .await;
             assert_eq!(
                 answer["error"],
-                json!({"code":-32000,"message":"transaction dropped: insufficient funds for gas * price + value + rent"}),
+                json!({
+                    "code": -32000,
+                    "message": concat!(
+                        "transaction dropped: ",
+                        "insufficient funds for gas * price + value + rent",
+                    ),
+                }),
                 "{method}"
             );
         }
         // An unknown hash is still just absent.
         let unknown = handle_request(
             &rt,
-            json!({"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[ZERO_HASH]}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getTransactionReceipt",
+                "params": [ZERO_HASH],
+            }),
         )
         .await;
         assert_eq!(unknown["result"], Value::Null);
     }
-    #[test]
-    fn estimate_has_no_nonce_balance_or_state_effect() {
-        let h = host();
-        let who = Signer::from_bytes([2; 32]).unwrap().address();
-        let before = h.account(h.head.height, who).unwrap();
-        let root = h.head.state_root;
-        let call = json!({"from":hex(who.as_bytes()),"to":hex(&[4;20]),"value":"0x1"});
-        let (gas, _) = simulation(&h, &call, Simulation::Estimate, &mut None).unwrap();
-        assert_eq!(gas, 21_000);
-        assert_eq!(h.account(h.head.height, who).unwrap(), before);
-        assert_eq!(h.head.state_root, root);
-        assert_eq!(h.head.height, 1);
-    }
+
     #[test]
     fn unfunded_estimates_match_execution_gas_without_mutating_state() {
         let mut h = host();
@@ -1810,6 +1905,7 @@ mod tests {
         h.produce().unwrap();
         assert_eq!(h.block(2).unwrap().outcomes.txs[0].spent, used);
     }
+
     #[test]
     fn transfer_estimation_ignores_fee_and_value_affordability() {
         let mut h = host();
@@ -1819,7 +1915,11 @@ mod tests {
         let mut state = RpcState::default();
         for value in [U256::ZERO, U256::from(1), U256::MAX] {
             for to in [empty, recipient] {
-                let call = json!({"from":hex(empty.as_bytes()),"to":hex(to.as_bytes()),"value":format!("{value:#x}")});
+                let call = json!({
+                    "from": hex(empty.as_bytes()),
+                    "to": hex(to.as_bytes()),
+                    "value": format!("{value:#x}"),
+                });
                 assert_eq!(
                     dispatch(&mut h, &mut state, "eth_estimateGas", &json!([call])).unwrap(),
                     quantity(21_000)
@@ -1833,9 +1933,11 @@ mod tests {
             assert_eq!(h.account(h.head.height, a).unwrap().nonce, 0);
         }
     }
+
     fn signed_transfer(signer: &Signer, nonce: u64, to: OwnerId, value: U256) -> Value {
         signed_transfer_with_gas(signer, nonce, to, value, 100_000, false)
     }
+
     fn signed_transfer_with_gas(
         signer: &Signer,
         nonce: u64,
@@ -1890,6 +1992,7 @@ mod tests {
         U256::from_be_slice(&sig[32..64]).encode(&mut payload);
         json!(hex(&list(payload)))
     }
+
     #[test]
     fn legacy_and_eip1559_transfers_execute_with_exact_intrinsic_gas() {
         for typed in [false, true] {
@@ -1898,7 +2001,12 @@ mod tests {
             let recipient = Signer::from_bytes([4; 32]).unwrap().address();
             let before = h.account(h.head.height, signer.address()).unwrap();
             let mut state = RpcState::default();
-            let call = json!({"from":hex(signer.address().as_bytes()),"to":hex(recipient.as_bytes()),"value":"0x1","gas":"0x5208"});
+            let call = json!({
+                "from": hex(signer.address().as_bytes()),
+                "to": hex(recipient.as_bytes()),
+                "value": "0x1",
+                "gas": "0x5208",
+            });
             assert_eq!(
                 dispatch(&mut h, &mut state, "eth_estimateGas", &json!([call])).unwrap(),
                 quantity(21_000)
@@ -1937,6 +2045,7 @@ mod tests {
             );
         }
     }
+
     #[tokio::test]
     async fn raw_send_enforces_balance_and_pending_reservations_after_estimation() {
         let h = host();
@@ -1955,7 +2064,14 @@ mod tests {
         let rejected = handle_request(&rt, request("eth_sendRawTransaction", json!([raw]))).await;
         assert_eq!(
             rejected,
-            json!({"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"insufficient funds for gas * price + value + rent"}})
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": -32000,
+                    "message": "insufficient funds for gas * price + value + rent",
+                },
+            })
         );
         {
             let mut guard = rt.node.lock().unwrap();
@@ -2009,6 +2125,7 @@ mod tests {
             U256::from(1)
         );
     }
+
     #[test]
     fn malformed_hex_and_log_ranges_are_rejected_without_panics() {
         for s in ["0x€a", "0xéé", "0xz0", "0x1", "0X11"] {
@@ -2032,12 +2149,21 @@ mod tests {
             .is_err()
         );
     }
+
     #[tokio::test]
     async fn jsonrpc_batches_notifications_and_errors_keep_protocol_shape() {
         let rt =
             super::super::runtime::Runtime::new(Node::Full(Box::new(host())), None, None, None)
                 .unwrap();
-        let response=handle_request(&rt,json!([{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","method":"eth_chainId"},{"jsonrpc":"2.0","id":2,"method":"unknown"}])).await;
+        let response = handle_request(
+            &rt,
+            json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"},
+                {"jsonrpc": "2.0", "method": "eth_chainId"},
+                {"jsonrpc": "2.0", "id": 2, "method": "unknown"},
+            ]),
+        )
+        .await;
         assert_eq!(response.as_array().unwrap().len(), 2);
         assert_eq!(response[0]["result"], "0x2454");
         assert_eq!(response[1]["error"]["code"], -32601);
@@ -2047,6 +2173,7 @@ mod tests {
         let notification = handle_request(&rt, json!({"jsonrpc":"2.0","method":"unknown"})).await;
         assert!(notification.is_null());
     }
+
     #[tokio::test]
     async fn concurrent_rpc_receipt_reads_do_not_use_rest_admission_slots() {
         let rt =
@@ -2061,7 +2188,13 @@ mod tests {
                 let response = http(
                     State(rt),
                     Body::from(
-                        json!({"jsonrpc":"2.0","id":id,"method":"eth_getTransactionReceipt","params":[ZERO_HASH]}).to_string(),
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "eth_getTransactionReceipt",
+                            "params": [ZERO_HASH],
+                        })
+                        .to_string(),
                     ),
                 )
                 .await;
@@ -2079,11 +2212,18 @@ mod tests {
         .await
         .unwrap();
     }
+
     #[test]
     fn filters_reject_unknown_fields_and_bound_every_retained_dimension() {
         let address = hex(&[1; 20]);
         let topic = hex(&[2; 32]);
-        validate_filter(&json!({"address":[address.clone()],"topics":[null,[topic.clone(),null]],"fromBlock":"earliest","toBlock":"0xffffffffffffffff"})).unwrap();
+        validate_filter(&json!({
+            "address": [address],
+            "topics": [null, [topic, null]],
+            "fromBlock": "earliest",
+            "toBlock": "0xffffffffffffffff",
+        }))
+        .unwrap();
         for bad in [
             json!({"typo":true}),
             json!({"address":null}),
@@ -2105,6 +2245,7 @@ mod tests {
             assert!(state.filters.is_empty());
         }
     }
+
     fn create_filter_event(h: &mut Host, nonce: u64) {
         let tx = native(
             h,
@@ -2122,6 +2263,7 @@ mod tests {
         h.submit(tx).unwrap();
         h.produce().unwrap();
     }
+
     #[test]
     fn finite_and_block_hash_filters_keep_bounds_and_poll_without_duplicates() {
         let mut h = host();
@@ -2160,6 +2302,7 @@ mod tests {
             json!([])
         );
     }
+
     #[test]
     fn filters_expire_release_capacity_and_refresh_on_poll() {
         let mut h = host();
@@ -2182,6 +2325,7 @@ mod tests {
         assert!(!state.filters.contains_key(&numeric));
         assert_eq!(state.filters.len(), 1);
     }
+
     #[tokio::test]
     async fn execute_call_returns_abi_keys_and_missing_entity_errors_decode() {
         use alloy_sol_types::{SolCall, SolValue};
@@ -2218,7 +2362,16 @@ mod tests {
         let rt =
             super::super::runtime::Runtime::new(Node::Full(Box::new(h)), None, None, None).unwrap();
         let empty = Signer::from_bytes([3; 32]).unwrap().address();
-        let result=handle_request(&rt,json!({"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"from":hex(empty.as_bytes()),"to":ADDRESS,"data":hex(&data)}]})).await;
+        let result = handle_request(
+            &rt,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_estimateGas",
+                "params": [{"from": hex(empty.as_bytes()), "to": ADDRESS, "data": hex(&data)}],
+            }),
+        )
+        .await;
         assert_eq!(result["error"]["code"], 3);
         assert_eq!(
             result["error"]["data"],
@@ -2229,6 +2382,7 @@ mod tests {
             )
         );
     }
+
     #[tokio::test]
     async fn sdk_query_refusals_answer_with_the_sdk_code_table() {
         let rt =
@@ -2259,7 +2413,7 @@ mod tests {
             parse["error"]["data"],
             json!({"position":3,"expected":"a value","got":"end of query"})
         );
-        // The removed payload model is an unknown select key: invalid params.
+        // `payload` and `contentType` are unknown select keys: invalid params.
         for removed in ["payload", "contentType"] {
             let answer = call(json!(["*", {"select": {"key": true, removed: true}}])).await;
             assert_eq!(answer["error"]["code"], -32602, "{answer}");
@@ -2267,8 +2421,8 @@ mod tests {
         // No other error uses the query table.
         assert!(!(-32006..=-32001).contains(&SERVER_BUSY_CODE));
         assert!(!(-32006..=-32001).contains(&super::super::rpc_ws::SUBSCRIPTION_LIMIT_CODE));
-        assert_eq!(HISTORY_PRUNED_CODE, QueryErrorKind::Block.code());
     }
+
     #[test]
     fn fee_history_rejects_allocation_amplification_before_building_rewards() {
         let mut h = host();

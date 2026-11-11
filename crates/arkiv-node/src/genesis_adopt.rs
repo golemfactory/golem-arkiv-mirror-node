@@ -24,6 +24,7 @@
 //! file until one atomic rename replaces it with a complete database.
 //! Adoption consumes the staged store, so an interrupted adoption must be
 //! resumed with adoption; the copy installation refuses a relabelled store.
+
 use crate::genesis_streaming::check_disk;
 use arkiv_db::durable::{DurableEngine, simulator::StorageProfile};
 use arkiv_db_redb::{RedbConfig, RedbStore};
@@ -34,12 +35,13 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, String>;
+
 fn err(e: impl std::fmt::Display) -> String {
     format!("genesis adoption: {e}")
 }
 
 /// The staged store inside a run directory's import scratch (`prefill-work`).
-pub const STAGED_STATE: &str = "bulk-v1/complete/state.redb";
+const STAGED_STATE: &str = "bulk-v1/complete/state.redb";
 
 /// Workers for the verification walk: it is bound by random object reads,
 /// which a solid-state disk serves in parallel. Memory stays bounded.
@@ -85,6 +87,7 @@ fn sync_dir(path: &Path) -> Result<()> {
         .and_then(|file| file.sync_all())
         .map_err(err)
 }
+
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())

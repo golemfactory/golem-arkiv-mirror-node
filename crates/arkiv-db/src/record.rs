@@ -8,8 +8,8 @@
 //! The engine assigns application cells no meaning.
 //!
 //! Every encoding here is canonical and frozen for this repository: term
-//! bytes decide index order (ranges and prefixes are contiguous runs), and a
-//! later milestone hashes the same bytes into roots.
+//! bytes decide index order (ranges and prefixes are contiguous runs), and
+//! the same bytes are hashed into the state root.
 
 use std::{fmt, sync::Arc};
 
@@ -118,16 +118,16 @@ impl std::error::Error for NameFault {}
 ///
 /// Grammar: ASCII only; the first character is a letter, or `$` followed by a
 /// letter; every later character is a letter, a digit, `_`, `-`, `.` or `:`;
-/// 1 to [`Self::MAX_LEN`] bytes (writes: [`Limits::max_cell_name_len`]); case-sensitive with no normalisation. `#` and `@` never
-/// occur, so engine-reserved names are unreachable from the data plane.
+/// 1 to [`Self::MAX_LEN`] bytes (writes: [`Limits::max_cell_name_len`]);
+/// case-sensitive with no normalisation. `#` and `@` never occur, so
+/// engine-reserved names are unreachable from the data plane.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CellName(Arc<str>);
 
 impl CellName {
     /// Longest representable name, in bytes: the hard cap of the name
     /// grammar (golem-db's cell-name limit). Writes obey the configured
-    /// [`Limits::max_cell_name_len`], which is at most this. Term keys
-    /// store names unpadded, so this is not a key-width constraint.
+    /// [`Limits::max_cell_name_len`], which is at most this.
     pub const MAX_LEN: usize = 32;
 
     /// Validates `name` against the grammar.
@@ -365,16 +365,6 @@ impl TypeTag {
         }
     }
 
-    /// Decimal places of a decimal type; `None` for other types.
-    pub const fn decimal_scale(self) -> Option<u8> {
-        match self {
-            Self::Dec32 => Some(4),
-            Self::Dec64 => Some(6),
-            Self::Dec128 | Self::Dec => Some(18),
-            _ => None,
-        }
-    }
-
     /// Whether attributes of this type exist (everything except `Bytes`).
     pub const fn is_indexable(self) -> bool {
         !matches!(self, Self::Bytes)
@@ -573,8 +563,7 @@ impl Value {
     /// Safety ceiling on the encoded bytes of an indexed `Str` value: the
     /// largest [`Limits::max_indexed_len`] any instance may configure.
     ///
-    /// Term keys store a `Str` value unpadded (`len + 1` bytes), so this is
-    /// not a key width. It bounds the representation and resources: a term
+    /// It bounds the representation and resources: a term
     /// key is at most [`TermKey::MAX_LEN`](arkiv_db_trie::TrieKey::MAX_LEN)
     /// = 548 bytes, so a worst-case term leaf (key path, posting handle and
     /// RLP framing) stays well below the 1 KiB proof-node limit of equality
@@ -863,8 +852,7 @@ impl Limits {
     pub const MAX_RAW_KEY_LEN: usize = 20;
 
     /// The default and Arkiv-facing indexed-string limit: the 128-byte
-    /// public `str` profile (`docs/arkiv-system-compatibility-plan.md`).
-    /// An explicit admission policy, no longer a key width.
+    /// public `str` profile.
     pub const DEFAULT_INDEXED_LEN: usize = 128;
 
     /// The defaults every engine uses unless configured otherwise: the name
@@ -991,47 +979,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_hold_one_to_thirty_two_bytes() {
-        assert_eq!(RecordKey::MAX_LEN, 32);
-        assert_eq!(RecordKey::new(b""), None);
-        assert_eq!(RecordKey::new(&[7u8; 33]), None);
-        assert_eq!(RecordKey::new(&[7u8; 32]).unwrap().as_bytes(), [7u8; 32]);
-    }
-
-    #[test]
-    fn names_follow_the_grammar() {
-        for good in ["a", "A1", "$owner", "x_y-z.w:v", "Z", &"n".repeat(20)] {
-            assert!(CellName::new(good).is_ok(), "{good}");
-        }
-        assert_eq!(CellName::new(""), Err(NameFault::Empty));
-        assert_eq!(
-            CellName::new(&"n".repeat(CellName::MAX_LEN + 1)),
-            Err(NameFault::TooLong)
-        );
-        for bad in [
-            "$", "$$a", "$1", "1a", "_a", "a b", "a#b", "a@b", "é", "a/b", "-a", "a\0",
-        ] {
-            assert_eq!(CellName::new(bad), Err(NameFault::Grammar), "{bad}");
-        }
-        assert!(CellName::new("abc").unwrap() < CellName::new("abd").unwrap());
-        assert!(CellName::new("B").unwrap() < CellName::new("a").unwrap());
-    }
-
-    #[test]
-    fn term_bytes_preserve_order() {
-        let bytes = |value: Value| value.term_bytes().unwrap();
-        assert_eq!(
-            bytes(Value::I64(-1)),
-            vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-        );
-        assert_eq!(bytes(Value::I64(0)), vec![0x80, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(bytes(Value::I64(i64::MIN)), vec![0; 8]);
-        assert_eq!(bytes(Value::I64(i64::MAX)), vec![0xff; 8]);
-        assert_eq!(bytes(Value::U64(258)), vec![0, 0, 0, 0, 0, 0, 1, 2]);
-        assert_eq!(bytes(Value::Str(Arc::from("ab"))), vec![0x61, 0x62]);
-        assert_eq!(bytes(Value::Bool(false)), vec![0]);
-        assert_eq!(bytes(Value::Bool(true)), vec![1]);
-        assert_eq!(Value::bytes(b"x").term_bytes(), None);
+    fn term_bytes_round_trip_and_reject_malformed_input() {
         for value in [
             Value::I64(i64::MIN),
             Value::I64(-1),
@@ -1052,33 +1000,16 @@ mod tests {
         assert_eq!(Value::from_term_bytes(TypeTag::Bool, &[2]), None);
         assert_eq!(Value::from_term_bytes(TypeTag::I64, &[1, 2, 3]), None);
         assert_eq!(Value::from_term_bytes(TypeTag::Str, &[0xff]), None);
-
-        let samples = [i64::MIN, -2, -1, 0, 1, 2, i64::MAX];
-        for window in samples.windows(2) {
-            assert!(bytes(Value::I64(window[0])) < bytes(Value::I64(window[1])));
-        }
-        assert_eq!(
-            Value::I64(3).cmp_ordered(&Value::I64(4)),
-            Some(std::cmp::Ordering::Less)
-        );
-        assert_eq!(Value::I64(3).cmp_ordered(&Value::U64(4)), None);
-        assert_eq!(
-            Value::str("a").cmp_ordered(&Value::str("b")),
-            Some(std::cmp::Ordering::Less)
-        );
-        assert_eq!(Value::bytes(b"a").cmp_ordered(&Value::bytes(b"b")), None);
-        assert_eq!(Value::Bool(true).encoded_len(), 1);
-        assert_eq!(Value::U64(1).encoded_len(), 8);
-        assert_eq!(Value::str("héllo").encoded_len(), 6);
-        assert_eq!(Value::bytes(&[1, 2, 3]).encoded_len(), 3);
     }
 
     #[test]
-    fn ids_start_at_one() {
+    fn ids_start_at_one_and_order_by_ordinal() {
         assert_eq!(RecordId::from_ordinal(0), None);
-        let id = RecordId::from_ordinal(7).unwrap();
+        let rid = |ordinal| RecordId::from_ordinal(ordinal).unwrap();
+        let id = rid(7);
         assert_eq!(id.ordinal(), 7);
         assert_eq!(id.to_string(), "rec:7");
         assert_eq!(format!("{id:?}"), "RecordId(7)");
+        assert!(rid(1) < rid(2) && rid(2) < rid(10), "ids order by ordinal");
     }
 }

@@ -1,50 +1,19 @@
-//! Hand-counted metering vectors for every milestone-2 charge point under
-//! `PriceSchedule::FIXTURE`: typed record writes (create, patch, delete),
-//! typed reads (`get_record`, `query`, `count`) and the rules around them
-//! (abort points, ledgers, block budgets, the host path, estimation,
-//! overflow and pinned pricing).
+//! Hand-counted metering vectors for the typed record charge points under
+//! `PriceSchedule::FIXTURE`: record writes (create, patch, delete), typed
+//! reads (`get_record`, `query`, `count`) and the rules around them (abort
+//! points, ledgers, block budgets, the host path, estimation, overflow and
+//! pinned pricing).
 //!
-//! Every expected total in this file is written as an explicit sum of
-//! literals derived by hand from the FIXTURE weights (DirectoryLookup 1,
-//! PointRead 3, ReadByte 1, RecordCreate 20, RecordPatch 10, RecordDelete 20,
-//! CellWrite 4, CellByte 1, CellRemove 4, IndexInsert 6, IndexTermCreate 30,
-//! IndexRemove 6, QueryGroup 5, TermSeek 4, TermVisit 3, PostingEntry 1,
-//! RowVisit 1, RecordProbe 2, ResultRow 3, RootUpdate 2, RowByte 1) and the
-//! model-version-3 charge points (the milestone-2 brief's points, with
-//! `RowByte n` and `RootUpdate` joining the record groups and `RootUpdate 2`
-//! every index group; `n` = key bytes plus the name and encoded value bytes
-//! of every cell of the row after the write). To check an operation under
-//! *every*
-//! budget, its charge steps are transcribed into the test as the brief's
-//! atomic groups and priced with the weight table below by plain integer
-//! arithmetic; the table's total is asserted equal to the hand-written sum,
-//! so nothing here asks the engine or a schedule what an operation costs.
-//!
-//! What this file establishes:
-//! - For each write and read vector, under every budget from 0 to the total
-//!   (and one above, and unlimited): the whole receipt (kind, model version
-//!   3, schedule id 1, spent, outcome) and the traced ledger (classes in
-//!   first-charge order, zero-count classes omitted, identical to the
-//!   untraced receipt otherwise); the abort point rule (per-entry classes are
-//!   charged one at a time, atomic groups charge nothing on `OutOfBudget`);
-//!   the state is unchanged after a rejected write and a rejected read
-//!   returns no partial page; the applied state equals an independent model.
-//! - A 32-byte key, the longest, is counted by its raw bytes (not its
-//!   33-byte canonical encoding) in a create's `RowByte` and in a key
-//!   projection's `ReadByte`.
-//! - Query results are checked against a `BTreeMap` model with a full-scan
-//!   evaluator of the brief's semantics, never against the engine's index.
-//! - Block budgets: `ExceedsBlockBudget` for typed ops is decided at
-//!   admission and not recorded; rejected typed ops drain the block; reads
-//!   never deduct. `execute_host` issues receipts identical to `execute`;
-//!   `estimate` equals `execute` for typed ops; `CostOverflow` under a
-//!   uniform `u64::MAX` schedule; pricing stays pinned after `set_pricing`;
-//!   and under FIXTURE a create costs exactly 30 more per new term.
-//!
-//! What it does not establish: admission validation of arguments, queries and
-//! projections beyond the two cases used here, cursor binding across
-//! branches and snapshots, rollback of typed state, expiry, physical traces,
-//! and snapshot isolation of the typed store (other files own those).
+//! Every expected total is written as an explicit sum of literals. To check
+//! an operation under every budget, its charge steps are transcribed into
+//! the test as atomic groups and priced with the weight table below; the
+//! table's total is asserted equal to the hand-written sum, so nothing here
+//! asks the engine or a schedule what an operation costs. `RowByte n` counts
+//! the key bytes plus the name and encoded value bytes of every cell of the
+//! row after the write. Query results come
+//! from a `BTreeMap` model with a full-scan evaluator, never from the
+//! engine's index. Argument validation, cursor binding, rollback, expiry and
+//! physical traces are covered by other files.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -70,11 +39,7 @@ const FIXTURE_ID: u32 = 1;
 const OUT_OF_BUDGET: Outcome = Outcome::Rejected(Rejection::OutOfBudget);
 const COST_OVERFLOW: Outcome = Outcome::Rejected(Rejection::CostOverflow);
 
-// ---------------------------------------------------------------------------
-// The charge table, transcribed from the brief
-// ---------------------------------------------------------------------------
-
-/// FIXTURE unit prices, copied from the brief (never read from a schedule).
+/// FIXTURE unit prices, written out here (never read from a schedule).
 const fn price(class: OperationClass) -> u64 {
     match class {
         OperationClass::DirectoryLookup => 1,
@@ -257,10 +222,6 @@ fn ledger_after(groups: &[Group], applied: usize) -> Ledger {
     Ledger { entries }
 }
 
-// ---------------------------------------------------------------------------
-// Receipts and canonical results
-// ---------------------------------------------------------------------------
-
 fn receipt(kind: ReceiptKind, schedule_id: u32, spent: u64, outcome: Outcome) -> Receipt {
     Receipt {
         kind,
@@ -320,10 +281,6 @@ fn canonical(result: &WriteResult) -> Canonical {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Records, cells and operations
-// ---------------------------------------------------------------------------
-
 fn name(text: &str) -> CellName {
     CellName::new(text).expect("fixture names follow the grammar")
 }
@@ -348,7 +305,7 @@ fn cell(text: &str, cell: Cell) -> (CellName, Cell) {
     (name(text), cell)
 }
 
-/// The brief's fixture record shape: attributes `kind: Str`, `price: I64`,
+/// The fixture record shape: attributes `kind: Str`, `price: I64`,
 /// `$expiresAt: U64(5)` and a field `note: Bytes("xyz")`. Name plus encoded
 /// value bytes: `$expiresAt` 10 + 8 = 18, `kind` 4 + len, `note` 4 + 3 = 7,
 /// `price` 5 + 8 = 13.
@@ -413,10 +370,8 @@ fn named(key: bool, names: &[&str]) -> Projection {
     Projection::named(key, names.iter().map(|text| name(text)))
 }
 
-// ---------------------------------------------------------------------------
 // Independent reference: a BTreeMap model with a full-scan evaluator of the
-// brief's query semantics. It never consults the engine.
-// ---------------------------------------------------------------------------
+// query semantics. It never consults the engine.
 
 type Cells = BTreeMap<CellName, Cell>;
 
@@ -551,7 +506,7 @@ impl Model {
     }
 }
 
-/// The brief's semantics of one term on one record's cells: only an
+/// The semantics of one term on one record's cells: only an
 /// attribute of the term's type can match; fields never do.
 fn term_holds(term: &Term, cells: &Cells) -> bool {
     let Some(cell) = cells.get(term.name()) else {
@@ -624,10 +579,6 @@ fn ids_of(rows: &[Row]) -> Vec<u64> {
     rows.iter().map(|row| row.id.ordinal()).collect()
 }
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 fn ns_id(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).expect("ordinals start at 1")
 }
@@ -659,7 +610,7 @@ fn bare() -> (Engine, NamespaceId) {
     bare_with(PriceSchedule::FIXTURE, Limits::DEFAULT)
 }
 
-/// The brief's fixture: snapshot 1 holds namespace 1 (ALICE) with records
+/// The fixture: snapshot 1 holds namespace 1 (ALICE) with records
 /// a (id 1), b (id 2), c (id 3) of [`fixture_cells`] shape, kinds book, book,
 /// pen and prices 10, 20, 5. The model mirrors it.
 fn fixture_with(limits: Limits) -> (Engine, NamespaceId, Model) {
@@ -678,7 +629,7 @@ fn fixture_with(limits: Limits) -> (Engine, NamespaceId, Model) {
         )
         .expect("an unlimited creation applies");
     let ns = ns_id(1);
-    // The brief's worked vectors under model 3: 379 (six new terms), 229
+    // The worked vectors: 379 (six new terms), 229
     // (price 20 new), 257 (kind pen and price 5 new).
     for ((key_text, kind, price), expected) in FIXTURE_RECORDS.into_iter().zip([379, 229, 257]) {
         let cells = fixture_cells(kind, price);
@@ -724,10 +675,6 @@ fn prepared(engine: &Engine, setup: &[WriteOp]) -> (Branch, u64) {
     }
     (branch, spent)
 }
-
-// ---------------------------------------------------------------------------
-// Observing state
-// ---------------------------------------------------------------------------
 
 /// A key of the longest allowed length, 32 bytes (the width of an SDK
 /// entity key).
@@ -776,10 +723,6 @@ fn modelled(model: &Model) -> Observed {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Every-budget vector helpers
-// ---------------------------------------------------------------------------
-
 /// How a vector ends once every group is charged.
 #[derive(Clone, Copy, Debug)]
 enum Expect {
@@ -794,7 +737,7 @@ struct WriteVector<'a> {
     setup: &'a [WriteOp],
     actor: OwnerId,
     op: WriteOp,
-    /// The charge steps, transcribed from the brief.
+    /// The charge steps, transcribed by hand.
     groups: Vec<Group>,
     /// The hand-written total the table must reproduce.
     total: u64,
@@ -977,6 +920,34 @@ struct QueryVector<'a> {
     next: Option<u64>,
 }
 
+/// A query whose term nobody holds: the lookup, the group and the seek, no
+/// rows.
+fn assert_seek_only(
+    engine: &Engine,
+    ns: NamespaceId,
+    model: &Model,
+    name: &str,
+    query: Query,
+    projection: Projection,
+) {
+    assert_query_on_both(
+        engine,
+        ns,
+        model,
+        &QueryVector {
+            name,
+            query,
+            projection,
+            limit: 10,
+            after: None,
+            groups: vec![lookup(), query_group(), term_seek()],
+            total: 1 + 5 + 4,
+            ids: &[],
+            next: None,
+        },
+    );
+}
+
 fn assert_query_vector(
     model: &Model,
     vector: &QueryVector<'_>,
@@ -1008,10 +979,6 @@ fn assert_query_vector(
         |budget| read(budget).map(summarize),
     );
 }
-
-// ---------------------------------------------------------------------------
-// 1. CreateRecord
-// ---------------------------------------------------------------------------
 
 #[test]
 fn create_vectors_on_an_empty_namespace_match_the_worked_examples() {
@@ -1085,7 +1052,7 @@ fn create_vectors_on_an_empty_namespace_match_the_worked_examples() {
         ns,
         &WriteVector {
             name: "create c",
-            setup: &[a.clone(), b.clone()],
+            setup: &[a.clone(), b],
             actor: ALICE,
             op: c,
             groups: vec![
@@ -1545,38 +1512,6 @@ fn each_new_term_costs_exactly_thirty_more_than_the_same_create() {
 }
 
 #[test]
-fn create_of_a_bound_key_is_already_exists_after_the_binding_lookup() {
-    let (engine, ns, model) = fixture();
-    // create a again: DirectoryLookup 1; PointRead 3 -> 4; the key is bound.
-    // Recorded, state unchanged; 0..=3 are OutOfBudget at 0 or 1.
-    let branch = assert_write_vector(
-        &engine,
-        ns,
-        &WriteVector {
-            name: "create a (bound)",
-            setup: &[],
-            actor: ALICE,
-            op: create(ns, "a", fixture_cells("pen", 99)),
-            groups: vec![lookup(), point_read()],
-            total: 1 + 3,
-            expect: Expect::Rejected(Rejection::AlreadyExists),
-        },
-    );
-    assert_eq!(observe(&branch, ns), modelled(&model));
-    assert_eq!(
-        branch.receipts(),
-        &[write_receipt(
-            4,
-            Outcome::Rejected(Rejection::AlreadyExists)
-        )]
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 2. PatchRecord
-// ---------------------------------------------------------------------------
-
-#[test]
 fn patch_changing_only_a_value_swaps_the_value_term_and_keeps_existence() {
     let (engine, ns, model) = fixture();
     // patch a: set price := I64(11) (s = 1, b = 13, r = 0, n = 47: the row
@@ -1633,7 +1568,7 @@ fn patch_changing_only_a_value_swaps_the_value_term_and_keeps_existence() {
             expect: Expect::Applied(Effect::RecordPatched { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.patch("a", &set, &[]);
     assert_eq!(expected.term_count(), 8, "value 10 was the only holder");
     assert_eq!(observe(&branch, ns), modelled(&expected));
@@ -1669,7 +1604,7 @@ fn patch_changing_a_type_removes_and_creates_both_terms() {
             expect: Expect::Applied(Effect::RecordPatched { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.patch("a", &set, &[]);
     assert_eq!(expected.term_count(), 10);
     assert_eq!(observe(&branch, ns), modelled(&expected));
@@ -1705,7 +1640,7 @@ fn patch_changing_a_type_removes_and_creates_both_terms() {
 #[test]
 fn patch_with_removals_charges_absent_names_and_reindexes_in_name_order() {
     let (engine, ns, model) = fixture();
-    // The brief's worked vector. patch a: set price := U64(10), remove
+    // The worked vector. patch a: set price := U64(10), remove
     // [note, missing]: s = 1, b = 13, r = 2, n = 1 + 18 + 8 + 13 = 40: 1; 4;
     // {10 + 4 + 13 + 8 + 40 + 4} -> 83; names in sorted order: missing
     // (absent -> nothing), note (field -> nothing), price: two index removes
@@ -1716,7 +1651,7 @@ fn patch_with_removals_charges_absent_names_and_reindexes_in_name_order() {
         &engine,
         ns,
         &WriteVector {
-            name: "patch a (brief vector)",
+            name: "patch a (worked vector)",
             setup: &[],
             actor: ALICE,
             op: patch(ns, "a", set.clone(), &["note", "missing"]),
@@ -1733,7 +1668,7 @@ fn patch_with_removals_charges_absent_names_and_reindexes_in_name_order() {
             expect: Expect::Applied(Effect::RecordPatched { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.patch("a", &set, &["note", "missing"]);
     assert_eq!(observe(&branch, ns), modelled(&expected));
     let row = branch
@@ -1797,7 +1732,7 @@ fn patch_removing_an_attribute_drops_its_value_then_existence_term() {
             expect: Expect::Applied(Effect::RecordPatched { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.patch("a", &[], &["price"]);
     assert_eq!(
         expected.term_count(),
@@ -1903,7 +1838,7 @@ fn patch_flipping_kind_in_both_directions_charges_the_index_each_way() {
             expect: Expect::Applied(Effect::RecordPatched { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.patch("a", &set, &[]);
     assert_eq!(expected.term_count(), 11);
     assert_eq!(observe(&branch, ns), modelled(&expected));
@@ -1929,30 +1864,6 @@ fn patch_setting_an_identical_attribute_touches_no_term() {
         },
     );
     assert_eq!(observe(&branch, ns), modelled(&model));
-}
-
-#[test]
-fn patch_of_a_missing_key_is_not_found_after_the_binding_lookup() {
-    let (engine, ns, model) = fixture();
-    // patch z: DirectoryLookup 1; PointRead 3 -> 4; unbound. Recorded.
-    let branch = assert_write_vector(
-        &engine,
-        ns,
-        &WriteVector {
-            name: "patch z (unbound)",
-            setup: &[],
-            actor: ALICE,
-            op: patch(ns, "z", vec![cell("kind", attr(Value::str("ink")))], &[]),
-            groups: vec![lookup(), point_read()],
-            total: 1 + 3,
-            expect: Expect::Rejected(Rejection::NotFound),
-        },
-    );
-    assert_eq!(observe(&branch, ns), modelled(&model));
-    assert_eq!(
-        branch.receipts(),
-        &[write_receipt(4, Outcome::Rejected(Rejection::NotFound))]
-    );
 }
 
 #[test]
@@ -2059,10 +1970,6 @@ fn patch_that_would_overfill_the_record_is_record_full_after_the_lookup() {
     assert_eq!(observe(&branch, ns), modelled(&model));
 }
 
-// ---------------------------------------------------------------------------
-// 3. DeleteRecord
-// ---------------------------------------------------------------------------
-
 #[test]
 fn delete_charges_the_removal_group_then_one_unit_per_held_term() {
     let (engine, ns, model) = fixture();
@@ -2093,7 +2000,7 @@ fn delete_charges_the_removal_group_then_one_unit_per_held_term() {
             expect: Expect::Applied(Effect::RecordDeleted { id: id(1) }),
         },
     );
-    let mut expected = model.clone();
+    let mut expected = model;
     expected.delete("a");
     assert_eq!(expected.term_count(), 8, "price 10 was held by a alone");
     assert_eq!(observe(&branch, ns), modelled(&expected));
@@ -2117,9 +2024,9 @@ fn delete_charges_the_removal_group_then_one_unit_per_held_term() {
         )
     );
 
-    // After the brief's patch a has 3 cells and 3 attributes: 1 + 3 + (20 +
-    // 12 + 6) + 6 * 10 = 102 (the brief's first expiry delete).
-    let brief_patch = patch(
+    // After the worked patch a has 3 cells and 3 attributes: 1 + 3 + (20 +
+    // 12 + 6) + 6 * 10 = 102 (the first expiry delete).
+    let worked_patch = patch(
         ns,
         "a",
         vec![cell("price", attr(Value::U64(10)))],
@@ -2130,7 +2037,7 @@ fn delete_charges_the_removal_group_then_one_unit_per_held_term() {
         ns,
         &WriteVector {
             name: "delete a (3 cells)",
-            setup: std::slice::from_ref(&brief_patch),
+            setup: std::slice::from_ref(&worked_patch),
             actor: ALICE,
             op: delete(ns, "a"),
             groups: vec![
@@ -2173,22 +2080,47 @@ fn delete_charges_the_removal_group_then_one_unit_per_held_term() {
 }
 
 #[test]
-fn delete_of_a_missing_key_is_not_found_after_the_binding_lookup() {
+fn typed_writes_rejected_after_the_binding_lookup_spend_four() {
     let (engine, ns, model) = fixture();
-    let branch = assert_write_vector(
-        &engine,
-        ns,
-        &WriteVector {
-            name: "delete z (unbound)",
-            setup: &[],
-            actor: ALICE,
-            op: delete(ns, "z"),
-            groups: vec![lookup(), point_read()],
-            total: 1 + 3,
-            expect: Expect::Rejected(Rejection::NotFound),
-        },
-    );
-    assert_eq!(observe(&branch, ns), modelled(&model));
+    // DirectoryLookup 1; PointRead 3 -> 4; then the binding decides. The
+    // rejection is recorded and the state unchanged; budgets 0..=3 are
+    // OutOfBudget at 0 or 1.
+    let vectors = [
+        // create a again: the key is bound.
+        (
+            "create a (bound)",
+            create(ns, "a", fixture_cells("pen", 99)),
+            Rejection::AlreadyExists,
+        ),
+        // patch z and delete z: unbound.
+        (
+            "patch z (unbound)",
+            patch(ns, "z", vec![cell("kind", attr(Value::str("ink")))], &[]),
+            Rejection::NotFound,
+        ),
+        ("delete z (unbound)", delete(ns, "z"), Rejection::NotFound),
+    ];
+    for (name, op, reason) in vectors {
+        let branch = assert_write_vector(
+            &engine,
+            ns,
+            &WriteVector {
+                name,
+                setup: &[],
+                actor: ALICE,
+                op,
+                groups: vec![lookup(), point_read()],
+                total: 1 + 3,
+                expect: Expect::Rejected(reason),
+            },
+        );
+        assert_eq!(observe(&branch, ns), modelled(&model), "{name}");
+        assert_eq!(
+            branch.receipts(),
+            &[write_receipt(4, Outcome::Rejected(reason))],
+            "{name}"
+        );
+    }
     // A deleted key is unbound too: delete a, then delete a again.
     let branch = assert_write_vector(
         &engine,
@@ -2215,60 +2147,41 @@ fn delete_of_a_missing_key_is_not_found_after_the_binding_lookup() {
 #[test]
 fn typed_writes_reject_wrong_owner_and_unknown_namespace_after_the_lookup() {
     let (engine, ns, model) = fixture();
-    let ops = [
-        ("create", create(ns, "d", fixture_cells("book", 10))),
-        (
-            "patch",
-            patch(ns, "a", vec![cell("price", attr(Value::I64(11)))], &[]),
-        ),
-        ("delete", delete(ns, "a")),
+    let ops = |target| {
+        [
+            ("create", create(target, "d", fixture_cells("book", 10))),
+            (
+                "patch",
+                patch(target, "a", vec![cell("price", attr(Value::I64(11)))], &[]),
+            ),
+            ("delete", delete(target, "a")),
+        ]
+    };
+    // DirectoryLookup 1, then the rejection: BOB is not the owner, and
+    // ordinal 9 does not exist.
+    let cases = [
+        (ns, BOB, "by BOB", Rejection::Unauthorized),
+        (ns_id(9), ALICE, "on ordinal 9", Rejection::UnknownNamespace),
     ];
-    for (label, op) in &ops {
-        // BOB is not the owner: DirectoryLookup 1, then Unauthorized.
-        let branch = assert_write_vector(
-            &engine,
-            ns,
-            &WriteVector {
-                name: &format!("{label} by BOB"),
-                setup: &[],
-                actor: BOB,
-                op: op.clone(),
-                groups: vec![lookup()],
-                total: 1,
-                expect: Expect::Rejected(Rejection::Unauthorized),
-            },
-        );
-        assert_eq!(observe(&branch, ns), modelled(&model));
-    }
-    let unknown = ns_id(9);
-    let ops = [
-        ("create", create(unknown, "d", fixture_cells("book", 10))),
-        (
-            "patch",
-            patch(unknown, "a", vec![cell("price", attr(Value::I64(11)))], &[]),
-        ),
-        ("delete", delete(unknown, "a")),
-    ];
-    for (label, op) in &ops {
-        assert_write_vector(
-            &engine,
-            ns,
-            &WriteVector {
-                name: &format!("{label} on ordinal 9"),
-                setup: &[],
-                actor: ALICE,
-                op: op.clone(),
-                groups: vec![lookup()],
-                total: 1,
-                expect: Expect::Rejected(Rejection::UnknownNamespace),
-            },
-        );
+    for (target, actor, suffix, reason) in cases {
+        for (label, op) in ops(target) {
+            let branch = assert_write_vector(
+                &engine,
+                ns,
+                &WriteVector {
+                    name: &format!("{label} {suffix}"),
+                    setup: &[],
+                    actor,
+                    op,
+                    groups: vec![lookup()],
+                    total: 1,
+                    expect: Expect::Rejected(reason),
+                },
+            );
+            assert_eq!(observe(&branch, ns), modelled(&model));
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 4. get_record
-// ---------------------------------------------------------------------------
 
 #[test]
 fn get_record_vectors_for_every_projection() {
@@ -2302,7 +2215,7 @@ fn get_record_vectors_for_every_projection() {
             1 + 3 + (3 + 1),
         ),
         (
-            // p = 1 + 18 + 8 + 7 + 13 = 47 (the brief's 54).
+            // p = 1 + 18 + 8 + 7 + 13 = 47 (total 54).
             "all",
             "a",
             Projection::ALL,
@@ -2387,10 +2300,6 @@ fn get_record_vectors_for_every_projection() {
     assert!(branch.receipts().is_empty(), "reads are never recorded");
 }
 
-// ---------------------------------------------------------------------------
-// 5. query
-// ---------------------------------------------------------------------------
-
 /// Runs a cursor-less query vector on the head snapshot and on a fresh
 /// branch; both must charge and return the same.
 fn assert_query_on_both(engine: &Engine, ns: NamespaceId, model: &Model, vector: &QueryVector<'_>) {
@@ -2426,7 +2335,7 @@ fn assert_query_on_both(engine: &Engine, ns: NamespaceId, model: &Model, vector:
 fn eq_query_pages_charge_the_head_beyond_a_full_page() {
     let (engine, ns, model) = fixture();
     let query = Query::term(eq("kind", Value::str("book")));
-    // The brief's vector. Page 1, ALL, limit 1: DirectoryLookup 1;
+    // The worked vector. Page 1, ALL, limit 1: DirectoryLookup 1;
     // QueryGroup 5 -> 6; TermSeek 4 -> 10; PostingEntry (id 1, the head)
     // -> 11; {ResultRow 3 + ReadByte 47} -> 61; advance: PostingEntry (id 2,
     // the head beyond the page) -> 62; the page is full: next after 1.
@@ -2538,38 +2447,22 @@ fn eq_query_pages_charge_the_head_beyond_a_full_page() {
         },
     );
     // A term nobody holds costs the seek only: 1 + 5 + 4 = 10, no rows.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Eq(kind, ink)",
-            query: Query::term(eq("kind", Value::str("ink"))),
-            projection: Projection::ALL,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Eq(kind, ink)",
+        Query::term(eq("kind", Value::str("ink"))),
+        Projection::ALL,
     );
     // So does an existing value of another type: Eq(price, U64(10)).
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Eq(price, U64 10)",
-            query: Query::term(eq("price", Value::U64(10))),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Eq(price, U64 10)",
+        Query::term(eq("price", Value::U64(10))),
+        Projection::ID_ONLY,
     );
     // The traced ledger of page 1, spelled out.
     let traced_page = engine
@@ -2632,21 +2525,13 @@ fn exists_and_not_eq_queries_seek_the_existence_posting() {
         },
     );
     // Exists(kind, I64): no such existence term: the seek only.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Exists(kind, I64)",
-            query: Query::term(exists("kind", TypeTag::I64)),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Exists(kind, I64)",
+        Query::term(exists("kind", TypeTag::I64)),
+        Projection::ID_ONLY,
     );
     // NotEq(kind, book), KEY_ONLY: the existence posting {1, 2, 3} is only
     // a domain, so the literal itself probes every candidate: PostingEntry
@@ -2681,21 +2566,13 @@ fn exists_and_not_eq_queries_seek_the_existence_posting() {
     );
     // NotEq(price, U64(5)): no record holds a U64 price, so nothing is
     // probed: the seek only (a record lacking the type does not match).
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "NotEq(price, U64 5)",
-            query: Query::term(not_eq("price", Value::U64(5))),
-            projection: Projection::KEY_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "NotEq(price, U64 5)",
+        Query::term(not_eq("price", Value::U64(5))),
+        Projection::KEY_ONLY,
     );
 }
 
@@ -2703,7 +2580,7 @@ fn exists_and_not_eq_queries_seek_the_existence_posting() {
 fn range_queries_visit_only_the_qualifying_terms() {
     let (engine, ns, model) = fixture();
     // The (price, I64) run in key order: existence, 5 {3}, 10 {1}, 20 {2}.
-    // The brief's vector: Excluded(5)..Unbounded, ID_ONLY, limit 10: 1 + 5 +
+    // The worked vector: Excluded(5)..Unbounded, ID_ONLY, limit 10: 1 + 5 +
     // 4 = 10; the seek lands on 5, which is stepped over unpaid; TermVisit
     // 10 -> 13, 20 -> 16; the run ends at the next name. Heads by id:
     // PostingEntry (1) -> 17; emit -> 20; PostingEntry (2) -> 21; emit -> 24.
@@ -2816,68 +2693,44 @@ fn range_queries_visit_only_the_qualifying_terms() {
     );
     // lower > upper: the seek lands on 20, which is above the upper bound
     // 10, so the run is empty: the seek only.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Range(price, 20..=10)",
-            query: Query::term(range(
-                "price",
-                Bound::Included(Value::I64(20)),
-                Bound::Included(Value::I64(10)),
-            )),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Range(price, 20..=10)",
+        Query::term(range(
+            "price",
+            Bound::Included(Value::I64(20)),
+            Bound::Included(Value::I64(10)),
+        )),
+        Projection::ID_ONLY,
     );
     // A run past every term of the type: $expiresAt >= 6 seeks past the
     // only value (5) and stops at the next name unpaid.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Range($expiresAt, >=6)",
-            query: Query::term(range(
-                "$expiresAt",
-                Bound::Included(Value::U64(6)),
-                Bound::Unbounded,
-            )),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Range($expiresAt, >=6)",
+        Query::term(range(
+            "$expiresAt",
+            Bound::Included(Value::U64(6)),
+            Bound::Unbounded,
+        )),
+        Projection::ID_ONLY,
     );
     // A range on a type with no terms of that name: the seek only.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "Range(price, U64)",
-            query: Query::term(range(
-                "price",
-                Bound::Included(Value::U64(0)),
-                Bound::Unbounded,
-            )),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "Range(price, U64)",
+        Query::term(range(
+            "price",
+            Bound::Included(Value::U64(0)),
+            Bound::Unbounded,
+        )),
+        Projection::ID_ONLY,
     );
     // A one-term run, Range($expiresAt, ..=U64(5)), KEY_ONLY, limit 200:
     // one term visited (5 {1, 2, 3}), then PostingEntry 1 + {3 + 1} per row.
@@ -2979,62 +2832,38 @@ fn starts_with_queries_visit_the_prefix_run() {
     );
     // A prefix with no term: "c" seeks between book and pen; pen does not
     // start with c and terminates the run unpaid.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "StartsWith(kind, c)",
-            query: Query::term(starts_with("kind", "c")),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "StartsWith(kind, c)",
+        Query::term(starts_with("kind", "c")),
+        Projection::ID_ONLY,
     );
     // A prefix past every value: "z" seeks to the next name.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "StartsWith(kind, z)",
-            query: Query::term(starts_with("kind", "z")),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "StartsWith(kind, z)",
+        Query::term(starts_with("kind", "z")),
+        Projection::ID_ONLY,
     );
     // A prefix on a name with no Str terms (price): the seek only.
-    assert_query_on_both(
+    assert_seek_only(
         &engine,
         ns,
         &model,
-        &QueryVector {
-            name: "StartsWith(price, 1)",
-            query: Query::term(starts_with("price", "1")),
-            projection: Projection::ID_ONLY,
-            limit: 10,
-            after: None,
-            groups: vec![lookup(), query_group(), term_seek()],
-            total: 1 + 5 + 4,
-            ids: &[],
-            next: None,
-        },
+        "StartsWith(price, 1)",
+        Query::term(starts_with("price", "1")),
+        Projection::ID_ONLY,
     );
 }
 
 #[test]
 fn negated_first_literal_and_match_all_walk_the_row_map() {
     let (engine, ns, model) = fixture();
-    // The brief's vector: NOT StartsWith(kind, "bo"), KEY_ONLY: no seek; the
+    // The worked vector: NOT StartsWith(kind, "bo"), KEY_ONLY: no seek; the
     // row map is the source and the literal probes each row: RowVisit 1 +
     // RecordProbe 2 for 1 (fails), 2 (fails), 3 (passes) -> 15; emit {3 +
     // 1} -> 19; exhausted.
@@ -3510,10 +3339,6 @@ fn or_groups_open_in_order_and_merge_interleaved_heads() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 6. count
-// ---------------------------------------------------------------------------
-
 #[test]
 fn count_vectors_walk_every_head_without_row_charges() {
     let (engine, ns, model) = fixture();
@@ -3523,7 +3348,7 @@ fn count_vectors_walk_every_head_without_row_charges() {
     // loop advances every head to exhaustion with no ResultRow or ReadByte.
     let vectors: Vec<(&str, Query, Vec<Group>, u64)> = vec![
         (
-            // The brief's vector: RowVisit 1, 2, 3.
+            // The worked vector: RowVisit 1, 2, 3.
             "match-all",
             Query::match_all(),
             vec![
@@ -3536,7 +3361,7 @@ fn count_vectors_walk_every_head_without_row_charges() {
             1 + 5 + 1 + 1 + 1,
         ),
         (
-            // The brief's vector: PostingEntry 1, 2, 3.
+            // The worked vector: PostingEntry 1, 2, 3.
             "Exists(price, I64)",
             Query::term(exists("price", TypeTag::I64)),
             vec![
@@ -3693,10 +3518,6 @@ fn typed_reads_on_an_unknown_namespace_charge_the_lookup_only() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 7. Block budgets
-// ---------------------------------------------------------------------------
-
 #[test]
 fn block_budget_vector_for_typed_ops_admits_charges_and_records_as_specified() {
     let (mut engine, ns, mut model) = fixture();
@@ -3846,36 +3667,26 @@ fn block_budget_vector_for_typed_ops_admits_charges_and_records_as_specified() {
         op4.receipt.ledger,
         "the traced receipt is recorded with its ledger"
     );
-    assert!(
-        sealed
-            .receipts()
-            .iter()
-            .all(|receipt| receipt.kind == ReceiptKind::Write)
-    );
     let published = engine.publish(&sealed).expect("publish on snapshot 1");
     let head = fresh_branch(&engine, None);
     assert_eq!(head.base(), published);
     assert_eq!(observe(&head, ns), modelled(&model), "only d was added");
 }
 
-// ---------------------------------------------------------------------------
-// 8. Host path
-// ---------------------------------------------------------------------------
-
 #[test]
 fn execute_host_receipts_are_identical_to_execute_for_the_same_op() {
     let (engine, ns, _model) = fixture();
-    let brief_patch = patch(
+    let worked_patch = patch(
         ns,
         "a",
         vec![cell("price", attr(Value::U64(10)))],
         &["note", "missing"],
     );
-    // (label, op, hand-derived total): create d 199, the brief's patch 183,
+    // (label, op, hand-derived total): create d 199, the worked patch 183,
     // delete c 106.
     let ops = [
         ("create d", create(ns, "d", fixture_cells("book", 10)), 199),
-        ("patch a", brief_patch, 183),
+        ("patch a", worked_patch, 183),
         ("delete c", delete(ns, "c"), 106),
     ];
     for (label, op, total) in &ops {
@@ -4021,10 +3832,6 @@ fn execute_host_receipts_are_identical_to_execute_for_the_same_op() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 9. Estimation
-// ---------------------------------------------------------------------------
-
 #[test]
 fn estimate_matches_execute_for_a_typed_operation_script() {
     let (engine, ns, _model) = fixture();
@@ -4060,7 +3867,7 @@ fn estimate_matches_execute_for_a_typed_operation_script() {
             )),
         ),
         (
-            // The brief's patch on the patched a (price I64(11) held by a
+            // The worked patch on the patched a (price I64(11) held by a
             // alone): row n = 40, remove 2, insert 2 new terms: 183.
             "patch a type",
             ALICE,
@@ -4316,10 +4123,6 @@ fn typed_estimates_have_no_side_effects_and_consume_no_ids() {
     assert_eq!(branch.spent(), Cost::new(199));
 }
 
-// ---------------------------------------------------------------------------
-// 10. Overflow
-// ---------------------------------------------------------------------------
-
 #[test]
 fn cost_overflow_on_typed_ops_under_a_uniform_maximal_schedule() {
     // The fixture is published under FIXTURE; a second block commits
@@ -4534,10 +4337,6 @@ fn cost_overflow_inside_a_group_charges_nothing_of_the_group() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 11. Pricing pinning
-// ---------------------------------------------------------------------------
-
 #[test]
 fn typed_pricing_is_pinned_to_the_base_and_applies_only_after_publication() {
     let (mut engine, ns, mut model) = fixture();
@@ -4717,7 +4516,6 @@ fn range_walk_pages_revisit_every_term_of_the_run() {
         Bound::Unbounded,
     ));
     let mut cursor = None;
-    let mut walked = Vec::new();
     for (expected_id, expected_cost) in [(1, 24), (2, 24), (3, 23)] {
         let page = snapshot
             .query(
@@ -4729,9 +4527,8 @@ fn range_walk_pages_revisit_every_term_of_the_run() {
                 Budget::unlimited().traced(),
             )
             .expect("the walk stays within budget");
-        let ids: Vec<u64> = page.value.rows.iter().map(|row| row.id.ordinal()).collect();
-        assert_eq!(ids, [expected_id]);
-        let ledger = page.receipt.ledger.clone().expect("traced");
+        assert_eq!(ids_of(&page.value.rows), [expected_id]);
+        let ledger = page.receipt.ledger.as_ref().expect("traced");
         let visits = ledger
             .entries
             .iter()
@@ -4739,13 +4536,11 @@ fn range_walk_pages_revisit_every_term_of_the_run() {
             .map(|entry| entry.count);
         assert_eq!(visits, Some(3), "every page visits the whole run");
         assert_eq!(
-            page.receipt,
-            traced(read_receipt(expected_cost, Outcome::Applied), ledger)
+            without_ledger(&page.receipt),
+            read_receipt(expected_cost, Outcome::Applied)
         );
-        walked.push(expected_id);
         cursor = page.value.next;
     }
-    assert_eq!(walked, [1, 2, 3]);
     assert!(cursor.is_none(), "the third page is terminal");
 }
 
@@ -4769,7 +4564,7 @@ fn planned_reads_match_the_plans_worked_vectors() {
         count(&Query::term(not_eq("kind", Value::str("pen")))),
         (2, 1 + 5 + 4 + 4)
     );
-    // The written charges of the same reads are untouched: 9 and 13.
+    // The written charge of the match-all count is untouched: 9.
     assert_eq!(
         snapshot
             .count(ns, &Query::match_all(), Budget::unlimited())

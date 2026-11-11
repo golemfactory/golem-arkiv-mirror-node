@@ -1,5 +1,6 @@
 //! Strict Ethereum authentication and Arkiv execute ABI translation.
 //! The original signed bytes are retained and rechecked by every replaying node.
+
 use super::{
     Error, Result,
     crypto::recover,
@@ -18,7 +19,14 @@ sol! {
     struct Attribute { bytes32 name; uint8 typeId; bytes value; }
     struct Operation { uint8 operation; bytes operationData; }
     function execute(Operation[] ops) external returns (bytes32[] keys);
-    struct Create { uint128 salt; uint64 expiresAt; uint64 minLifetime; uint8 creationFlags; Attribute[] attributes; }
+    struct Create {
+        uint128 salt;
+        uint64 expiresAt;
+        uint64 minLifetime;
+        uint8 creationFlags;
+        Attribute[] attributes;
+    }
+
     struct Patch { bytes32 entityKey; Attribute[] mutations; }
     struct Extend { bytes32 entityKey; uint64 expiresAt; uint64 minLifetime; }
     struct Transfer { bytes32 entityKey; address newOwner; }
@@ -30,7 +38,6 @@ pub struct EthereumTransaction {
     pub chain_id: u64,
     pub nonce: u64,
     pub gas_limit: u64,
-    pub gas_price: U256,
     pub max_fee_per_gas: U256,
     pub max_priority_fee_per_gas: U256,
     pub to: [u8; 20],
@@ -41,14 +48,17 @@ pub struct EthereumTransaction {
     pub hash: B256,
     pub tx_type: u8,
 }
+
 fn bad() -> Error {
     Error("InvalidEthereumTransaction")
 }
+
 struct Item<'a> {
     raw: &'a [u8],
     payload: &'a [u8],
     list: bool,
 }
+
 fn take<'a>(input: &mut &'a [u8]) -> Result<Item<'a>> {
     let original = *input;
     let h = Header::decode(input).map_err(|_| bad())?;
@@ -60,15 +70,18 @@ fn take<'a>(input: &mut &'a [u8]) -> Result<Item<'a>> {
         list: h.list,
     })
 }
+
 fn uint(item: &Item<'_>) -> Result<U256> {
     if item.list || item.payload.len() > 32 || item.payload.first() == Some(&0) {
         return Err(bad());
     }
     Ok(U256::from_be_slice(item.payload))
 }
+
 fn u64_value(item: &Item<'_>) -> Result<u64> {
     uint(item)?.try_into().map_err(|_| bad())
 }
+
 fn list_bytes(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     Header {
@@ -79,6 +92,7 @@ fn list_bytes(payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
+
 /// Accept protected legacy and EIP-1559 transactions only. Nonempty access lists
 /// are rejected because this engine has no EVM warm/cold storage semantics.
 pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
@@ -157,7 +171,7 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
             list_bytes(&payload),
         )
     };
-    if parity > 1 || max_fee < U256::from(1_000_000_000u64) {
+    if parity > 1 || max_fee < U256::from(crate::accounts::GAS_PRICE_WEI) {
         return Err(Error("GasPriceBelowMinimum"));
     }
     let to = &fields[to_idx];
@@ -176,7 +190,6 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
         chain_id,
         nonce,
         gas_limit,
-        gas_price: U256::from(1_000_000_000u64),
         max_fee_per_gas: max_fee,
         max_priority_fee_per_gas: priority,
         to: to.payload.try_into().map_err(|_| bad())?,
@@ -188,6 +201,7 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
         tx_type: if typed { 2 } else { 0 },
     })
 }
+
 /// The ABI triples as cells: bit 7 of `typeId` selects an indexed attribute
 /// or an unindexed field; `None` is a patch tombstone.
 fn triples(
@@ -204,9 +218,11 @@ fn triples(
         .collect::<Vec<_>>();
     arkiv::decode_protocol_triples(&attrs, patch).map_err(|_| Error("InvalidArkivAttribute"))
 }
+
 fn key(bytes: alloy_primitives::B256) -> Result<RecordKey> {
     RecordKey::new(bytes.as_slice()).ok_or_else(bad)
 }
+
 fn abi_config() -> AbiDecoderConfig {
     // A canonical input of at most TX_CAP (384 KiB) needs far less than this; aliased dynamic
     // offsets must not multiply a small hostile payload into large allocations.
@@ -214,6 +230,7 @@ fn abi_config() -> AbiDecoderConfig {
         .strict(true)
         .memory_limit(2 * 1024 * 1024)
 }
+
 pub fn operations(input: &[u8]) -> Result<Vec<ArkivOperation>> {
     if input.len() > TX_CAP as usize {
         return Err(bad());
@@ -303,7 +320,8 @@ pub fn operations(input: &[u8]) -> Result<Vec<ArkivOperation>> {
         })
         .collect()
 }
-pub fn call_ops(_genesis: &SignedGenesis, calldata: &[u8]) -> Result<Vec<TxOp>> {
+
+pub fn call_ops(calldata: &[u8]) -> Result<Vec<TxOp>> {
     Ok(operations(calldata)?
         .into_iter()
         .map(|operation| TxOp::Arkiv {
@@ -312,6 +330,7 @@ pub fn call_ops(_genesis: &SignedGenesis, calldata: &[u8]) -> Result<Vec<TxOp>> 
         })
         .collect())
 }
+
 pub fn make_envelope(genesis: &SignedGenesis, tx: &EthereumTransaction) -> Result<TxEnvelope> {
     if tx.chain_id != genesis.genesis.chain_id {
         return Err(Error("IdentityMismatch"));
@@ -320,7 +339,7 @@ pub fn make_envelope(genesis: &SignedGenesis, tx: &EthereumTransaction) -> Resul
         if !tx.value.is_zero() {
             return Err(Error("NonzeroArkivValue"));
         }
-        call_ops(genesis, &tx.input)?
+        call_ops(&tx.input)?
     } else {
         if !tx.input.is_empty() {
             return Err(Error("UnsupportedEthereumCall"));
@@ -338,6 +357,7 @@ pub fn make_envelope(genesis: &SignedGenesis, tx: &EthereumTransaction) -> Resul
         ops,
     })
 }
+
 pub fn decode(genesis: &SignedGenesis, raw: &[u8]) -> Result<SignedTx> {
     let parsed = parse(raw)?;
     let tx = SignedTx {

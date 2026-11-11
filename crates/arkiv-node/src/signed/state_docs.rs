@@ -1,4 +1,5 @@
 //! Same-origin Scalar reference; independent of database locks and job permits.
+
 use axum::{Json, response::Html};
 use serde_json::Value;
 use std::sync::LazyLock;

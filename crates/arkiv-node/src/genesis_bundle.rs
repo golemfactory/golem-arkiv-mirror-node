@@ -1,5 +1,7 @@
-//! Bounded, deterministic height-zero entity builder, protocol 4.
+//! Small (at most 256 rows) height-zero prefill: row codec, launch
+//! commitment and the live-execution builder.
 //! Canonical bytes, not authoring syntax or local paths, define launch identity.
+
 use crate::{accounts, arkiv, signed::protocol::SignedGenesis};
 use alloy_primitives::U256;
 use arkiv_db::{
@@ -13,11 +15,10 @@ pub const MAX_ENTITIES: u64 = 256;
 pub const MAX_CANONICAL_BYTES: u64 = 1024 * 1024;
 pub const MAX_STORAGE_UNITS: u64 = 8 * 1024 * 1024;
 pub const STREAM_DOMAIN: &str = "arkiv/prefill-stream/v1";
-pub const RECIPE_DOMAIN: &str = "arkiv/genesis-recipe/v1";
+const RECIPE_DOMAIN: &str = "arkiv/genesis-recipe/v1";
 /// Row codec of both prefill stream framings (the `u32` after the magic):
 /// user-defined columns, each attribute an engine [`Cell`] whose kind is its
-/// indexed flag, with no payload or content type. Codecs 1 (`ARKPFL01`) and
-/// 2 (`ARKPFL02`) carried a payload and content type and are refused.
+/// indexed flag. Row codecs 1 and 2 (payload and content type) are refused.
 pub const ROW_CODEC: u32 = 3;
 /// The most user attributes of one prefill row: a create's
 /// [`arkiv::MAX_ATTRIBUTES`].
@@ -27,12 +28,14 @@ pub const MAX_ROW_ATTRIBUTES: u32 = arkiv::MAX_ATTRIBUTES as u32;
 /// Only a permanent-prefill launch ([`PrefillLaunch::permanent_prefill`]) admits it.
 pub const PERMANENT_EXPIRY: u64 = u64::MAX;
 type Result<T> = std::result::Result<T, String>;
+
 fn invalid(reason: &'static str) -> DecodeError {
     DecodeError::Invalid {
         kind: "PrefillV1",
         reason,
     }
 }
+
 fn err(e: impl std::fmt::Debug) -> String {
     format!("prefill: {e:?}")
 }
@@ -43,6 +46,7 @@ pub struct PrefillLimits {
     pub max_canonical_bytes: u64,
     pub max_storage_units: u64,
 }
+
 impl PrefillLimits {
     pub fn validate(&self) -> Result<()> {
         if self.max_entities > MAX_ENTITIES
@@ -50,11 +54,16 @@ impl PrefillLimits {
             || self.max_canonical_bytes > MAX_CANONICAL_BYTES
             || self.max_storage_units > MAX_STORAGE_UNITS
         {
-            return Err("prefill limits exceed supported envelope: 256 entities, 1 MiB canonical bytes, 8 MiB storage units".into());
+            return Err(concat!(
+                "prefill limits exceed supported envelope: ",
+                "256 entities, 1 MiB canonical bytes, 8 MiB storage units"
+            )
+            .into());
         }
         Ok(())
     }
 }
+
 impl Encode for PrefillLimits {
     fn encode_to(&self, e: &mut Encoder) {
         e.u64(self.max_entities);
@@ -62,6 +71,7 @@ impl Encode for PrefillLimits {
         e.u64(self.max_storage_units);
     }
 }
+
 impl Decode for PrefillLimits {
     const MIN_ENCODED_LEN: usize = 24;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -92,6 +102,7 @@ pub struct PrefillEntity {
     /// User attributes, strictly ascending by name.
     pub attributes: Vec<(CellName, Cell)>,
 }
+
 impl Encode for PrefillEntity {
     fn encode_to(&self, e: &mut Encoder) {
         e.fixed(&self.creator);
@@ -102,12 +113,14 @@ impl Encode for PrefillEntity {
         e.put(&self.attributes);
     }
 }
+
 impl Decode for PrefillEntity {
     const MIN_ENCODED_LEN: usize = 57;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
         Self::decode_with_attribute_limit(d, MAX_ROW_ATTRIBUTES)
     }
 }
+
 impl PrefillEntity {
     pub(crate) fn decode_with_attribute_limit(
         d: &mut Decoder<'_>,
@@ -142,6 +155,7 @@ impl PrefillEntity {
         })
     }
 }
+
 fn canonical_entities(entities: &[PrefillEntity], permanent: bool) -> Result<Vec<PrefillEntity>> {
     if entities.len() as u64 > MAX_ENTITIES {
         return Err("too many prefill entities".into());
@@ -218,9 +232,11 @@ fn canonical_entities(entities: &[PrefillEntity], permanent: bool) -> Result<Vec
     }
     Ok(rows)
 }
+
 pub fn encode_stream(entities: &[PrefillEntity]) -> Result<Vec<u8>> {
     encode_stream_with(entities, false)
 }
+
 /// [`encode_stream`] under a launch policy: `permanent` also admits
 /// [`PERMANENT_EXPIRY`] rows. The byte format is the same.
 pub fn encode_stream_with(entities: &[PrefillEntity], permanent: bool) -> Result<Vec<u8>> {
@@ -238,9 +254,11 @@ pub fn encode_stream_with(entities: &[PrefillEntity], permanent: bool) -> Result
     }
     Ok(e.into_bytes())
 }
+
 pub fn decode_stream(bytes: &[u8]) -> Result<Vec<PrefillEntity>> {
     decode_stream_with(bytes, false)
 }
+
 /// [`decode_stream`] under a launch policy; see [`encode_stream_with`].
 pub fn decode_stream_with(bytes: &[u8], permanent: bool) -> Result<Vec<PrefillEntity>> {
     if bytes.len() as u64 > MAX_CANONICAL_BYTES {
@@ -303,6 +321,7 @@ pub struct PrefillLaunch {
     pub burned_wei: U256,
     pub storage_units: u64,
 }
+
 /// `(streaming, permanent)` for a supported launch version.
 fn launch_layout(version: u32) -> Option<(bool, bool)> {
     match version {
@@ -313,6 +332,7 @@ fn launch_layout(version: u32) -> Option<(bool, bool)> {
         _ => None,
     }
 }
+
 fn validate_launch_limits(streaming: bool, limits: PrefillLimits) -> Result<()> {
     if streaming {
         crate::genesis_streaming::validate_limits(limits)
@@ -320,6 +340,7 @@ fn validate_launch_limits(streaming: bool, limits: PrefillLimits) -> Result<()> 
         limits.validate()
     }
 }
+
 impl PrefillLaunch {
     /// The launch version for a stream layout and permanence policy.
     pub const fn version_for(streaming: bool, permanent: bool) -> u32 {
@@ -330,15 +351,18 @@ impl PrefillLaunch {
             (true, true) => 4,
         }
     }
+
     /// A file-backed `ARKPFL02` launch (versions 2 and 4).
     pub fn is_streaming(&self) -> bool {
         launch_layout(self.version).is_some_and(|(streaming, _)| streaming)
     }
+
     /// The permanent-prefill contract (versions 3 and 4): rows may carry
     /// [`PERMANENT_EXPIRY`].
     pub fn permanent_prefill(&self) -> bool {
         launch_layout(self.version).is_some_and(|(_, permanent)| permanent)
     }
+
     pub fn validate(&self, g: &SignedGenesis) -> Result<()> {
         let Some((streaming, _)) = launch_layout(self.version) else {
             return Err("unsupported prefill version".into());
@@ -360,6 +384,7 @@ impl PrefillLaunch {
         Ok(())
     }
 }
+
 impl Encode for PrefillLaunch {
     fn encode_to(&self, e: &mut Encoder) {
         e.u32(self.version);
@@ -374,6 +399,7 @@ impl Encode for PrefillLaunch {
         e.u64(self.storage_units);
     }
 }
+
 impl Decode for PrefillLaunch {
     const MIN_ENCODED_LEN: usize =
         4 + 24 + 20 + 32 + 8 + 8 + 32 + StateHeader::MIN_ENCODED_LEN + 32 + 8;
@@ -402,6 +428,7 @@ impl Decode for PrefillLaunch {
         })
     }
 }
+
 pub fn recipe_hash(g: &SignedGenesis, p: &PrefillLaunch) -> B256 {
     let mut e = Encoder::new();
     e.u32(p.version);
@@ -429,6 +456,7 @@ pub fn recipe_hash(g: &SignedGenesis, p: &PrefillLaunch) -> B256 {
         &e.into_bytes(),
     )
 }
+
 /// Genesis rent of one prefill row of `units` storage units expiring at
 /// `expires_at`, created at height 0 under the chain's rent clock, in wei. A
 /// finite row prepays its lifetime with [`crate::gas::rent`], capped like a
@@ -452,16 +480,19 @@ pub(crate) fn prefill_rent_wei(
         .map(|quote| U256::from(quote.wei))
         .map_err(err)
 }
+
 /// The rent clock of a genesis; its parameters were validated.
 pub(crate) fn rent_clock(g: &SignedGenesis) -> Result<crate::gas::RentClock> {
     crate::gas::RentClock::of(&g.genesis.params).ok_or_else(|| "invalid rent clock".into())
 }
+
 struct Constructed {
     candidate: SealedCandidate,
     burn: U256,
     units: u64,
     rows: Vec<serde_json::Value>,
 }
+
 fn construct(
     g: &SignedGenesis,
     limits: PrefillLimits,
@@ -556,7 +587,14 @@ fn construct(
         let rent = prefill_rent_wei(row_units, row.expires_at_height, permanent, clock)?;
         burn = burn.checked_add(rent).ok_or("prefill rent overflow")?;
         use crate::simulator::wire::hex;
-        reports.push(serde_json::json!({"creator":hex(&row.creator),"createNonce":row.create_nonce.to_string(),"key":hex(&key),"expiresAtHeight":row.expires_at_height.to_string(),"storageUnits":row_units.to_string(),"rentWei":rent.to_string()}));
+        reports.push(serde_json::json!({
+            "creator": hex(&row.creator),
+            "createNonce": row.create_nonce.to_string(),
+            "key": hex(&key),
+            "expiresAtHeight": row.expires_at_height.to_string(),
+            "storageUnits": row_units.to_string(),
+            "rentWei": rent.to_string(),
+        }));
     }
     let balance = accounts
         .initial_balance(OwnerId::new(sponsor))
@@ -581,6 +619,7 @@ fn construct(
         rows: reports,
     })
 }
+
 pub fn build_genesis(
     base: SignedGenesis,
     limits: PrefillLimits,
@@ -589,6 +628,7 @@ pub fn build_genesis(
 ) -> Result<SignedGenesis> {
     build_genesis_with(base, limits, sponsor, entities, false)
 }
+
 /// [`build_genesis`] under a launch policy: `permanent` builds a version-3
 /// permanent-prefill launch, which also admits [`PERMANENT_EXPIRY`] rows.
 pub fn build_genesis_with(
@@ -621,6 +661,7 @@ pub fn build_genesis_with(
     base.validate().map_err(err)?;
     Ok(base)
 }
+
 pub fn verified_candidate(g: &SignedGenesis, stream: &[u8]) -> Result<SealedCandidate> {
     g.validate().map_err(err)?;
     let p = g.prefill.as_ref().ok_or("genesis has no prefill profile")?;
@@ -643,9 +684,11 @@ pub fn verified_candidate(g: &SignedGenesis, stream: &[u8]) -> Result<SealedCand
     }
     Ok(built.candidate)
 }
+
 pub fn verify_genesis(g: &SignedGenesis, stream: &[u8]) -> Result<()> {
     verified_candidate(g, stream).map(|_| ())
 }
+
 pub fn report(g: &SignedGenesis, stream: &[u8]) -> serde_json::Value {
     use crate::simulator::wire::hex;
     let Some(p) = &g.prefill else {
@@ -656,7 +699,20 @@ pub fn report(g: &SignedGenesis, stream: &[u8]) -> serde_json::Value {
         Err(e) => return serde_json::json!({"error":e}),
     };
     let a = &g.accounts;
-    let mut report = serde_json::json!({"genesisHash":hex(g.hash().as_slice()),"stateRoot":hex(p.state.root().as_slice()),"recipeHash":hex(p.recipe_hash.as_slice()),"streamHash":hex(p.stream_hash.as_slice()),"rowCount":p.row_count.to_string(),"canonicalBytes":p.canonical_bytes.to_string(),"storageUnits":p.storage_units.to_string(),"burnedWei":p.burned_wei.to_string(),"sponsor":hex(&p.sponsor),"sponsorBalanceWei":(a.initial_balance(OwnerId::new(p.sponsor))-p.burned_wei).to_string(),"initialSupplyWei":a.initial_supply().expect("valid supply").to_string(),"entities":built.rows});
+    let mut report = serde_json::json!({
+        "genesisHash": hex(g.hash().as_slice()),
+        "stateRoot": hex(p.state.root().as_slice()),
+        "recipeHash": hex(p.recipe_hash.as_slice()),
+        "streamHash": hex(p.stream_hash.as_slice()),
+        "rowCount": p.row_count.to_string(),
+        "canonicalBytes": p.canonical_bytes.to_string(),
+        "storageUnits": p.storage_units.to_string(),
+        "burnedWei": p.burned_wei.to_string(),
+        "sponsor": hex(&p.sponsor),
+        "sponsorBalanceWei": (a.initial_balance(OwnerId::new(p.sponsor))-p.burned_wei).to_string(),
+        "initialSupplyWei": a.initial_supply().expect("valid supply").to_string(),
+        "entities": built.rows,
+    });
     // Present only for the permanent-prefill contract, so finite reports and
     // the locks that record them are unchanged.
     if p.permanent_prefill() {
@@ -705,6 +761,7 @@ mod tests {
         );
         assert!(prefill_rent_wei(1, 0, true, clock).is_err());
     }
+
     /// The converter contract of `docs/genesis-bundle-v1.md`, byte for byte.
     #[test]
     fn row_codec_layout_is_pinned() {
@@ -752,6 +809,7 @@ mod tests {
         assert_eq!(&stream[..12], b"ARKPFL01\0\0\0\x03");
         assert_eq!(decode_stream(&stream).unwrap(), vec![row]);
     }
+
     #[test]
     fn launch_versions_select_layout_and_permanence() {
         for (version, streaming, permanent) in [

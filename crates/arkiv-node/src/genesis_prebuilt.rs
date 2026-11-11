@@ -18,6 +18,7 @@
 //! object reachable from that committed root. The checks in this module only
 //! refuse a store for another bundle before it is moved. Full followers and
 //! `genesis stream-verify` keep deriving the state independently.
+
 use crate::{
     genesis_streaming::{StreamSummary, check_disk, import_identity},
     signed::protocol::SignedGenesis,
@@ -31,6 +32,7 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, String>;
+
 fn err(e: impl std::fmt::Display) -> String {
     format!("prebuilt genesis state: {e}")
 }
@@ -43,7 +45,7 @@ const IDENTITY: &str = "IDENTITY";
 const PENDING: &str = "pending";
 const STORE_FILES: [&str; 3] = ["state.redb", "genesis.bin", "complete.json"];
 /// Binds a prebuilt state directory to one signed genesis.
-pub const MANIFEST: &str = "prebuilt.json";
+const MANIFEST: &str = "prebuilt.json";
 const INSTALL_PENDING: &str = "bulk-v1.install-pending";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ pub enum Installed {
     /// for example after an interrupted earlier start.
     Existing,
 }
+
 impl Installed {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -117,6 +120,7 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -126,25 +130,31 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes).map_err(err)?;
     file.sync_all().map_err(err)
 }
+
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(err)
 }
+
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
+
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
+
 fn is_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
+
 fn is_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
+
 fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -238,9 +248,10 @@ pub(crate) fn check_destination(state_out: &Path, bundle: &Path) -> Result<PathB
     fs::remove_dir(if probe.is_ok() { &to } else { &from }).map_err(err)?;
     match probe {
         Ok(()) => Ok(target),
-        Err(rustix::io::Errno::XDEV) => Err(err(
-            "state destination must be on the bundle output's filesystem and mount (publication is a rename)",
-        )),
+        Err(rustix::io::Errno::XDEV) => Err(err(concat!(
+            "state destination must be on the bundle output's filesystem and mount ",
+            "(publication is a rename)",
+        ))),
         Err(e) => Err(err(format!("state destination rename probe: {e}"))),
     }
 }
@@ -396,11 +407,13 @@ mod tests {
             Self(p)
         }
     }
+
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+
     fn base(run: u8) -> SignedGenesis {
         SignedGenesis {
             genesis: default_native_genesis(9450, 1000, 1000),
@@ -417,9 +430,11 @@ mod tests {
             prefill: None,
         }
     }
+
     fn stream(rows: u64) -> Vec<u8> {
         stream_expiring(rows, |n| 100 + n / 4)
     }
+
     fn stream_expiring(rows: u64, expiry: impl Fn(u64) -> u64) -> Vec<u8> {
         let mut b = b"ARKPFL02".to_vec();
         b.extend_from_slice(&crate::genesis_bundle::ROW_CODEC.to_be_bytes());
@@ -447,12 +462,14 @@ mod tests {
         }
         b
     }
+
     struct Built {
         bundle: PathBuf,
         state: PathBuf,
         genesis: SignedGenesis,
         report: serde_json::Value,
     }
+
     fn author(root: &Path, tag: &str, run: u8, rows: u64, keep: bool) -> Built {
         let base_path = root.join(format!("{tag}-base.bin"));
         let input = root.join(format!("{tag}-input.bin"));
@@ -482,9 +499,11 @@ mod tests {
             report,
         }
     }
+
     fn inode(path: &Path) -> u64 {
         fs::metadata(path).unwrap().ino()
     }
+
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = fs::read_dir(dir)
             .unwrap()
@@ -493,6 +512,7 @@ mod tests {
         names.sort();
         names
     }
+
     fn state_of(g: &SignedGenesis) -> arkiv_db::StateHeader {
         g.prefill.as_ref().unwrap().state.clone()
     }
@@ -500,17 +520,17 @@ mod tests {
     #[test]
     fn kept_state_is_reused_without_rebuild_and_matches_the_rebuild_path() {
         let tmp = Temp::new();
-        let legacy = author(&tmp.0, "legacy", 7, 12, false);
+        let rebuild = author(&tmp.0, "rebuild", 7, 12, false);
         let once = author(&tmp.0, "once", 7, 12, true);
         // Keeping the state changes neither the bundle nor its commitments.
-        assert_eq!(once.report, legacy.report);
+        assert_eq!(once.report, rebuild.report);
         assert_eq!(
             names(&once.bundle),
             ["genesis.bin", "prefill.bin", "report.json"]
         );
         assert_eq!(
             fs::read(once.bundle.join("genesis.bin")).unwrap(),
-            fs::read(legacy.bundle.join("genesis.bin")).unwrap()
+            fs::read(rebuild.bundle.join("genesis.bin")).unwrap()
         );
         assert_eq!(names(&once.state), ["IDENTITY", "LOCK", COMPLETE, MANIFEST]);
         assert_eq!(
@@ -545,8 +565,8 @@ mod tests {
             Installed::Existing
         );
 
-        // The legacy producer path still rebuilds independently, to the same state.
-        let rebuilt = tmp.0.join("legacy-node/prefill-work");
+        // The default producer path rebuilds independently, to the same state.
+        let rebuilt = tmp.0.join("rebuild-node/prefill-work");
         let engine =
             prepare_streaming(&once.genesis, &prefill, &rebuilt, Options::default()).unwrap();
         assert_eq!(
@@ -626,7 +646,7 @@ mod tests {
         let tmp = Temp::new();
         let once = author(&tmp.0, "copy", 7, 6, true);
         let work = tmp.0.join("node/prefill-work");
-        // A cut during an earlier copy, and unselected legacy scratch.
+        // A cut during an earlier copy, and unselected scratch.
         fs::create_dir_all(work.join(INSTALL_PENDING).join(COMPLETE)).unwrap();
         fs::write(
             work.join(INSTALL_PENDING).join("complete/state.redb"),
@@ -750,7 +770,7 @@ mod tests {
         let work = tmp.0.join(".bundle.stream-work");
         fs::create_dir_all(&work).unwrap();
         for (state, needle) in [
-            (existing.clone(), "already exists"),
+            (existing, "already exists"),
             (tmp.0.join("no/such/parent"), "parent must exist"),
             (bundle.clone(), "overlaps"),
             (work.join("state"), "overlaps"),

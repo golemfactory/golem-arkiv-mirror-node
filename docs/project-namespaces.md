@@ -23,14 +23,15 @@ name-to-ID index or uniqueness policy. Names are immutable in the current
 API; external naming aliases do not migrate records or rebuild indexes.
 
 Identity, ownership, per-namespace record maps, typed records with their
-term indexes, and the bounded directory are implemented in the in-memory
-engine (`arkiv_db::Engine`). Namespaces address the cost-isolation gap from
+term indexes, and the bounded directory are implemented in the engine
+(`arkiv_db::Engine`, and `DurableEngine` over the same state). Namespaces address the cost-isolation gap from
 [PR #2](https://github.com/Arkiv-Network/arkiv-source-of-truth/pull/2); the
 implemented bound covers put, delete, transfer, point reads, prefix scans,
 descriptor reads, typed record creation, patching and deletion, record reads,
 every query operator (equality, inequality, ranges, prefixes, existence,
 negation, match-all, AND-groups and OR of groups), pagination and counts.
-Roots, proofs and the authenticated directory remain design targets.
+The state root authenticates the directory, and equality and range proofs
+verify the namespace's catalog path.
 
 ## Identity, ownership and authorization
 
@@ -161,8 +162,8 @@ All query-relevant state is partitioned by namespace:
   result caches and no namespace-local statistics beyond the unmetered
   counts.
 
-Proof material and sort inputs do not exist yet; when they arrive they must
-be partitioned the same way.
+Proof material is partitioned the same way: a proof authenticates one
+namespace's catalog leaf and then only that namespace's maps.
 
 The implemented layout keeps separate persistent Merkle Patricia maps per
 namespace behind a directory keyed by ID, rather than prefixes in one shared
@@ -202,8 +203,8 @@ query_work <= local_work(query, namespace_state) + directory_bound
 allowance proportional to other projects' records, terms or namespace count.
 
 Implemented bound: every operation resolves its namespace through the
-directory exactly once, charged as one `DirectoryLookup` unit. Since node
-step N3b the directory is a Merkle Patricia trie keyed by 8-byte big-endian
+directory exactly once, charged as one `DirectoryLookup` unit. The
+directory is a Merkle Patricia trie keyed by 8-byte big-endian
 IDs (16 nibbles), so whatever the number of namespaces a read visits at most
 `2·8 + 1` = 17 directory nodes (each branch consumes a nibble, each
 extension at least one and precedes a branch, one leaf ends the path) and a
@@ -217,9 +218,7 @@ namespaces (configurable through `Engine::with_namespace_cap` or
 constant directory charge reserves that worst case, so unrelated directory
 growth cannot make an unchanged operation exceed its budget. Directory visits
 are reported in `PhysicalTrace::directory_nodes` for measurement only; they
-are not canonical and never affect charges. (Before N3b the directory was
-an AVL tree with a height bound of 46 visits per read and 92 per write at
-the cap.)
+are not canonical and never affect charges.
 
 `local_work` is the charged work over the selected namespace's own maps:
 key and row lookups (`PointRead`), index maintenance (`IndexInsert`,
@@ -235,11 +234,10 @@ has its own posting: it changes neither the charges nor the `record_nodes`
 and `index_nodes` of an unchanged operation, which is what the extended
 interference test measures.
 
-The directory is now authenticated by the state root and has a fixed key
-width and a bounded depth, but no directory witness is produced or verified
-yet: the proof-size bound (the planned constant `ProofNode 17` and
-`ProofByte D_MAX` directory witness, node step N3d) must be derived and
-measured before claiming isolation for proofs.
+The directory is authenticated by the state root and has a fixed key width
+and a bounded depth. Equality proofs carry and verify the directory witness
+and charge its nodes and bytes as `ProofNode`/`ProofByte`
+([proof charges](eq-proof-charges.md)).
 
 Do not hide a global scan behind a constant charge. Actual logical visits,
 bytes processed and witness construction must meet the bound as well as the
@@ -266,12 +264,12 @@ together as one snapshot; projects never advance independently. Internal
 snapshot IDs are distinct from block heights as described in the single-block
 contract, and the host's `BlockMap` records only a block's terminal snapshot.
 
-Roots are implemented (node step N3b); proofs are not. The composition, with
+The composition of the state root, with
 leaves in the canonical codec (see `docs/architecture.md` for the layouts):
 
 ```text
 state_root = digest("arkiv/state/v1", encode(StateHeader))
-StateHeader { format 1, catalog_root, catalog_len, next_namespace (directory
+StateHeader { format 2, catalog_root, catalog_len, next_namespace (directory
               allocation state), pricing, host_root, host_len }
 catalog (directory) trie: NamespaceId -> descriptor (id, name, owner, revision),
     next_record (local allocator), and root ‖ len of the namespace's
@@ -301,54 +299,30 @@ name (implemented); caches, when they exist, must do the same. Retention must
 preserve the historical namespace directory as well as its referenced content
 and proof nodes.
 
-## Implementation order and acceptance gates
+## Evidence
 
-1. Done: ID allocation, namespace-local record addressing and owner
-   transitions are defined and implemented, together with the in-memory
-   catalog, deterministic metering and the first block/snapshot API. The
-   low-level KV facade stays byte-oriented.
-2. Done: records, record ids and indexes are namespace-local from their first
-   implementation, and the cross-namespace interference test is extended to
-   every query operator (`query_isolation.rs`).
-3. Commit directory descriptors and per-namespace roots: done (node step
-   N3b, state root). Measure both local witnesses and the bounded directory
-   witness in historical point and query proofs: planned (N3d, milestone 4).
-4. Extend SDK requests, cursors, errors and ownership operations with explicit
-   namespace context. Resolve the entity-owner compatibility rule before use;
-   the 32-byte key encoding is settled (node step N0b-1, `RecordKey`
-   encoding version 2).
-5. Preserve the same boundaries in durable storage, pruning and archive import.
+- Identical keys in two namespaces never mix reads, writes or scans, and
+  identical attribute terms never mix postings, counts, negation domains,
+  cursors or term listings (`pagination.rs`, `query_isolation.rs`,
+  `terms.rs`).
+- Unauthorized writes and transfers fail; stale transfer revisions fail. A
+  transfer followed by an old-owner write in one block uses the updated
+  authority. Rollback and rejected candidates restore owner and content
+  state, including rows and index (`namespaces.rs`, `rollback.rs`).
+- Transferring an empty or a populated namespace costs the same, and the
+  record map, rows and index are shared afterwards; content roots stay
+  stable while the state root changes (`roots.rs`).
+- With project A's data, queries and pricing frozen, growing B's records,
+  writes, identical terms and the number of namespaces leaves A's local
+  visits, charged units and abort points unchanged, with directory work
+  inside its bound: `isolation.rs` for put/delete/get/scan/descriptor,
+  `query_isolation.rs` for record writes and reads and every query operator,
+  paging and count.
+- Equality proofs authenticate the catalog path and the namespace binding
+  (`eq_proofs.rs`).
+- Missing or corrupt namespace data produces a storage error, not an empty
+  answer or a switch to another namespace, and a directory leaf describing
+  another namespace is corrupt (`storage_faults.rs`).
 
-Required tests, with the current status of each:
-
-- Identical keys in two namespaces never mix reads, writes or scans:
-  implemented for records. Identical attribute terms never mix postings,
-  counts, negation domains, cursors or term listings: implemented
-  (`pagination.rs`, `query_isolation.rs`; `terms.rs` for term listings).
-  Caches and proofs: planned with milestone 4 (there are no caches).
-- Unauthorized writes/transfers fail; stale transfer revisions fail. A transfer
-  followed by an old-owner write in one block uses the updated authority.
-  Rollback and rejected candidates restore both owner and content state,
-  including rows and index: implemented.
-- Transfer an empty and a populated namespace: charges are independent of
-  record count and the record map, rows and index are shared (same roots)
-  afterwards: implemented. Content roots staying stable while the state
-  root changes: implemented (`roots.rs`). Old-block proofs of the former
-  owner: planned (N3d).
-- Freeze project A's data/query/pricing, grow B's records, writes, identical
-  terms and additional namespaces, then repeat A's operations. Measure local
-  visits, charged units and abort points separately from bounded directory
-  work: implemented for put/delete/get/scan/descriptor
-  (`isolation.rs`) and for record writes, record reads, equality, range,
-  prefix, existence, inequality, NOT, match-all, paging and count
-  (`query_isolation.rs`). Proof sizes, sorting, warm and cold caches: planned
-  as each is implemented.
-- Tampered namespace IDs, descriptors or cross-namespace witnesses fail proof
-  verification: planned (N3d). Missing or corrupt namespace data produces a
-  storage error (unavailability), not an empty answer or a switch to another
-  namespace, and a directory leaf describing another namespace is corrupt:
-  implemented over a test object reader (`storage_faults.rs`); durable
-  storage follows in N3c.
-
-These tests are gates on the design. A namespace label, owner filter or a
-passing data-correctness test alone does not establish cost isolation.
+A namespace label, owner filter or a passing data-correctness test alone does
+not establish cost isolation.

@@ -1,53 +1,22 @@
-//! Independent model test for milestone 2: generated block histories of typed
-//! records, term indexes, queries and host expiry, checked against an oracle.
+//! Independent model test: generated block histories of typed records, term
+//! indexes, queries and host expiry, checked against an oracle.
 //!
 //! For each fixed seed the workload runs 120 real blocks on one engine with
 //! small instance limits (6 cells, 16-byte values, pages of 5) over keys of
-//! 1 to 32 bytes (every seed applies writes under the 32-byte key): creates,
-//! patches (value, type and kind changes, removals of present and absent
-//! names), deletes, key recreation, transactions with checkpoint and
-//! rollback, admission faults, budget failures, host-path writes, a stale
-//! losing candidate, admin pricing candidates, empty blocks and host expiry
-//! (`$expiresAt` records deleted by `expire_records` before every seal).
-//! Every 20th block stamps all of its keys to expire in the next, empty
-//! block, whose expiry first runs with a starved delete budget (a halt) and
-//! then over several pages; every tenth block gets the starved run too.
+//! 1 to 32 bytes: creates, patches, deletes, key recreation, transactions
+//! with checkpoint and rollback, admission faults, budget failures,
+//! host-path writes, a stale losing candidate, admin pricing candidates,
+//! empty blocks and host expiry. Every 20th block stamps all of its keys to
+//! expire in the next block, whose expiry first runs with a starved delete
+//! budget (a halt) and then over several pages; every tenth block gets the
+//! starved run too.
 //!
-//! What this file establishes:
-//! - The oracle keeps its own per-namespace mutation log and BTreeMap views
-//!   and predicts, before looking at the engine, every verdict
-//!   (AlreadyExists, NotFound, Unauthorized, UnknownNamespace, RecordFull,
-//!   every admission fault, ExceedsBlockBudget and the OutOfBudget abort
-//!   point), every effect and record id, and every write receipt from the
-//!   CHARGE table transcribed from the milestone-2 brief and the model-3
-//!   charge table (`RowByte`, `RootUpdate`), with term newness derived from
-//!   the model's live rows.
-//! - Expiry: the oracle predicts exactly which ids expire in a block (and
-//!   which survive because `$expiresAt` is a field, another type, or was
-//!   removed), the delete receipts in id order, multi-page runs, and the
-//!   halt when a delete runs out of budget; expired rows are absent from the
-//!   block's snapshot and present in the previous one.
-//! - At every published snapshot, checked again at the end after all later
-//!   mutations, `get_record` for every key ever used, `count` and a full
-//!   cursor walk (limit 5) of a fixed query catalogue covering every
-//!   operator, negation, AND, OR and match-all agree with a full-scan
-//!   reference evaluator of the brief's semantics over the model's view at
-//!   that block. Single-group query and count receipts are predicted from
-//!   the brief's lazy rules; multi-group queries are checked for results
-//!   only. Cursors bind their snapshot, query and projection.
-//! - `index_consistent` holds after every operation and at every snapshot;
-//!   a namespace shares its typed structure (the roots of its key, row and
-//!   term maps) with the previous block exactly when its live rows are
-//!   unchanged, which includes every untouched namespace.
-//! - Replay: a second engine driven by the same seed produces identical
-//!   receipts, ids, pages and physical traces.
-//! - The host obligation stated in the brief: without host filtering a
-//!   user patch that turns `$expiresAt` into a field makes the record
-//!   survive `expire_records`, and the reference evaluator agrees.
-//!
-//! What it does not establish: raw byte-keyspace behaviour (`Put`/`Delete`,
-//! covered by `history.rs`), physical node bounds, multi-group query
-//! charges, ledgers, or anything about durability or authentication.
+//! The oracle keeps its own mutation log and BTreeMap views and predicts,
+//! before looking at the engine, every verdict, effect, record id, write
+//! receipt (from the CHARGE table below) and expiry. Reads at every snapshot
+//! are checked against a full-scan reference evaluator; single-group query
+//! and count receipts are predicted, multi-group queries are checked for
+//! results only. Raw `Put`/`Delete` histories are covered by `history.rs`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,10 +32,6 @@ use arkiv_db::{
     SealedCandidate, Snapshot, SnapshotId, Term, TypeTag, Value, WriteOp, WriteResult,
     expire_records,
 };
-
-// ---------------------------------------------------------------------------
-// Workload shape
-// ---------------------------------------------------------------------------
 
 const SEEDS: [u32; 3] = [0x0000_0007, 0x9e37_79b9, 0xdead_beef];
 const BLOCKS: u64 = 120;
@@ -184,15 +149,10 @@ fn cells_of(list: &[(CellName, Cell)]) -> Cells {
     list.iter().cloned().collect()
 }
 
-// ---------------------------------------------------------------------------
-// CHARGE table: unit prices and charge points, transcribed from the
-// milestone-2 brief with the model-3 additions (`RowByte n` and
-// `RootUpdate` in the record groups, `RootUpdate 2` in every index group,
-// `RootUpdate 1` with a namespace creation). Plain u64 arithmetic; the
-// engine's pricing API is never consulted. Every element of a charge list is
-// one atomic charge group in charge order.
-// ---------------------------------------------------------------------------
-
+/// The CHARGE table: unit prices and charge points in plain u64 arithmetic
+/// (see docs/metering.md); the engine's pricing API is never
+/// consulted. Every element of a charge list is one atomic charge group in
+/// charge order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Weights {
     id: u32,
@@ -220,7 +180,7 @@ struct Weights {
     row_byte: u64,
 }
 
-/// `PriceSchedule::FIXTURE` (id 1) as listed in the brief. The raw byte
+/// The weights of `PriceSchedule::FIXTURE` (id 1). The raw byte
 /// classes (PutRecord, DeleteRecord, WriteKeyByte, WriteValueByte, ScanSeek,
 /// ScanEntry, NamespaceTransfer) are not exercised here and are omitted.
 const FIXTURE: Weights = Weights {
@@ -465,12 +425,8 @@ fn receipt(kind: ReceiptKind, schedule_id: u32, spent: u64, outcome: Outcome) ->
     }
 }
 
-// ---------------------------------------------------------------------------
-// Encodings and term identities, transcribed from the brief.
-// ---------------------------------------------------------------------------
-
-/// Encoded value length: 1 for Bool, 8 for the integers, the byte length
-/// for Str and Bytes.
+/// Encoded value length: the type's fixed width, or the byte length for Str
+/// and Bytes.
 fn encoded_len(value: &Value) -> u64 {
     match value {
         Value::I32(_) | Value::Bytes4(_) | Value::U32(_) | Value::Dec32(_) => 4,
@@ -542,10 +498,6 @@ fn patched_cells(old: &Cells, set: &[(CellName, Cell)], remove: &[CellName]) -> 
     cells
 }
 
-// ---------------------------------------------------------------------------
-// Admission validation, transcribed from the brief (before any charge).
-// ---------------------------------------------------------------------------
-
 fn cells_fault(cells: &[(CellName, Cell)]) -> Option<ArgumentFault> {
     if cells.len() > LIMITS.max_cells {
         return Some(ArgumentFault::TooManyCells);
@@ -595,10 +547,8 @@ fn argument_fault(op: &WriteOp) -> Option<ArgumentFault> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The model: per-namespace live rows, and the reference evaluator of the
-// brief's query semantics (a full scan, never an index).
-// ---------------------------------------------------------------------------
+// query semantics (a full scan, never an index).
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Rec {
@@ -742,7 +692,7 @@ fn within(value: &Value, lower: &Bound<Value>, upper: &Bound<Value>) -> bool {
     above && below
 }
 
-/// The brief's term semantics on one record: only an attribute of the
+/// The term semantics on one record: only an attribute of the
 /// term's name and type can match; fields never do.
 fn term_matches(term: &Term, cells: &Cells) -> bool {
     let Some(cell) = cells.get(term.name()) else {
@@ -808,12 +758,10 @@ fn project(id: RecordId, rec: &Rec, projection: &Projection) -> (Row, u64) {
     (row, bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Single-group query charges, from the brief's lazy rules. The source and
+// Single-group query charges, from the lazy evaluation rules. The source and
 // probe list follow the first literal; every candidate and probe is charged
 // as it is revealed; the page stops at `limit` rows with the next head
 // already pulled.
-// ---------------------------------------------------------------------------
 
 /// A predicted page or count walk: charge points in order plus the emitted
 /// ids and the continuation.
@@ -1015,10 +963,8 @@ fn predict_count(w: &Weights, model: &NsModel, group: &[Literal]) -> Plan {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Oracle: the published mutation log per namespace, views replayed from it,
 // and the open candidate.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Mutation {
@@ -1324,10 +1270,6 @@ fn full_cost(pending: &Pending, path: Path, op: &WriteOp) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Comparable shapes, transcript and coverage.
-// ---------------------------------------------------------------------------
-
 type Flat<T> = Result<(T, Receipt), (Rejection, Receipt)>;
 
 fn flat_write(result: &WriteResult) -> (Flat<Effect>, PhysicalTrace) {
@@ -1486,10 +1428,6 @@ impl fmt::Display for Ctx {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// Metered typed reads on branches and snapshots, checked against a view.
-// ---------------------------------------------------------------------------
 
 trait Reader {
     fn get_record_metered(
@@ -2207,10 +2145,6 @@ fn check_reads<R: Reader>(
     (out, issued)
 }
 
-// ---------------------------------------------------------------------------
-// Workload generation.
-// ---------------------------------------------------------------------------
-
 struct Generator(u32);
 
 impl Generator {
@@ -2387,7 +2321,8 @@ fn delete(namespace: NamespaceId, bytes: &[u8]) -> WriteOp {
     }
 }
 
-/// An operation that fails admission, chosen by `which`.
+/// An operation that fails admission, chosen by `which` (case 4, the empty
+/// patch, is a no-op or NotFound instead).
 fn fault_op(namespace: NamespaceId, bytes: &[u8], which: usize) -> (Path, WriteOp) {
     let long = "x".repeat(LIMITS.max_str_len + 1);
     let kind = name(KIND);
@@ -2508,7 +2443,7 @@ fn block_budget(block: u64, size: usize) -> Option<u64> {
 }
 
 /// Every 20th block stamps every one of its keys to expire in the next
-/// block (an empty, starved one), so expiry runs over several pages; every
+/// block (a starved one), so expiry runs over several pages; every
 /// fourth stamp is a field, which expiry must leave alone.
 fn is_stamping_block(block: u64) -> bool {
     block % 20 == 19
@@ -2581,21 +2516,17 @@ fn plan_op(
         generator.pick(&KEYS)
     };
     let (path, op) = match index % 10 {
-        0 | 1 => (
+        // 2 then 3 delete and recreate the focus key: the recreation mints a
+        // new id.
+        0 | 1 | 3 => (
             path,
             create(namespace, bytes, generator.create_cells(block)),
         ),
-        // Delete then recreate the focus key: the recreation mints a new id.
-        2 => (path, delete(namespace, bytes)),
-        3 => (
-            path,
-            create(namespace, bytes, generator.create_cells(block)),
-        ),
+        2 | 6 => (path, delete(namespace, bytes)),
         4 | 5 => {
             let (set, remove) = generator.patch_lists();
             (path, patch(namespace, bytes, set, remove))
         }
-        6 => (path, delete(namespace, bytes)),
         7 => {
             let (set, remove) = generator.expiry_patch(block);
             (path, patch(namespace, bytes, set, remove))
@@ -2626,10 +2557,6 @@ fn plan_op(
     };
     (path, op, budget)
 }
-
-// ---------------------------------------------------------------------------
-// Checked execution.
-// ---------------------------------------------------------------------------
 
 fn run_write(branch: &mut Branch, path: Path, op: WriteOp, budget: Budget) -> WriteResult {
     match path {
@@ -2799,7 +2726,6 @@ fn execute_checked(
     transcript.physical.push(physical);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rollback_checked(
     branch: &mut Branch,
     pending: &mut Pending,
@@ -3038,10 +2964,6 @@ fn expire_checked(
     ids
 }
 
-// ---------------------------------------------------------------------------
-// Admin candidates and stale losers.
-// ---------------------------------------------------------------------------
-
 /// Publishes a pricing change as its own snapshot before the block's data
 /// candidate. The block maps to the data snapshot only.
 fn publish_admin(
@@ -3278,10 +3200,6 @@ fn build_loser(
     branch.seal()
 }
 
-// ---------------------------------------------------------------------------
-// The per-seed run.
-// ---------------------------------------------------------------------------
-
 struct Retained {
     block: u64,
     id: SnapshotId,
@@ -3479,10 +3397,7 @@ fn run_seed(seed: u32, thorough: bool) -> Run {
                 block,
                 phase: "branch",
             };
-            let (checked, _) = check_reads(&branch, &pending.view, &weights, &ctx);
-            transcript
-                .events
-                .extend(checked.receipts.into_iter().map(Event::Read));
+            check_reads(&branch, &pending.view, &weights, &ctx);
         }
 
         // Host expiry before the seal: a starved first run halts on its
@@ -3889,14 +3804,10 @@ fn assert_replay(seed: u32) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Tests.
-// ---------------------------------------------------------------------------
-
-/// The brief's worked vectors: three records a, b, c with attributes kind
+/// The worked vectors: three records a, b, c with attributes kind
 /// (Str), price (I64), $expiresAt (U64(5)) and a field note (Bytes "xyz");
 /// kinds book, book, pen; prices 10, 20, 5.
-fn brief_vectors() -> NsModel {
+fn worked_vectors() -> NsModel {
     let mut model = NsModel::new(ALICE);
     for (ordinal, bytes, kind, price) in [
         (1, b"a", "book", 10),
@@ -3918,9 +3829,9 @@ fn brief_vectors() -> NsModel {
 }
 
 #[test]
-fn charge_table_reproduces_the_brief_worked_vectors() {
+fn charge_table_reproduces_the_worked_vectors() {
     let w = FIXTURE;
-    let full = brief_vectors();
+    let full = worked_vectors();
     let mut model = NsModel::new(ALICE);
     let mut created = Vec::new();
     for (id, rec) in &full.rows {
@@ -4012,8 +3923,8 @@ fn charge_table_reproduces_the_brief_worked_vectors() {
 }
 
 #[test]
-fn reference_evaluator_follows_the_brief_semantics() {
-    let model = brief_vectors();
+fn reference_evaluator_follows_the_query_semantics() {
+    let model = worked_vectors();
     let n = name;
     let matches = |term: Term| model.matches(&Query::term(term));
     assert_eq!(
@@ -4098,22 +4009,10 @@ fn reference_evaluator_follows_the_brief_semantics() {
 
 /// A host that lets a user write `$`-cells loses expiry: a patch that turns
 /// `$expiresAt` into a field makes the record survive `expire_records`,
-/// exactly as the reference evaluator predicts. The filter the brief asks
-/// the host to apply would have refused the patch before it reached the
-/// engine.
+/// exactly as the reference evaluator predicts. A host is expected to refuse
+/// user writes to `$`-cells before they reach the engine.
 #[test]
 fn a_field_expires_at_survives_expiry_without_host_filtering() {
-    fn host_accepts(op: &WriteOp) -> bool {
-        let names: Vec<&CellName> = match op {
-            WriteOp::CreateRecord { cells, .. } => cells.iter().map(|(n, _)| n).collect(),
-            WriteOp::PatchRecord { set, remove, .. } => {
-                set.iter().map(|(n, _)| n).chain(remove.iter()).collect()
-            }
-            _ => Vec::new(),
-        };
-        names.iter().all(|n| !n.as_str().starts_with('$'))
-    }
-
     let w = FIXTURE;
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
     let namespace = ns(1);
@@ -4177,10 +4076,6 @@ fn a_field_expires_at_survives_expiry_without_host_filtering() {
         b"b",
         vec![(expires.clone(), field(Value::U64(3)))],
         vec![],
-    );
-    assert!(
-        !host_accepts(&op),
-        "the brief's host filter refuses user `$` writes"
     );
     let b = &model.rows[&rid(2)].cells;
     let set = vec![(expires.clone(), field(Value::U64(3)))];

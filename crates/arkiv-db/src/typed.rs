@@ -43,7 +43,7 @@ use planner::PostingCursor;
 pub(crate) enum Evaluation {
     /// As written: each group is driven by its first literal and probes the
     /// rest on rows in order. These are the canonical counting rules of the
-    /// plan (`docs/snapshot-query-plan.md`); every read that does not opt in
+    /// plan (`docs/metering.md`); every read that does not opt in
     /// uses them, block execution's expiry sweep included.
     Written,
     /// By estimated cost (see [`planner`]): the same rows, order, cursors
@@ -166,10 +166,6 @@ fn find<'c>(cells: &'c [(CellName, Cell)], name: &CellName) -> Option<&'c Cell> 
         .map(|index| &cells[index].1)
 }
 
-// ---------------------------------------------------------------------------
-// Admission validation (before any charge)
-// ---------------------------------------------------------------------------
-
 fn validate_cells(limits: &Limits, cells: &[(CellName, Cell)]) -> Result<(), ArgumentFault> {
     if cells.len() > limits.max_cells {
         return Err(ArgumentFault::TooManyCells);
@@ -192,7 +188,6 @@ fn validate_cells(limits: &Limits, cells: &[(CellName, Cell)]) -> Result<(), Arg
     Ok(())
 }
 
-/// Validates a create's cells.
 pub(crate) fn validate_create(
     limits: &Limits,
     cells: &[(CellName, Cell)],
@@ -200,7 +195,6 @@ pub(crate) fn validate_create(
     validate_cells(limits, cells)
 }
 
-/// Validates a patch's set and remove lists.
 pub(crate) fn validate_patch(
     limits: &Limits,
     set: &[(CellName, Cell)],
@@ -328,10 +322,6 @@ pub(crate) fn validate_query(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Index maintenance
-// ---------------------------------------------------------------------------
-
 /// The terms an attribute cell holds: its value term, then its existence
 /// term. A field holds none.
 fn terms_of(name: &CellName, cell: &Cell) -> Vec<TermKey> {
@@ -418,10 +408,6 @@ fn remove_member(
     };
     Ok(updated)
 }
-
-// ---------------------------------------------------------------------------
-// Writes
-// ---------------------------------------------------------------------------
 
 /// Looks up the live binding of `key`, charging the point read.
 fn lookup_key(
@@ -655,10 +641,6 @@ pub(crate) fn delete(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Reads
-// ---------------------------------------------------------------------------
-
 /// The cells a projection selects, walking the record's own (bounded) cell
 /// list.
 fn projected<'r>(
@@ -786,7 +768,6 @@ pub(crate) fn terms(
     outcome.map(|()| values)
 }
 
-/// Reads one record by key.
 pub(crate) fn get_record(
     state: &TypedState,
     loaders: &NamespaceLoaders<'_>,
@@ -869,7 +850,7 @@ enum Source<'a> {
     /// A planned group's driving posting, which its leapfrog may move
     /// forward (see [`planner`]).
     Cursor(PostingCursor<'a>),
-    /// Nothing: the cursor is past every possible id.
+    /// Nothing to yield.
     Empty,
 }
 
@@ -1140,7 +1121,6 @@ impl<'a, 'q> GroupStream<'a, 'q> {
         })
     }
 
-    /// Opens one group as `evaluation` asks.
     fn open_as(
         evaluation: Evaluation,
         state: &TypedState,
@@ -1321,7 +1301,6 @@ impl<'a, 'q> Evaluator<'a, 'q> {
 /// [`open_run`]. Every visited node is therefore noted exactly once. Noting
 /// is not metered, so charges are untouched. (A storage failure discards
 /// the trace with the rest of the read.)
-#[allow(clippy::too_many_arguments)]
 fn evaluate<'a, 'q, 'm, T>(
     state: &TypedState,
     loaders: &'a NamespaceLoaders<'a>,

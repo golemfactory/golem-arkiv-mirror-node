@@ -43,7 +43,7 @@ fn envelope_limits() {
         envelope.tx_budget = budget;
         assert_eq!(check_tx(&spec, &envelope), Err(TxFault::Budget));
     }
-    let mut full = valid.clone();
+    let mut full = valid;
     full.tx_budget = 100_000;
     assert_eq!(check_tx(&spec, &full), Ok(()));
     let empty = tx(ALICE, 1, 10, vec![]);

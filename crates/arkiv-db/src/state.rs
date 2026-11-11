@@ -32,7 +32,7 @@ use crate::{
 pub const STATE_FORMAT: u32 = crate::LAYOUT_VERSION;
 
 /// The digest domain of the state root.
-pub const STATE_ROOT_DOMAIN: &str = "arkiv/state/v1";
+const STATE_ROOT_DOMAIN: &str = "arkiv/state/v1";
 
 /// The global part of one engine state, whose digest is the state root.
 ///
@@ -120,8 +120,7 @@ impl Decode for StateHeader {
 }
 
 /// The roots of one namespace's maps and its record allocator: the content
-/// of its catalog leaf besides the descriptor. A test aid; see
-/// `Snapshot::try_namespace_roots`.
+/// of its catalog leaf besides the descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamespaceRoots {
     /// The id the next record creation receives.
@@ -179,8 +178,7 @@ impl MapKind {
 }
 
 /// One object of a state that exists only in memory: a trie node a commit
-/// must write. A test aid until node step N3c stages commits; see
-/// `Snapshot::staged_objects`.
+/// must write. Returned by the hidden test aid `Snapshot::staged_objects`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedObject {
     /// The object space: `Catalog`, `Host` or the namespace's.

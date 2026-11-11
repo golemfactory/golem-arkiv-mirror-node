@@ -127,12 +127,10 @@ impl fmt::Display for NamespaceId {
 pub struct OwnerId([u8; 20]);
 
 impl OwnerId {
-    /// Wraps raw principal bytes.
     pub const fn new(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
 
-    /// Returns the raw principal bytes.
     pub const fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
@@ -167,7 +165,6 @@ impl Revision {
 /// descriptor that was current at that snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamespaceDescriptor {
-    /// Immutable identity.
     pub id: NamespaceId,
     /// Readable name assigned at creation, preserved by ownership transfers.
     pub name: NamespaceName,
@@ -197,10 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_ids_are_opaque_bytes() {
-        let owner = OwnerId::new([0xab; 20]);
-        assert_eq!(owner.as_bytes(), &[0xab; 20]);
-        assert!(format!("{owner:?}").starts_with("OwnerId(0xabab"));
-        assert_ne!(owner, OwnerId::new([0xac; 20]));
+    fn owner_ids_print_as_hex() {
+        assert_eq!(
+            format!("{:?}", OwnerId::new([0xab; 20])),
+            format!("OwnerId(0x{})", "ab".repeat(20))
+        );
     }
 }

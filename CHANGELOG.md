@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Cleanup
+
+- Removed `arkiv_db_memory::persistent` (unused), about thirty unused public
+  items, duplicate runs of the storage contract suite, tests that compared a
+  method with its own wrapper, and charge vectors pinned in two files. The
+  workspace runs 1,194 tests, was 1,319; no pinned vector changed.
+- `FaultyStore` forwards `stage_objects` and `relabel`, as documented. A
+  panicking adoption worker no longer leaves the others waiting.
+- Documentation states the current formats and limits; finished plans, run
+  logs and nine obsolete scripts are gone or under `docs/runs/`. Open items:
+  [docs/code-quality-todo.md](docs/code-quality-todo.md).
+
 ### Receipt polling no longer starves block production
 
 - **Stored blocks are authenticated once.** `eth_getTransactionReceipt`,
@@ -204,8 +216,8 @@ protocols 3 and 4 were never released.
   (which a signed genesis requires to equal its timestamp period). Status
   advertises `rentRule`, `rentCharging`, `rentWeiPerStorageUnitDay`,
   `rentBlockPeriodMs`, `maxRentLifetimeSeconds` and `maxRentLifetimeBlocks`.
-  Profiles set `max_rent_lifetime_seconds`; the preset is
-  `arkiv-entity-v3/glm-v2@4`. A producer without a bundle uses a year.
+  Profiles set `max_rent_lifetime_seconds`. A producer without a bundle uses
+  a year.
 - Rent is bounded only by the sender's balance: a wallet's `gas × price +
   value` does not cover it. An operation risks about 1 GLM at most; a signed
   allowance is planned for when the SDK can set one.
@@ -251,7 +263,7 @@ protocols 3 and 4 were never released.
 files, prefill streams, stores and SDK clients from earlier builds are
 refused; start a fresh chain.
 
-### Entity model
+#### Entity model
 - An entity is its seven system cells plus named, typed user attributes. The
   payload and content type are gone: `$payload` and `$contentType` are no
   longer created, writable, removable, queryable or returned.
@@ -272,7 +284,7 @@ refused; start a fresh chain.
   `max_cells` between 39 and 64, so the system cells always leave room for 32
   user attributes; the default and preset profiles use 39.
 
-### JSON-RPC
+#### JSON-RPC
 - `arkiv_query` entities match the SDK's `RpcEntity`: `attributeSchema`
   entries are `{name, type, indexed}`, and `attributes` include unindexed
   attributes, `bytes` values too. `select` takes the SDK's `RpcSelect` keys;
@@ -286,12 +298,12 @@ refused; start a fresh chain.
 - Verified equality pages list every attribute of each proven entity with its
   `indexed` flag; the entity profile is `arkiv-entity-v3`.
 
-### Gas
+#### Gas
 - Storage units count every cell's name, value and two tag bytes, whatever its
   name; only indexed cells add the 128-unit posting reservation. The
   calibration in `docs/glm-gas-v1.md` is regenerated.
 
-### Genesis
+#### Genesis
 - Prefill rows use row codec 3 in both framings (`ARKPFL01 ‖ u32(3)` and
   `ARKPFL02 ‖ u32(3)`): each attribute is `CellName ‖ Cell`, with kind `01`
   indexed and `02` unindexed; no payload or content type; at most 32
@@ -299,7 +311,7 @@ refused; start a fresh chain.
 - Authored entities give each attribute exactly one typed value and an
   explicit `indexed`; `bytes`, `bytes_text` and `bytes_file` spell bytes
   values. Dataset formats are `arkiv-entities-toml-v2` and
-  `arkiv-entities-jsonl-v2`; the preset is `arkiv-entity-v3/glm-v2@2`.
+  `arkiv-entities-jsonl-v2`.
 - `arkiv-proposer create` takes `--data-file` (an unindexed `bytes`
   attribute `data`) instead of `--payload-file`.
 
@@ -336,13 +348,9 @@ start from fresh stores.
   are significant.
 - Details are in `docs/benchmarks/2026-10-11-prekucki-v1.md`.
 
-### Validation
-- 1,161 tests pass, including:
-  - BTreeMap differential tests with variable-length keys;
-  - adversarial range-bound and proof tests;
-  - tests at the 512-byte ceiling.
-- An independent adversarial review of the proof paths found nothing above
-  low severity.
+### Tests
+- Added BTreeMap differential tests with variable-length keys, adversarial
+  range-bound and proof tests, and tests at the 512-byte ceiling.
 
 ### CI
 - GitHub Actions run workspace checks (fmt, clippy, tests) and the golem-db

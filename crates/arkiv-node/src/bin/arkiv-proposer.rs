@@ -1,4 +1,5 @@
 //! Explicit signed single-proposer profile. Keys are local and never returned by HTTP.
+
 use arkiv_db::{
     decode_exact,
     durable::{DurableEngine, Options},
@@ -28,6 +29,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
 fn arguments() -> Result<(String, BTreeMap<String, String>)> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "--help".into());
@@ -43,6 +45,7 @@ fn arguments() -> Result<(String, BTreeMap<String, String>)> {
     }
     Ok((command, flags))
 }
+
 fn read_file(path: &str, cap: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|_| Error("InvalidRequest"))?;
@@ -55,12 +58,14 @@ fn read_file(path: &str, cap: usize) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
 fn signer(path: &str) -> Result<Signer> {
     let bytes = read_file(path, 128)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| Error("InvalidKey"))?;
     let raw = unhex(text.trim(), 32)?;
     Signer::from_bytes(raw.try_into().map_err(|_| Error("InvalidKey"))?)
 }
+
 fn store(path: &Path, streaming_import: bool) -> Result<Arc<RedbStore>> {
     let opened = if path.exists() {
         RedbStore::open(path, RedbConfig::default())?
@@ -78,6 +83,7 @@ fn store(path: &Path, streaming_import: bool) -> Result<Arc<RedbStore>> {
     }
     Ok(Arc::new(opened))
 }
+
 fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     use std::io::Write;
     let mut unique = [0u8; 16];
@@ -113,6 +119,7 @@ fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     }
     Ok(())
 }
+
 fn retain_public(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         if read_file(
@@ -127,6 +134,7 @@ fn retain_public(path: &Path, bytes: &[u8]) -> Result<()> {
         write_new(path, bytes, false)
     }
 }
+
 fn amount(value: &str) -> Result<alloy_primitives::U256> {
     if value.is_empty()
         || !value.bytes().all(|b| b.is_ascii_digit())
@@ -136,6 +144,7 @@ fn amount(value: &str) -> Result<alloy_primitives::U256> {
     }
     value.parse().map_err(|_| Error("InvalidAmount"))
 }
+
 fn allocations(path: &str) -> Result<arkiv_node::accounts::AccountConfig> {
     // Read pairs directly to reject duplicate JSON keys instead of silently
     // overwriting an allocation during ordinary map deserialization.
@@ -183,10 +192,12 @@ fn allocations(path: &str) -> Result<arkiv_node::accounts::AccountConfig> {
         .collect::<Result<Vec<_>>>()?;
     arkiv_node::accounts::AccountConfig::new(values).map_err(|_| Error("InvalidAllocations"))
 }
+
 fn authoring_error(error: String) -> Error {
     eprintln!("{error}");
     Error("InvalidGenesisBundle")
 }
+
 enum PrefillSource {
     Small(Vec<u8>),
     Streaming {
@@ -194,9 +205,11 @@ enum PrefillSource {
         verified: arkiv_node::genesis_streaming::VerifiedStream,
     },
 }
+
 fn streaming(genesis: &SignedGenesis) -> bool {
     genesis.prefill.as_ref().is_some_and(|p| p.is_streaming())
 }
+
 fn load_bundle(path: &Path) -> Result<(SignedGenesis, PathBuf)> {
     let genesis: SignedGenesis = decode_exact(&read_file(
         path.join("genesis.bin")
@@ -215,6 +228,7 @@ fn load_bundle(path: &Path) -> Result<(SignedGenesis, PathBuf)> {
     }
     Ok((genesis, input))
 }
+
 fn local_prefill(
     path: &Path,
     genesis: &SignedGenesis,
@@ -272,6 +286,7 @@ fn local_prefill(
     retain_public(&target, &stream)?;
     Ok(Some(PrefillSource::Small(stream)))
 }
+
 #[allow(clippy::too_many_arguments)]
 fn create_host(
     state: Arc<RedbStore>,
@@ -338,6 +353,7 @@ fn create_host(
         ),
     }
 }
+
 /// `--genesis-install adopt`: install a streaming genesis by verifying and
 /// relabelling the staged store in place and renaming it over the headless
 /// `state` (see `arkiv_node::genesis_adopt`), instead of copying it.
@@ -419,6 +435,7 @@ fn adopt_host(
     }
     Ok(host)
 }
+
 fn attach_prefill(host: &mut Host, prefill: Option<PrefillSource>) {
     match prefill {
         Some(PrefillSource::Small(bytes)) => host.prefill_stream = Some(bytes),
@@ -426,6 +443,7 @@ fn attach_prefill(host: &mut Host, prefill: Option<PrefillSource>) {
         None => {}
     }
 }
+
 async fn download_prefill(
     client: &reqwest::Client,
     peer: &str,
@@ -505,6 +523,7 @@ async fn download_prefill(
         .map_err(|_| Error("StorageUnavailable"))?;
     Ok(())
 }
+
 fn genesis_command() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let [command, source, rest @ ..] = args.as_slice() else {
@@ -525,9 +544,10 @@ fn genesis_command() -> Result<()> {
                 "--sponsor" if sponsor.is_none() => sponsor = Some(value),
                 "--state-out" if state_out.is_none() => state_out = Some(value),
                 "--batch-bytes" => {
-                    eprintln!(
-                        "--batch-bytes is deprecated: bulk genesis uses fixed bounded sort buffers; this option only controls progress sampling."
-                    );
+                    eprintln!(concat!(
+                        "--batch-bytes is deprecated: bulk genesis uses fixed bounded sort ",
+                        "buffers; this option only controls progress sampling.",
+                    ));
                     batch_bytes = value.parse().map_err(|_| Error("InvalidRequest"))?
                 }
                 _ => return Err(Error("InvalidRequest")),
@@ -586,14 +606,29 @@ fn genesis_command() -> Result<()> {
         }
     }
     let result = match command.as_str() {
-        "lock" if out.is_none() && !locked => arkiv_node::genesis_authoring::lock(Path::new(source), refresh),
-        "build" if out.is_some() && !refresh => arkiv_node::genesis_authoring::build(Path::new(source), Path::new(out.unwrap()), locked),
-        "verify" if out.is_none() && !locked && !refresh => arkiv_node::genesis_authoring::verify(Path::new(source)),
-        _ => { eprintln!("genesis lock CHAIN [--refresh] | genesis build CHAIN --out BUNDLE --locked | genesis verify BUNDLE | genesis stream-build BASE_GENESIS --prefill FILE --out BUNDLE --sponsor 0xADDRESS [--state-out DIR] | genesis stream-verify BUNDLE"); return Err(Error("InvalidRequest")); }
-    }.map_err(authoring_error)?;
+        "lock" if out.is_none() && !locked => {
+            arkiv_node::genesis_authoring::lock(Path::new(source), refresh)
+        }
+        "build" if out.is_some() && !refresh => {
+            arkiv_node::genesis_authoring::build(Path::new(source), Path::new(out.unwrap()), locked)
+        }
+        "verify" if out.is_none() && !locked && !refresh => {
+            arkiv_node::genesis_authoring::verify(Path::new(source))
+        }
+        _ => {
+            eprintln!(concat!(
+                "genesis lock CHAIN [--refresh] | genesis build CHAIN --out BUNDLE --locked | ",
+                "genesis verify BUNDLE | genesis stream-build BASE_GENESIS --prefill FILE ",
+                "--out BUNDLE --sponsor 0xADDRESS [--state-out DIR] | genesis stream-verify BUNDLE",
+            ));
+            return Err(Error("InvalidRequest"));
+        }
+    }
+    .map_err(authoring_error)?;
     println!("{result}");
     Ok(())
 }
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -601,6 +636,7 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
 async fn run() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("genesis") {
         return genesis_command();
@@ -611,14 +647,75 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if command == "--help" {
-        println!(
-            "arkiv-proposer genesis lock CHAIN [--refresh]\narkiv-proposer genesis build CHAIN --out BUNDLE --locked\narkiv-proposer genesis verify BUNDLE\narkiv-proposer genesis stream-build BASE_GENESIS --prefill FILE --out BUNDLE --sponsor 0xADDRESS [--state-out DIR]\narkiv-proposer genesis stream-verify BUNDLE\narkiv-proposer keygen --out FILE\narkiv-proposer producer --run-dir DIR --key-file FILE [--listen 127.0.0.1:9500] [--private-listen 127.0.0.1:9501] [--start paused|running] [--source-id UUID] [--chain-id 9001] [--block-period-ms 1000] [--state-retention archive|N] [--read-concurrency 4] [--read-deadline-secs 30] [--read-max-groups N] [--read-max-literals N] (--allocations-file FILE | --bundle BUNDLE [--prebuilt-state DIR])\narkiv-proposer full|light --run-dir DIR --peer URL --genesis-hash 0xHEX --proposer 0xADDRESS --chain-id N --source-id UUID --run-id HEX32 [--replication-peer URL] [--bundle BUNDLE] [--state-retention archive|N (full only)] [--read-concurrency 4] [--read-deadline-secs 30] [--read-max-groups N] [--read-max-literals N]\narkiv-proposer sign --key-file FILE --genesis-file FILE --tx-file FILE --nonce N --out FILE\narkiv-proposer create --key-file FILE --genesis-file FILE --nonce N --request-id 0xHEX64 --data-file FILE --out FILE [--salt 0] [--gas-limit 1000000] [--lifetime-blocks 17280]\narkiv-proposer transfer --key-file FILE --genesis-file FILE --nonce N --request-id 0xHEX64 --to 0xADDRESS --amount-wei DECIMAL --out FILE [--gas-limit 21000]\narkiv-proposer submit --peer URL --transaction-file FILE\nOptional private Prometheus exporter: --metrics-listen 127.0.0.1:9600 [--metrics-interval-secs 300] (minimum 10). Metrics use rogue_one_ prefix.\nPrivate listener/full replication use ARKIV_PROPOSER_TOKEN (at least 32 bytes). Producer starts paused. Every chain runs the glm-v2 gas profile with funded accounts. A bundle chain creates the entities namespace (and its prefill) at height 0; a chain created from --allocations-file creates it with the proposer's bootstrap transaction in block 1. Each run exports public genesis.bin/certificate.bin. stream-build --state-out keeps its verified private state; a fresh producer given it with --prebuilt-state moves it into the run directory and installs it without rebuilding (it is ignored once the node is initialized). create writes FILE as an unindexed bytes attribute `data` (at most 128 KiB) beside an indexed u64 `group` = 1. Sign/create files use native canonical bytes; submit polls pending/included status. Single-proposer authentication supplies no consensus or finality. Bodies are retained in history.redb separately from node.redb. --state-retention N serves state (balances, proofs, queries, receipts/logs) only for the head and the N snapshots before it and refuses older heights with HistoryPruned; archive (default) serves every height. Nothing is deleted yet, and a pruned floor never moves back. Entity queries and counts, proofs and the state tree explorer run outside the node lock against a pinned snapshot: at most --read-concurrency (1-64) at once, others refused with ServerBusy (HTTP 429), each stopped after --read-deadline-secs (1-3600) with ReadDeadlineExceeded (HTTP 503) or when its client disconnects. Entity queries and counts are planned: each AND-group is driven by its smallest index posting, so clause order does not change their cost, and counts use stored posting sizes. --read-max-groups (1-64) and --read-max-literals (1-256) raise the genesis query bounds for these reads only (default: the genesis values); larger queries still use the bounded scan fallback (queries) or are refused (counts)."
-        );
-        println!(
-            "producer --genesis-install copy|adopt: how a fresh producer installs a streaming bundle's staged genesis state. copy (default) copies every reachable object into a new node.redb. adopt reads and verifies the same objects without writing them, relabels the private staged store in place and renames it to node.redb, so no second copy of the state is written or stored; it consumes the run directory's prefill-work store, an interrupted adoption resumes only with adopt, and the option is ignored once the node is initialized."
-        );
+        println!(concat!(
+            "arkiv-proposer genesis lock CHAIN [--refresh]\n",
+            "arkiv-proposer genesis build CHAIN --out BUNDLE --locked\n",
+            "arkiv-proposer genesis verify BUNDLE\n",
+            "arkiv-proposer genesis stream-build BASE_GENESIS --prefill FILE --out BUNDLE ",
+            "--sponsor 0xADDRESS [--state-out DIR]\n",
+            "arkiv-proposer genesis stream-verify BUNDLE\n",
+            "arkiv-proposer keygen --out FILE\n",
+            "arkiv-proposer producer --run-dir DIR --key-file FILE [--listen 127.0.0.1:9500] ",
+            "[--private-listen 127.0.0.1:9501] [--start paused|running] [--source-id UUID] ",
+            "[--chain-id 9001] [--block-period-ms 1000] [--state-retention archive|N] ",
+            "[--read-concurrency 4] [--read-deadline-secs 30] [--read-max-groups N] ",
+            "[--read-max-literals N] (--allocations-file FILE | --bundle BUNDLE ",
+            "[--prebuilt-state DIR])\n",
+            "arkiv-proposer full|light --run-dir DIR --peer URL --genesis-hash 0xHEX ",
+            "--proposer 0xADDRESS --chain-id N --source-id UUID --run-id HEX32 ",
+            "[--replication-peer URL] [--bundle BUNDLE] [--state-retention archive|N (full ",
+            "only)] [--read-concurrency 4] [--read-deadline-secs 30] [--read-max-groups N] ",
+            "[--read-max-literals N]\n",
+            "arkiv-proposer sign --key-file FILE --genesis-file FILE --tx-file FILE --nonce N ",
+            "--out FILE\n",
+            "arkiv-proposer create --key-file FILE --genesis-file FILE --nonce N --request-id ",
+            "0xHEX64 --data-file FILE --out FILE [--salt 0] [--gas-limit 1000000] ",
+            "[--lifetime-blocks 17280]\n",
+            "arkiv-proposer transfer --key-file FILE --genesis-file FILE --nonce N ",
+            "--request-id 0xHEX64 --to 0xADDRESS --amount-wei DECIMAL --out FILE [--gas-limit ",
+            "21000]\n",
+            "arkiv-proposer submit --peer URL --transaction-file FILE\n",
+            "Optional private Prometheus exporter: --metrics-listen 127.0.0.1:9600 ",
+            "[--metrics-interval-secs 300] (minimum 10). Metrics use rogue_one_ prefix.\n",
+            "Private listener/full replication use ARKIV_PROPOSER_TOKEN (at least 32 bytes). ",
+            "Producer starts paused. Every chain runs the glm-v2 gas profile with funded ",
+            "accounts. A bundle chain creates the entities namespace (and its prefill) at ",
+            "height 0; a chain created from --allocations-file creates it with the proposer's ",
+            "bootstrap transaction in block 1. Each run exports public ",
+            "genesis.bin/certificate.bin. stream-build --state-out keeps its verified private ",
+            "state; a fresh producer given it with --prebuilt-state moves it into the run ",
+            "directory and installs it without rebuilding (it is ignored once the node is ",
+            "initialized). create writes FILE as an unindexed bytes attribute `data` (at most ",
+            "128 KiB) beside an indexed u64 `group` = 1. Sign/create files use native ",
+            "canonical bytes; submit polls pending/included status. Single-proposer ",
+            "authentication supplies no consensus or finality. Bodies are retained in ",
+            "history.redb separately from node.redb. --state-retention N serves state ",
+            "(balances, proofs, queries, receipts/logs) only for the head and the N snapshots ",
+            "before it and refuses older heights with HistoryPruned; archive (default) serves ",
+            "every height. Nothing is deleted yet, and a pruned floor never moves back. ",
+            "Entity queries and counts, proofs and the state tree explorer run outside the ",
+            "node lock against a pinned snapshot: at most --read-concurrency (1-64) at once, ",
+            "others refused with ServerBusy (HTTP 429), each stopped after ",
+            "--read-deadline-secs (1-3600) with ReadDeadlineExceeded (HTTP 503) or when its ",
+            "client disconnects. Entity queries and counts are planned: each AND-group is ",
+            "driven by its smallest index posting, so clause order does not change their ",
+            "cost, and counts use stored posting sizes. --read-max-groups (1-64) and ",
+            "--read-max-literals (1-256) raise the genesis query bounds for these reads only ",
+            "(default: the genesis values); larger queries still use the bounded scan ",
+            "fallback (queries) or are refused (counts).",
+        ));
+        println!(concat!(
+            "producer --genesis-install copy|adopt: how a fresh producer installs a streaming ",
+            "bundle's staged genesis state. copy (default) copies every reachable object into ",
+            "a new node.redb. adopt reads and verifies the same objects without writing them, ",
+            "relabels the private staged store in place and renames it to node.redb, so no ",
+            "second copy of the state is written or stored; it consumes the run directory's ",
+            "prefill-work store, an interrupted adoption resumes only with adopt, and the ",
+            "option is ignored once the node is initialized.",
+        ));
         return Ok(());
     }
+
     const FLAGS: &[&str] = &[
         "--metrics-listen",
         "--metrics-interval-secs",
@@ -933,7 +1030,10 @@ async fn run() -> Result<()> {
             if args.contains_key("--prebuilt-state") {
                 eprintln!(
                     "{}",
-                    serde_json::json!({"event": "prefill_prebuilt_install", "result": "initialized"})
+                    serde_json::json!({
+                        "event": "prefill_prebuilt_install",
+                        "result": "initialized",
+                    })
                 );
             }
             let history = History::open(history_store, genesis.hash())?;
@@ -1006,7 +1106,10 @@ async fn run() -> Result<()> {
                 .map_err(authoring_error)?;
                 eprintln!(
                     "{}",
-                    serde_json::json!({"event": "prefill_prebuilt_install", "result": installed.as_str()})
+                    serde_json::json!({
+                        "event": "prefill_prebuilt_install",
+                        "result": installed.as_str(),
+                    })
                 );
             }
             let prefill =
@@ -1286,6 +1389,7 @@ struct ProductionCadence {
     next: tokio::time::Instant,
     period: Duration,
 }
+
 impl ProductionCadence {
     fn new(now: tokio::time::Instant, period: Duration) -> Self {
         Self {

@@ -17,11 +17,6 @@ impl CodecError {
             reason: reason.into(),
         }
     }
-
-    /// Returns the description given at construction.
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
 }
 
 impl fmt::Display for CodecError {

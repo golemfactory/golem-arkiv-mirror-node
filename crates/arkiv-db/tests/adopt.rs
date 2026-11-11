@@ -258,7 +258,7 @@ fn only_a_single_exact_bulk_publication_is_eligible() {
         error.to_string().contains("single height-zero publication"),
         "{error}"
     );
-    let stage = DurableEngine::open(store.clone(), original.clone(), Options::default()).unwrap();
+    let stage = DurableEngine::open(store, original, Options::default()).unwrap();
     assert_eq!(stage.head().sequence(), 3);
 
     // Its compaction is a height-zero engine store, but it keeps the import
@@ -275,13 +275,7 @@ fn only_a_single_exact_bulk_publication_is_eligible() {
     );
     assert_eq!(compact.import_checkpoint(8).unwrap(), Some(vec![3]));
     let outcome = compact
-        .adopt_staged_simulator(
-            genesis.clone(),
-            Options::default(),
-            identity.clone(),
-            packet.clone(),
-            2,
-        )
+        .adopt_staged_simulator(genesis, Options::default(), identity, packet, 2)
         .unwrap();
     match outcome {
         Publication::NotCommitted(error) => {
@@ -289,12 +283,7 @@ fn only_a_single_exact_bulk_publication_is_eligible() {
         }
         other => panic!("{other:?}"),
     }
-    let compact = DurableEngine::open(
-        compact_store.clone(),
-        staged_genesis.clone(),
-        Options::default(),
-    )
-    .unwrap();
+    let compact = DurableEngine::open(compact_store, staged_genesis, Options::default()).unwrap();
     assert_eq!(compact.import_checkpoint(8).unwrap(), Some(vec![3]));
 
     // A genesis, identity or packet for another state never relabels.
@@ -315,10 +304,9 @@ fn only_a_single_exact_bulk_publication_is_eligible() {
         (genesis.clone(), other_identity, packet.clone()),
         (genesis.clone(), identity.clone(), other_packet),
     ] {
-        let error = reopen()
+        reopen()
             .adopt_staged_simulator(genesis, Options::default(), identity, packet, 2)
             .unwrap_err();
-        assert!(!error.to_string().is_empty());
         assert_eq!(
             DurableEngine::storage_profile(bulk_store.as_ref()).unwrap(),
             Some(StorageProfile::Engine)

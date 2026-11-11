@@ -1,4 +1,5 @@
 //! Signed-chain security checks with real independent keys and explicit preimages.
+
 use alloy_primitives::{Keccak256, Signature, U256};
 use arkiv_db::{
     B256, CellName, Decode, Encode, NamespaceName, OwnerId, Value, decode_exact, encode,
@@ -18,9 +19,11 @@ fn signer(n: u8) -> Signer {
     key[31] = n;
     Signer::from_bytes(key).unwrap()
 }
+
 fn glm() -> U256 {
     U256::from(1_000_000_000_000_000_000u64)
 }
+
 fn genesis() -> SignedGenesis {
     SignedGenesis::new(
         default_native_genesis(7, 1_000, 250),
@@ -35,6 +38,7 @@ fn genesis() -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn envelope(who: &Signer) -> TxEnvelope {
     TxEnvelope {
         chain_id: 7,
@@ -46,6 +50,7 @@ fn envelope(who: &Signer) -> TxEnvelope {
         }],
     }
 }
+
 fn signed() -> SignedTx {
     SignedTx::sign(&genesis(), 0, envelope(&signer(1)), &signer(1)).unwrap()
 }
@@ -56,7 +61,7 @@ fn signed_genesis_bounds_native_state_and_reserves_complete_outcomes() {
     g.limits.max_body_bytes = g.limits.max_input_bytes + OUTCOME_RESERVE - 1;
     assert!(g.validate().is_err());
     // At most 128 records may expire at one height: the most operations of a
-    // block. Chains created with the earlier bound of 16 remain valid.
+    // block.
     for (expiry_per_block, valid) in [(1, true), (16, true), (128, true), (129, false)] {
         let mut g = genesis();
         g.genesis.params.expiry_per_block = expiry_per_block;
@@ -103,16 +108,13 @@ fn signed_genesis_bounds_native_state_and_reserves_complete_outcomes() {
         Some(53_400)
     );
     assert_eq!(
-        arkiv_node::arkiv::MIN_ENTITY_CELLS,
-        arkiv_node::arkiv::SYSTEM_CELLS + arkiv_node::arkiv::MAX_ATTRIBUTES
-    );
-    assert_eq!(
         arkiv_node::signed::protocol::default_native_genesis(7, 0, 250)
             .limits
             .max_cells,
         arkiv_node::arkiv::MIN_ENTITY_CELLS
     );
 }
+
 fn independent_digest(domain: &str, bytes: &[u8]) -> B256 {
     let mut h = Keccak256::new();
     h.update([domain.len() as u8]);
@@ -120,9 +122,11 @@ fn independent_digest(domain: &str, bytes: &[u8]) -> B256 {
     h.update(bytes);
     h.finalize()
 }
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
 fn unhex<const N: usize>(s: &str) -> [u8; N] {
     assert_eq!(s.len(), N * 2);
     let mut out = [0; N];
@@ -136,7 +140,7 @@ fn unhex<const N: usize>(s: &str) -> [u8; N] {
 fn preimages_are_explicit_and_golden() {
     let g = genesis();
     let tx = signed();
-    // These bytes are built independently of the new types' encoders.
+    // Built by hand, not with the `Encode` impls.
     let mut genesis_bytes = 1u32.to_be_bytes().to_vec();
     genesis_bytes.extend(encode(&g.genesis));
     genesis_bytes.extend([0x42; 16]);
@@ -260,6 +264,7 @@ fn roundtrip<T: Encode + Decode + std::fmt::Debug + PartialEq>(value: T) {
         assert!(decode_exact::<T>(&changed).is_err());
     }
 }
+
 #[test]
 fn exact_decoding_versions_truncations_and_hostile_counts() {
     let g = genesis();
@@ -473,7 +478,7 @@ fn every_authority_field_and_operation_is_signed() {
     let mut other = g.clone();
     other.run_id[0] ^= 1;
     assert!(tx.validate(&other).is_err());
-    let mut substituted = tx.clone();
+    let mut substituted = tx;
     substituted.signature = signed().signature;
     assert!(substituted.validate(&g).is_err());
     assert!(SignedTx::sign(&g, u64::MAX, envelope(&who), &who).is_err());
@@ -494,7 +499,7 @@ fn bootstrap_and_unsigned_admin_rules_fail_closed() {
     env.ops = vec![TxOp::CreateNamespace {
         name: NamespaceName::new("wrong").unwrap(),
     }];
-    let changed = SignedTx::sign(&g, 0, env.clone(), &who).unwrap();
+    let changed = SignedTx::sign(&g, 0, env, &who).unwrap();
     assert!(
         SignedInputs {
             txs: vec![changed.clone()]

@@ -37,20 +37,18 @@ use arkiv_db::{
 
 /// Version of the block format: the layouts and tag tables of this module.
 /// Headers carry it, so a decoder never reinterprets another layout.
-/// Version 2 carries entity attributes as cells (`kind ‖ value`) in
-/// `ArkivOperation`; version 1 carried bare values. Version 5 adds the rent
-/// clock ([`ChainParams::block_period_ms`] and
+/// Version 5 carries entity attributes as cells (`kind ‖ value`) in
+/// `ArkivOperation`, the rent clock ([`ChainParams::block_period_ms`] and
 /// [`ChainParams::max_rent_lifetime_seconds`]) and the per-block storage cap
-/// ([`ChainParams::max_new_storage_units_per_block`]) to the genesis and each
-/// transaction's burned rent ([`TxOutcome::rent_wei`]) to the outcomes.
-/// Versions 3 and 4 (earlier drafts of these) were never released.
+/// ([`ChainParams::max_new_storage_units_per_block`]) in the genesis, and
+/// each transaction's burned rent ([`TxOutcome::rent_wei`]) in the outcomes.
 pub const FORMAT_VERSION: u32 = 5;
 
-/// Version of the execution rules a genesis selects. Version 2 is the
-/// user-defined-columns entity model: per-attribute indexed flags, user
-/// `bytes` and no payload or content type ([`crate::arkiv`]). Version 5
-/// admits live permanent entities (only an owner extends one beyond a rent
-/// cap ahead, permanence included), caps the rent of any lifetime at
+/// Version of the execution rules a genesis selects. Version 5 is the
+/// user-defined-columns entity model ([`crate::arkiv`]: per-attribute
+/// indexed flags and user `bytes`). It admits live permanent entities (only
+/// an owner extends one beyond a rent cap ahead, permanence included), caps
+/// the rent of any lifetime at
 /// [`ChainParams::max_rent_lifetime_seconds`], charges rent in GLM per
 /// second, debited from the sender outside the gas budget
 /// ([`crate::gas::rent`]), and bounds the storage units a block may add
@@ -128,9 +126,6 @@ const EXPIRY_TOO_FAR: u8 = 3;
 
 /// Encoded size of a [`PriceSchedule`]: id, class count, 31 weights.
 const SCHEDULE_LEN: usize = 4 + 4 + 8 * 31;
-
-// ---------------------------------------------------------------------------
-// Genesis and chain parameters.
 
 /// Chain-wide execution parameters, fixed at genesis.
 ///
@@ -242,7 +237,6 @@ pub struct Genesis {
     pub limits: Limits,
     /// The pricing schedule in force at height 1.
     pub pricing: PriceSchedule,
-    /// Execution parameters.
     pub params: ChainParams,
     /// Actors whose admin inputs are valid, in any order.
     pub admins: Vec<OwnerId>,
@@ -303,7 +297,7 @@ impl Encode for Genesis {
 
 impl Decode for Genesis {
     const MIN_ENCODED_LEN: usize =
-        4 + 4 + 8 + 8 + 48 + SCHEDULE_LEN + ChainParams::MIN_ENCODED_LEN + 4;
+        4 + 4 + 8 + 8 + Limits::MIN_ENCODED_LEN + SCHEDULE_LEN + ChainParams::MIN_ENCODED_LEN + 4;
 
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let format_version = decoder.u32()?;
@@ -333,13 +327,9 @@ impl Decode for Genesis {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Headers.
-
 /// A block header. The block hash is the digest of its encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
-    /// Chain identity.
     pub chain_id: u64,
     /// Block height; the genesis block is 0.
     pub height: u64,
@@ -402,9 +392,6 @@ impl Decode for Header {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Block inputs.
-
 /// An admin action. Admin inputs run before expiry and user transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdminAction {
@@ -447,7 +434,6 @@ pub struct AdminInput {
     pub actor: OwnerId,
     /// Request id, unique per (chain, actor) among admin inputs.
     pub request_id: RequestId,
-    /// What to do.
     pub action: AdminAction,
 }
 
@@ -518,15 +504,15 @@ impl Decode for Expiry {
     }
 }
 
-/// One user operation of a transaction: an engine write plus, for record
-/// creations and patches, an optional expiry the host resolves and injects
-/// as the `$expiresAt` attribute.
+/// One user operation of a transaction: a native transfer, an Arkiv entity
+/// operation, or an engine write plus, for record creations and patches, an
+/// optional expiry the host resolves and injects as the `$expiresAt`
+/// attribute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxOp {
     /// Transfer native GLM base units; executes only on chains with
     /// accounts.
     Transfer {
-        /// The recipient.
         to: OwnerId,
         /// Amount in base units.
         amount: alloy_primitives::U256,
@@ -535,7 +521,6 @@ pub enum TxOp {
     Arkiv {
         /// The namespace holding the entity.
         namespace: NamespaceId,
-        /// The operation.
         operation: crate::arkiv::ArkivOperation,
     },
     /// Create a namespace owned by the actor.
@@ -545,34 +530,27 @@ pub enum TxOp {
     },
     /// Transfer a namespace the actor owns.
     TransferNamespace {
-        /// The namespace.
         namespace: NamespaceId,
         /// The revision the request was built against.
         expected_revision: Revision,
-        /// The new owner.
         new_owner: OwnerId,
     },
     /// Insert or replace a raw entry.
     Put {
-        /// The namespace.
         namespace: NamespaceId,
         /// Raw key, at most 20 bytes.
         key: Vec<u8>,
-        /// Value.
         value: Vec<u8>,
     },
     /// Remove a raw entry.
     Delete {
-        /// The namespace.
         namespace: NamespaceId,
         /// Raw key, at most 20 bytes.
         key: Vec<u8>,
     },
     /// Create a typed record.
     CreateRecord {
-        /// The namespace.
         namespace: NamespaceId,
-        /// Record key.
         key: RecordKey,
         /// User cells; no name may start with `$`.
         cells: Vec<(CellName, Cell)>,
@@ -582,9 +560,7 @@ pub enum TxOp {
     /// Patch a typed record; with an expiry and nothing else it only
     /// extends the record's lifetime (expiry may never be shortened).
     PatchRecord {
-        /// The namespace.
         namespace: NamespaceId,
-        /// Record key.
         key: RecordKey,
         /// Cells to set; no name may start with `$`.
         set: Vec<(CellName, Cell)>,
@@ -595,15 +571,14 @@ pub enum TxOp {
     },
     /// Delete a typed record.
     DeleteRecord {
-        /// The namespace.
         namespace: NamespaceId,
-        /// Record key.
         key: RecordKey,
     },
 }
 
 impl TxOp {
-    /// The namespace the operation addresses; `None` for a creation.
+    /// The namespace the operation addresses; `None` for a namespace
+    /// creation and a native transfer.
     pub const fn namespace(&self) -> Option<NamespaceId> {
         match self {
             Self::Arkiv { namespace, .. } => Some(*namespace),
@@ -915,9 +890,6 @@ impl Decode for BlockInputs {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Block outcomes.
-
 /// Why an admin input was rejected. Nothing changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminRejection {
@@ -1167,24 +1139,17 @@ pub enum OpOutcome {
         receipt: Receipt,
     },
     /// Applied, and the transaction committed.
-    Applied {
-        /// The change.
-        effect: Effect,
-        /// Its write receipt.
-        receipt: Receipt,
-    },
+    Applied { effect: Effect, receipt: Receipt },
     /// Applied, then undone because a later operation of the transaction
     /// failed. The receipt and its units remain.
     RolledBack {
         /// The change that was undone.
         effect: Effect,
-        /// Its write receipt.
         receipt: Receipt,
     },
     /// The engine rejected the operation after charging it; the
     /// transaction failed here.
     Rejected {
-        /// Why.
         reason: Rejection,
         /// The write receipt of the charged work.
         receipt: Receipt,
@@ -1192,16 +1157,10 @@ pub enum OpOutcome {
     /// The engine rejected the operation at admission, before any charge.
     /// Unreachable for statically valid operations; kept so the format can
     /// record it.
-    AdmissionRejected {
-        /// Why.
-        reason: Rejection,
-    },
+    AdmissionRejected { reason: Rejection },
     /// The host refused the operation before the engine saw it; the
     /// transaction failed here.
-    HostRejected {
-        /// Why.
-        fault: HostFault,
-    },
+    HostRejected { fault: HostFault },
     /// Not executed because an earlier operation of the transaction failed.
     NotExecuted,
 }
@@ -1337,7 +1296,6 @@ impl Decode for TxStatus {
 /// What happened to one transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxOutcome {
-    /// Committed or failed.
     pub status: TxStatus,
     /// One outcome per operation, in order.
     pub ops: Vec<OpOutcome>,
@@ -1423,11 +1381,8 @@ impl Decode for BlockOutcomes {
 /// The header commits to both through their digests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
-    /// The header.
     pub header: Header,
-    /// The recorded inputs.
     pub inputs: BlockInputs,
-    /// The recorded outcomes.
     pub outcomes: BlockOutcomes,
 }
 

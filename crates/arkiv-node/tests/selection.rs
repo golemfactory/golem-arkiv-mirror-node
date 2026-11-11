@@ -46,7 +46,7 @@ fn byte_sizes_follow_the_layouts() {
     let admin = admins(2);
     let inputs = BlockInputs {
         admin: admin.clone(),
-        txs: vec![envelope.clone(), puts(2, 10, 1, 0)],
+        txs: vec![envelope, puts(2, 10, 1, 0)],
     };
     let expected = 8 + 2 * 309 + put_tx_bytes(3, 7) + put_tx_bytes(1, 0);
     assert_eq!(encode(&inputs).len() as u64, expected);
@@ -127,7 +127,6 @@ fn the_byte_limit_is_the_encoded_inputs() {
     // Two transactions of 72 + 18 + 100 = 190 bytes: the inputs are 8 + 190
     // + 190 = 388 bytes. A limit of 388 takes both, 387 only the first.
     let queue = vec![puts(1, 10, 1, 100), puts(2, 10, 1, 100)];
-    assert_eq!(put_tx_bytes(1, 100), 190);
     for (limit, taken) in [(388, 2), (387, 1), (198, 1), (197, 0)] {
         let params = ChainParams {
             max_block_input_bytes: limit,

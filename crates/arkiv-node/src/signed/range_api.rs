@@ -1,4 +1,5 @@
-//! Small, unpaged range-proof transport. The text query language is unchanged.
+//! Small, unpaged range-proof transport.
+
 use super::{Node, Shared, fetch, parse, snapshot, with_node};
 use crate::{
     signed::{Error, Result},
@@ -165,22 +166,34 @@ pub(super) async fn handle(
         let inspection = if inspect {
             let mut caps = crate::simulator::wire::range_proof_limits()?;
             caps.max_proof_bytes = crate::simulator::inspection::INSPECT_PROOF_CAP;
-            let (_,trace) = arkiv_db::proof::verify_range_inspected(
-                &request, &bytes, caps, genesis.genesis.limits,
+            let (_, trace) = arkiv_db::proof::verify_range_inspected(
+                &request,
+                &bytes,
+                caps,
+                genesis.genesis.limits,
             )?;
             Some(trace)
-        } else { None };
+        } else {
+            None
+        };
         let rows = verified
             .rows
             .into_iter()
             .map(|row| crate::simulator::metadata::record_change(request.query.namespace, row))
             .collect::<Result<Vec<_>>>()?;
-        let mut result = json!({"verification":"proof verified against authenticated single-proposer header",
-            "verificationStatus":{"status":"verified","profile":PROFILE},
-            "identity":identity,"query":query,"snapshot":snapshot(&header),
-            "certificateBytes":pack(&certificate),
-            "rows":rows,"complete":true,"proofProfile":PROFILE,
-            "termCount":verified.term_count,"postingCount":verified.posting_count});
+        let mut result = json!({
+            "verification": "proof verified against authenticated single-proposer header",
+            "verificationStatus": {"status": "verified", "profile": PROFILE},
+            "identity": identity,
+            "query": query,
+            "snapshot": snapshot(&header),
+            "certificateBytes": pack(&certificate),
+            "rows": rows,
+            "complete": true,
+            "proofProfile": PROFILE,
+            "termCount": verified.term_count,
+            "postingCount": verified.posting_count,
+        });
         if let Some(inspection) = inspection {
             result["canonicalRequest"] = json!(pack(&request));
             result["canonicalProof"] = json!(hex(&bytes));

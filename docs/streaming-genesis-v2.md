@@ -9,8 +9,8 @@ zero. See [the bulk construction design](bulk-prefill.md).
 ## Build, verify and start
 
 First convert a completed processor bundle: a v4 (UDC) bundle with
-[the v4 converter](sourcify-v4-prefill.md) (row codec 3); the older
-[Sourcify adapter](sourcify-prefill-converter.md) emits the refused codec 2. Preserve the original source.
+[the v4 converter](sourcify-v4-prefill.md), which emits row codec 3, the only
+one the node accepts. Preserve the original source.
 Create a base `genesis.bin` using the existing TOML genesis commands; its
 allocations must fund the selected rent sponsor, and its proposer must match the
 key used to start the producer. The streaming builder discards the base's old
@@ -102,14 +102,38 @@ type cells, the seven system cells leave all 32 to the user. Indexed
 attributes (cell kind `01`) are posted; unindexed ones (`02`, and every
 `bytes` value) are stored only. A row's `bytes` values hold at most 128 KiB
 together.
-Lifetime is finite in a version-2 launch. A version-4 launch, built on a base
-genesis authored with `[prefill] allow_permanent = true`, also admits rows whose
-expiry is the `u64::MAX` never-expires sentinel. They are created permanent,
-never enter the expiry schedule (the per-height capacity does not apply) and
-prepay no rent, while their storage units still count. Finite rows are built and
-charged exactly as in version 2. The version and recipe domain enter chain
-identity; the stream format and bulk algorithm are unchanged. See
-[unlimited expiry](sourcify-prefill-converter.md#unlimited-expiry---expiry-policy-unlimited).
+
+## Row expiry
+
+A row's expiry is a block height or the `u64::MAX` never-expires sentinel.
+
+**Finite rows.** The sponsor prepays each row's rent at genesis under the
+chain's rent rule, capped like a live create: a row at or beyond the rent cap
+pays the cap (see [genesis bundle](genesis-bundle-v1.md#state-rent-and-first-live-block)),
+so a height far in the future costs no more than a year. A height holds at
+most the genesis `expiry_per_block` rows; prefill rows over that capacity are
+refused, not moved to a later height as live writes are.
+[`examples/far-future-prefill`](examples/far-future-prefill) is a base genesis
+for such a stream.
+
+**Permanent rows.** A base genesis authored with
+`[prefill] allow_permanent = true`
+([`examples/unlimited-prefill`](examples/unlimited-prefill)) compiles to prefill
+launch version 3, and `genesis stream-build` on it commits version 4. Only such
+a launch admits `u64::MAX` rows; a finite base (version 2) rejects the stream
+before any state is built, with an error naming `allow_permanent`. A permanent
+row is created with `$expiresAt = u64::MAX`, never enters the expiry schedule
+(the per-height capacity does not apply and the expiry sweep never visits it)
+and prepays no rent, so an all-permanent prefill burns 0. Its storage units
+still count toward `storageUnits` and the declared limit. Finite rows in the
+same stream are scheduled and charged exactly as in version 2. RPC reads return
+`expiresAt: "0xffffffffffffffff"`; `/signed/v1` query proofs return the decimal
+string.
+
+The launch version and recipe domain enter the genesis hash, so the policy is
+part of chain identity; the stream format and bulk algorithm are the same.
+After genesis a permanent row is an ordinary permanent entity under the
+[live rent rules](glm-gas-v1.md).
 
 ## Recovery and publication
 
@@ -212,46 +236,6 @@ started without `--prebuilt-state`. The prebuilt directory is private local
 state. Never distribute it as part of a bundle, and never give it to a follower;
 the follower roles refuse the option.
 
-### Build-once measurements, 2026-10-20
-
-These are single sequential runs of one release binary on the shared host, at
-`nice 19`/idle I/O priority while the full Ethereum producer was running beside
-them. There was no cgroup cap; the free-space reserve was 80 GiB. They are not
-repeated controlled trials.
-
-The 263-entity Sourcify fixture went through `scripts/run-full-prefill.py`
-(convert, stream-build, producer ready) twice: in default build-once mode and
-with `--rebuild-genesis-in-producer`. Both produced identical bundle reports and
-heads, with genesis `0x12832bb2…2281` and state root `0x7dd55378…ac27`. All 263
-entities, and the 16 `kind = str('verified_contract')` keys, read back through
-`arkiv_query` identically. The build-once producer logged one `moved` install and
-no normalization or index phase.
-
-On the matched 100k stream (445,600 entities, 1,853,670,399 bytes, base and
-sponsor as in [the scaling report](bulk-prefill-scaling.md)):
-
-| Phase | Producer rebuild | Build once |
-| --- | ---: | ---: |
-| `stream-build` wall time | 406.8 s | 407.3 s |
-| Producer ready | 697.2 s | **325.4 s** |
-| Producer stream audits | 3 × ~18 s | 4 × ~17.5 s |
-| Producer normalization | 108.8 s | none |
-| Producer index construction | 252.8 s | none |
-| Installation interval | 277.9 s | 251.4 s |
-| Producer kernel `write_bytes` | 67.7 GB | 30.6 GB |
-| End to end (build + ready) | 1,104.0 s | 732.7 s |
-
-Both producers reached the historical 100k commitment: state root
-`0x8074f966…aec0`, genesis `0xa1182828…793f`. The kept state directory used
-5.1 GB, and the sampled peak of the node directory was 12.06 GB in both modes.
-
-At full scale (15,298,744 entities), build once removes the producer's repeat of
-5,499 s normalization and 20,441 s index construction. It adds one reuse audit
-of about 480 s, so the projected saving is about **7.1 h**. The producer still
-performs four stream audits (about 32 min at 48.2 GB) and the final installation
-copy. That copy is now the dominant producer cost; at 100k it was 77% of
-build-once readiness.
-
 ## Resource policy
 
 Run heavy phases one at a time under an external 32 GiB cgroup limit, with swap
@@ -263,15 +247,13 @@ memory bounds; the cgroup is an additional backstop.
 The Rust library's portable default disk reserve is 1 GiB. **Set the environment
 variable to 80 or higher for the real dataset.** Checks cover ingestion, sort
 flushes, merges, object batches and stream copies/downloads. Long merges recheck
-the reserve periodically; final installation projects another database copy. These projections are conservative
-checks, not a disk quota or proof of full-dataset fit. Account for input, converter
-SQLite scratch, canonical output, sorted runs, staged/final databases,
+the reserve periodically; final installation projects another database copy.
+These projections are conservative checks, not a disk quota or proof of full-dataset fit. Account for input, converter
+scratch, canonical output, sorted runs, staged/final databases,
 transport copies and reserve concurrently. Live history still has no physical
 pruning.
 
 The processor-to-stream converter has atomic publication but is not resumable.
-The earlier Parquet-to-processor export also has its own memory characteristics;
-this work does not establish bounded memory for that separate executable.
 
 ## Progress and measurement
 
@@ -295,86 +277,8 @@ allocation separately from logical storage units. Run one heavy phase at a time;
 progress rates from small or synthetic samples do not establish a full-dataset
 completion estimate.
 
-## Historical incremental validation, 2026-10-19
+## Measurements
 
-The measurements below describe the previous incremental importer. Bulk results
-are recorded separately in [the bulk report](bulk-prefill.md).
-
-The isolated `scripts/streaming-prefill-smoke.py` accepts `--prefill` and a new
-`--work-dir`, creates disposable fixture credentials, and stops every process on
-exit. It passed on the real 16-contract / 263-entity Sourcify fixture:
-
-- Independent full-follower download and replay; producer/full/light head agreement.
-- Verified account and entity query proofs, including all 16 contract entities.
-- Live signed write at block one, persisted receipt, and restart of all roles.
-- No prefill file in the light-node directory.
-
-After bounded posting reuse, the 256 MiB final-destination cache, and the
-five-to-three producer audit reduction, the same release-build fixture passed
-again with the unchanged genesis/state commitments. The isolated acceptance
-run took 1.762 seconds and peaked at 52.9 MiB cgroup memory with no swap; this
-small fixture does not measure large-import speedup. Focused validation also
-passed 46 database library tests, three database streaming-import tests, two
-redb streaming-import tests, twelve streaming/recovery tests and three proposer
-tests. New cases cover cache collisions and namespace separation, malformed
-posting counts, missing/corrupt objects, copy-flush failures and retry, retained
-inode replacement, same-inode mutation/truncation, genesis binding and finalized
-checkpoint recovery. Clippy with warnings denied, formatting and diff checks
-passed. Logs and the smoke acceptance result are retained under
-`operations/runs/producer-optimization` in the parent workspace.
-
-A fresh producer then imported the original 100,000-contract / 445,583-entity
-bundle (1,858,260,091 canonical bytes) and reached the expected height-zero
-genesis hash and state root in **1,270.554 seconds (21m 10.6s)**. This producer
-measurement used a fresh destination and the unchanged canonical bundle under
-the 32 GiB memory cap, no swap and 80 GiB disk reserve. The process was stopped
-after readiness; it did not rerun the full three-role acceptance at this scale.
-
-| Measurement | Historical baseline | Optimized run |
-| --- | ---: | ---: |
-| Producer readiness | approximately 1,300–1,310 s | 1,270.554 s |
-| Standalone audits | 5 passes, 89.944 s | 3 passes, 53.036 s |
-| Replay including compaction | 958.354 s | 975.555 s |
-| Compaction | 133.363 s | 132.430 s |
-| Replay excluding compaction | 824.990 s | 843.125 s |
-| Process physical bytes written | 169,436,819,456 | 168,471,179,264 |
-
-The interval from replay completion to the final audit was 238.226 seconds.
-It includes final installation and surrounding overhead; the inner object copy
-was not separately timed. Peak process RSS was 965,676 KiB (943.0 MiB), while
-peak cgroup memory was 15,356,203,008 bytes (14.30 GiB), including file cache.
-All memory-event counters remained zero and no swap was used.
-
-The observed readiness improvement is only about 2–3%, and physical writes fell
-about 0.6%. These are historical comparisons, not a controlled repeated A/B
-benchmark. The audit reduction is clear, but replay excluding compaction took
-longer in this run and compaction was nearly unchanged. These changes do not
-solve the main import bottleneck. Raw measurements are in the parent workspace's
-`operations/runs/producer-optimization/producer-100k/result.json` and
-`events.jsonl`; the input and original acceptance are documented in
-[the 100,000-contract validation report](streaming-prefill-100k-validation.md).
-
-Debug-build streaming construction of synthetic 29-attribute entities with
-1 KiB payloads, on the local host, produced these preliminary measurements
-using the original 64 KiB batches and 8 MiB caches (before the import tuning):
-
-| Entities | Canonical bytes | Wall time | Peak process RSS | Peak cgroup memory |
-| --- | ---: | ---: | ---: | ---: |
-| 1,000 | 1,620,980 | 4.51 s | 35,916 KiB | 30.3 MiB |
-| 10,000 | 16,349,480 | 61.62 s | 44,212 KiB | 121 MiB |
-
-The time utility and cgroup use different accounting; cgroup values can include
-file-cache charges and are not interchangeable with RSS. These small-scale
-results are not a capacity estimate for the full Sourcify dataset.
-
-A separate 10,000-row run was killed with SIGKILL during replay; no bundle was
-published at interruption. Resumption produced the exact same genesis hash as
-the uninterrupted run and removed completed scratch. This does not exhaust
-all power-loss or disk-full timing windows.
-
-Inputs beyond this 445,583-entity sample, disk amplification and sustained import
-throughput remain the next scale gate.
-
-The complete Rust workspace test run passed 1,174 tests with four intentionally
-ignored tests and no failures. All 11 converter tests passed, including the
-real fixture. Workspace formatting and Clippy with warnings denied passed.
+Dated runs (build once against producer rebuild, adoption against copy, bulk
+construction against the earlier incremental importer) are in
+[benchmarks/2026-10-20-streaming-genesis.md](benchmarks/2026-10-20-streaming-genesis.md).

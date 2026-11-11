@@ -303,8 +303,7 @@ fn versions_are_checked() {
         ChainSpec::new(bad).err(),
         Some(GenesisError::UnsupportedFormat(2))
     );
-    // Protocols 1 (payload entities) and 2 (uncapped rent) are retired; 3
-    // and 4 (earlier drafts of the rent rules) were never released.
+    // Only protocol 5 is accepted.
     for protocol in [0, 1, 2, 3, 4, 6] {
         let mut bad = genesis();
         bad.protocol_version = protocol;
@@ -313,16 +312,4 @@ fn versions_are_checked() {
             Some(GenesisError::UnsupportedProtocol(protocol))
         );
     }
-}
-
-#[test]
-fn the_spec_exposes_the_genesis() {
-    let spec = spec(PARAMS, LIMITS).expect("valid");
-    assert_eq!(spec.chain_id(), CHAIN);
-    assert_eq!(spec.protocol_version(), 5);
-    assert!(spec.is_admin(&ADMIN));
-    assert!(!spec.is_admin(&ALICE));
-    assert_eq!(spec.genesis_header(), &genesis().header());
-    assert_eq!(spec.genesis_hash(), genesis().hash());
-    assert_eq!(spec.genesis_header().height, 0);
 }

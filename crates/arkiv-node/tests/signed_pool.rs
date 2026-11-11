@@ -1,4 +1,5 @@
 //! Nonce ordering, byte accounting and capacity invariants of signed admission.
+
 use alloy_primitives::U256;
 use arkiv_db::{NamespaceName, OwnerId, encode};
 use arkiv_node::{
@@ -13,6 +14,7 @@ fn signer(n: u16) -> Signer {
     key[30..].copy_from_slice(&n.to_be_bytes());
     Signer::from_bytes(key).unwrap()
 }
+
 fn genesis() -> SignedGenesis {
     SignedGenesis::new(
         default_native_genesis(7, 1_000, 250),
@@ -27,11 +29,13 @@ fn genesis() -> SignedGenesis {
     )
     .unwrap()
 }
+
 /// Admission against a balance that covers every reservation here, so these
 /// tests isolate nonce ordering, byte accounting and capacity.
 trait Admit {
     fn admit(&mut self, tx: SignedTx, next: u64) -> Result<Admission, Error>;
 }
+
 impl Admit for Pool {
     fn admit(&mut self, tx: SignedTx, next: u64) -> Result<Admission, Error> {
         self.insert_funded(
@@ -42,6 +46,7 @@ impl Admit for Pool {
         )
     }
 }
+
 /// A namespace creation with a budget of `budget` intrinsic-gas units.
 fn tx(g: &SignedGenesis, who: u16, nonce: u64, budget: u64) -> SignedTx {
     let s = signer(who);
@@ -63,6 +68,7 @@ fn tx(g: &SignedGenesis, who: u16, nonce: u64, budget: u64) -> SignedTx {
     )
     .unwrap()
 }
+
 fn nonces(inputs: &SignedInputs) -> Vec<(OwnerId, u64)> {
     inputs.txs.iter().map(|t| (t.tx.actor, t.nonce)).collect()
 }
@@ -89,18 +95,6 @@ fn duplicates_conflicts_and_failed_admission_preserve_pending() {
     );
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.bytes(), bytes);
-    // Capacity is checked only after exact pending duplicates.
-    let mut full = Pool::with_limits(
-        &g,
-        PoolLimits {
-            max_entries: 1,
-            ..PoolLimits::default()
-        },
-    )
-    .unwrap();
-    full.admit(first.clone(), 0).unwrap();
-    assert_eq!(full.admit(tx(&g, 2, 0, 10), 0), Err(Error("PoolFull")));
-    assert_eq!(full.admit(first, 0), Ok(Admission::Duplicate));
 }
 
 #[test]
@@ -120,7 +114,8 @@ fn gaps_become_ready_only_after_the_missing_nonce_and_order_by_arrival() {
         vec![(b, 0), (a, 0), (a, 1), (b, 1)]
     );
     assert_eq!(pool.contiguous_next(a, 0), 2);
-    assert_eq!(pool.len(), 4); // repeated construction is non-destructive
+    assert_eq!(pool.len(), 4);
+    // Repeated construction is non-destructive.
     let one = pool.select(|_| Ok(0)).unwrap();
     let two = pool.select(|_| Ok(0)).unwrap();
     assert_eq!(one, two);
@@ -204,6 +199,8 @@ fn byte_sender_entry_and_per_sender_limits_are_inclusive_and_do_not_evict() {
         let mut pool = Pool::with_limits(&g, limits).unwrap();
         pool.admit(first.clone(), 0).unwrap();
         assert_eq!(pool.admit(tx(&g, 2, 0, 10), 0), Err(Error("PoolFull")));
+        // Capacity is checked only after exact pending duplicates.
+        assert_eq!(pool.admit(first.clone(), 0), Ok(Admission::Duplicate));
         assert_eq!(pool.len(), 1);
         assert_eq!(pool.bytes(), bytes);
         assert_eq!(

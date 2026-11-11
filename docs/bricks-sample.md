@@ -3,7 +3,7 @@
 On GLM chains, native `TxOp::Arkiv` operations accept any existing namespace.
 The signed admission and execution paths still prohibit generic record writes
 and namespace transfers under this pricing profile. Arkiv keeps per-entity
-ownership, system cells, finite lifetimes, storage rent and atomic rollback.
+ownership, system cells, lifetimes, storage rent and atomic rollback.
 Chains without GLM pricing (the unsigned simulator and demo) restrict Arkiv
 operations to namespace one because their other namespaces admit generic writes. Ethereum/SDK APIs keep namespace
 one as their default; explicit namespace selection uses native transactions.

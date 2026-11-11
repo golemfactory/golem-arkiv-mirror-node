@@ -15,15 +15,19 @@ use arkiv_node::{
 };
 use std::sync::Arc;
 mod signed_support;
+
 fn signer() -> Signer {
     Signer::from_bytes([1; 32]).unwrap()
 }
+
 fn genesis() -> SignedGenesis {
     signed_support::genesis(9200, 1000, [8; 16], 1, 5000, &[1, 2])
 }
+
 fn host(producer: bool) -> Host {
     host_of(genesis(), producer)
 }
+
 fn host_of(g: SignedGenesis, producer: bool) -> Host {
     let cert = SignedHeader::sign(&g, g.header(), &signer()).unwrap();
     Host::create(
@@ -37,6 +41,7 @@ fn host_of(g: SignedGenesis, producer: bool) -> Host {
     )
     .unwrap()
 }
+
 /// An entity with an indexed `group` and `body` bytes of unindexed data.
 fn create(salt: u128, body: usize, lifetime: u64) -> ArkivOperation {
     ArkivOperation::Create {
@@ -58,9 +63,11 @@ fn create(salt: u128, body: usize, lifetime: u64) -> ArkivOperation {
         ],
     }
 }
+
 fn tx(h: &Host, nonce: u64, budget: u64, ops: Vec<ArkivOperation>) -> SignedTx {
     tx_by(h, &signer(), nonce, budget, ops)
 }
+
 fn tx_by(h: &Host, by: &Signer, nonce: u64, budget: u64, ops: Vec<ArkivOperation>) -> SignedTx {
     SignedTx::sign(
         &h.genesis,
@@ -82,9 +89,11 @@ fn tx_by(h: &Host, by: &Signer, nonce: u64, budget: u64, ops: Vec<ArkivOperation
     )
     .unwrap()
 }
+
 fn key(nonce: u64, salt: u128) -> RecordKey {
     key_of(&signer(), nonce, salt)
 }
+
 fn key_of(by: &Signer, nonce: u64, salt: u128) -> RecordKey {
     RecordKey::new(&arkiv::derive_entity_key(
         9200,
@@ -94,13 +103,16 @@ fn key_of(by: &Signer, nonce: u64, salt: u128) -> RecordKey {
     ))
     .unwrap()
 }
+
 /// The chain's rent clock: 5-second blocks, a one-year cap.
 fn clock(h: &Host) -> gas::RentClock {
     gas::RentClock::of(&h.genesis.genesis.params).unwrap()
 }
+
 fn balance(h: &Host, actor: OwnerId) -> U256 {
     h.account(h.head.height, actor).unwrap().balance
 }
+
 fn burnt(h: &Host) -> U256 {
     accounts::burned(
         h.engine
@@ -110,6 +122,7 @@ fn burnt(h: &Host) -> U256 {
     )
     .unwrap()
 }
+
 fn permanent(salt: u128, body: usize) -> ArkivOperation {
     let mut op = create(salt, body, 0);
     if let ArkivOperation::Create { expiry, .. } = &mut op {
@@ -117,6 +130,7 @@ fn permanent(salt: u128, body: usize) -> ArkivOperation {
     }
     op
 }
+
 /// A patch adding an unindexed `more` column of `bytes` bytes.
 fn grow(key: &RecordKey, bytes: usize) -> ArkivOperation {
     ArkivOperation::Patch {
@@ -128,6 +142,7 @@ fn grow(key: &RecordKey, bytes: usize) -> ArkivOperation {
         remove: vec![],
     }
 }
+
 fn cells(h: &Host, key: &RecordKey) -> Option<Vec<(CellName, arkiv_db::Cell)>> {
     h.engine
         .head_snapshot()
@@ -142,6 +157,7 @@ fn cells(h: &Host, key: &RecordKey) -> Option<Vec<(CellName, arkiv_db::Cell)>> {
         .value
         .map(|r| r.cells)
 }
+
 #[test]
 fn costs_rent_replay_and_exact_budget() {
     let mut p = host(true);
@@ -160,7 +176,6 @@ fn costs_rent_replay_and_exact_budget() {
         let b = p.block(p.head.height).unwrap();
         assert_eq!(b.outcomes.txs[0].status, TxStatus::Committed);
         let gas = b.outcomes.txs[0].spent;
-        println!("1KiB {days} days: {gas} gas");
         assert!((50_000..=1_000_000).contains(&gas));
         assert_eq!(
             gas,
@@ -206,6 +221,7 @@ fn costs_rent_replay_and_exact_budget() {
         TxStatus::Committed
     );
 }
+
 #[test]
 fn permanent_create_pays_rent_outside_gas_and_rollback_retains_gas_and_nonce() {
     let mut p = host(true);
@@ -284,6 +300,7 @@ fn permanent_create_pays_rent_outside_gas_and_rollback_retains_gas_and_nonce() {
     assert!(cells(&p, &key(2, 2)).is_none());
     assert_eq!(p.committed_nonce(actor).unwrap(), 4);
 }
+
 #[test]
 fn a_128_kib_permanent_entity_fits_one_transaction() {
     let mut p = host(true);
@@ -314,7 +331,8 @@ fn a_128_kib_permanent_entity_fits_one_transaction() {
         before - accounts::fee(outcome.spent) - outcome.rent_wei
     );
 }
-/// A chain funding the proposer and `tight` with exactly `balance`.
+
+/// A chain funding the proposer and `tight` with exactly `funds`.
 fn tight_host(tight: &Signer, funds: U256) -> Host {
     let base = genesis();
     let g = SignedGenesis::new(
@@ -333,6 +351,7 @@ fn tight_host(tight: &Signer, funds: U256) -> Host {
     h.produce().unwrap();
     h
 }
+
 /// The rent and gas of `txs` when `by` runs them in block 2 of a rich chain:
 /// execution is deterministic, so a tight chain charges the same.
 fn dry_run(by: &Signer, txs: &[(u64, Vec<ArkivOperation>)]) -> Vec<(U256, u64)> {
@@ -354,6 +373,7 @@ fn dry_run(by: &Signer, txs: &[(u64, Vec<ArkivOperation>)]) -> Vec<(U256, u64)> 
         })
         .collect()
 }
+
 #[test]
 fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
     let tight = signed_support::signer(7);
@@ -393,6 +413,7 @@ fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
         accounts::fee(1_000_000 - outcome.spent)
     );
 }
+
 #[test]
 fn rent_the_sender_cannot_pay_at_execution_fails_its_transaction_atomically() {
     let tight = signed_support::signer(7);
@@ -444,6 +465,7 @@ fn rent_the_sender_cannot_pay_at_execution_fails_its_transaction_atomically() {
     f.import(b).unwrap();
     assert_eq!(f.head, h.head);
 }
+
 #[test]
 fn the_producer_drops_a_transaction_whose_reservation_rent_consumed() {
     let tight = signed_support::signer(7);
@@ -472,7 +494,7 @@ fn the_producer_drops_a_transaction_whose_reservation_rent_consumed() {
         2,
         3_000_000,
         vec![ArkivOperation::ExtendExpiry {
-            key: entity.clone(),
+            key: entity,
             expiry: Expiry::PERMANENT,
         }],
     );
@@ -500,6 +522,7 @@ fn the_producer_drops_a_transaction_whose_reservation_rent_consumed() {
     h.produce().unwrap();
     assert_eq!(h.head.height, 3);
 }
+
 #[test]
 fn forged_schedule_and_low_intrinsic_are_rejected() {
     let mut g = genesis();
@@ -521,6 +544,7 @@ fn forged_schedule_and_low_intrinsic_are_rejected() {
         "GasLimitBelowIntrinsic"
     );
 }
+
 #[test]
 fn lifecycle_growth_extension_shrink_and_delete() {
     let mut p = host(true);
@@ -628,6 +652,7 @@ fn signed_genesis_rejects_other_wire_versions() {
         assert!(arkiv_db::decode_exact::<SignedGenesis>(&bytes).is_err());
     }
 }
+
 #[test]
 fn durable_reopen_light_proof_and_reserved_expiry_sweep() {
     use arkiv_db::proof::{EqQuery, EqRequest, SnapshotRef, VerifiedEq};
@@ -918,6 +943,7 @@ fn capped(cap: u64) -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn create_bytes(salt: u128, bytes: usize) -> ArkivOperation {
     create(salt, bytes, 1_000)
 }
@@ -1144,9 +1170,9 @@ fn poisoned_senders_cost_one_execution_per_block() {
     assert_eq!(p.block_executions, executions + 2);
 }
 
-/// The reviewer's case: `[create E, patch E]` in one transaction now quotes
-/// the patch on the create, so 32 senders and a heavy prefix build every
-/// block in one execution.
+/// `[create E, patch E]` in one transaction: the quote covers the patch on
+/// the create, so 32 senders and a heavy prefix build every block in one
+/// execution.
 #[test]
 fn a_transaction_quote_covers_its_own_create_and_patch() {
     const K: u8 = 32;

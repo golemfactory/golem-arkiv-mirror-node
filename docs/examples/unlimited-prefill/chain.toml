@@ -1,5 +1,5 @@
-# Base genesis for an unlimited (never-expiring) Sourcify prefill
-# (sourcify-prefill.py --expiry-policy unlimited). Same chain ID, allocation,
+# Base genesis for an unlimited (never-expiring) Sourcify prefill, such as the
+# output of scripts/sourcify-v4-prefill.py. Same chain ID, allocation,
 # block period and sponsor as the far-future base; the standard pinned profile
 # suffices because permanent rows are not bounded by max_lifetime. The only new
 # rule is [prefill] allow_permanent: this base compiles to a version-3

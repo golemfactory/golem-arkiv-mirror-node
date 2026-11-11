@@ -6,7 +6,6 @@ genesis without copying it. The default, `--genesis-install copy`, is unchanged.
 ```sh
 arkiv-proposer producer --bundle /data/bundle --run-dir /data/producer \
   --key-file /private/proposer.key --listen 127.0.0.1:9500 --genesis-install adopt
-python3 scripts/run-full-prefill.py ... --genesis-install adopt
 ```
 
 The option is accepted only by `producer`. It is ignored once the node is
@@ -116,53 +115,29 @@ new publication, never a mix.
 
 ## With build-once (`--prebuilt-state`) and permanent prefill
 
-Build-once (PR #4) moves the `stream-build --state-out` directory into
+Build-once moves the `stream-build --state-out` directory into
 `prefill-work/bulk-v1` before the existing staged-state path runs. Adoption
 starts from that same path, so the two compose without further changes. The
 prebuilt directory is already consumed by that move. In the cross-filesystem
 copy case the original stays untouched and only the run directory's copy is
 relabelled. Adoption also needs the staged store on the node directory's
 filesystem, which holds for `prefill-work` inside the run directory. Permanent
-prefill (PR #3) changes what the staged state contains, not how it is stored.
+prefill changes what the staged state contains, not how it is stored.
 Adoption selects only `PrefillSource::Streaming` and compares staged and signed
 state headers, so it does not depend on the launch version.
 
-Both combinations were checked on local merges of the branches as of October 21,
-2026. On the 100k-contract bundle, `stream-build --state-out` followed by
+Both combinations were checked on October 21, 2026. On the 100k-contract bundle, `stream-build --state-out` followed by
 `producer --prebuilt-state --genesis-install adopt` moved the store, did not
-rebuild it, adopted it and served the bundle's head. With #3, a version-4
+rebuild it, adopted it and served the bundle's head. A version-4
 permanent genesis adopted in place behaved like the copied one through
 permanent-entity blocks and expiries.
 
 ## Measurements
 
-The 100k-contract bundle has 445,600 entities and a 1.85 GB stream, and its staged
-store is 6.0 GiB. The machine has NVMe RAID0 and 12 cores. The staged file's page
-cache was dropped (`fsync` plus `POSIX_FADV_DONTNEED`) before each install. The
-times cover only the install step:
-
-| Install | Time | Bytes written | Second database |
-| --- | --- | --- | --- |
-| copy | 263.2 s | about 29 GB of file-system output | 6.0 GiB |
-| adopt, 1 verification worker | 151.5 s | 2.6 MB | none |
-| adopt, 8 verification workers | 25.4 s | 2.6 MB | none |
-
-End to end, the producer binary on the same bundle builds the staged store and
-then installs it, so the cache is warm:
-
-| Producer | Ready | Install step | Peak RSS | Height-zero head and query proofs |
-| --- | --- | --- | --- | --- |
-| `--genesis-install copy` | 608.5 s | 220.5 s | 0.66 GiB | reference |
-| `--genesis-install adopt` | 410.6 s | 25.5 s (verify and relabel 15.1 s) | 0.91 GiB | identical |
-
-The adopted node restarted in 38.7 s, the stream re-audit, and produced block 1.
-A producer killed with SIGKILL during verification left its staged store
-untouched. The next start reused it without rebuilding and adopted it.
-
-The copy costs 0.59 ms per entity here, but 2.8 ms per entity on the full run,
-where neither database fits in the page cache. Adoption is bound by random reads
-of one database instead of reads and writes of two. These sample figures do not
-establish a full-dataset time.
+On a 100,000-contract bundle (445,600 entities, a 6.0 GiB staged store) the
+install step took 263 s by copy and 25 s by adoption with 8 verification
+workers; see
+[benchmarks/2026-10-20-streaming-genesis.md](benchmarks/2026-10-20-streaming-genesis.md#adopt-instead-of-copy-2026-10-21).
 
 ## Limitations
 

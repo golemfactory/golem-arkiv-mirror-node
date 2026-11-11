@@ -49,11 +49,6 @@ impl KeyRange {
         )
     }
 
-    /// Every key.
-    pub const fn all() -> Self {
-        Self::new(Bound::Unbounded, Bound::Unbounded)
-    }
-
     /// Every key starting with `prefix`: `[prefix, prefix_successor(prefix))`,
     /// unbounded above when the prefix is empty or all `0xff`.
     pub fn prefix(prefix: &[u8]) -> Self {

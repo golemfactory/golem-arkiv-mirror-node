@@ -1,4 +1,5 @@
 //! Volatile development chain. Run `scripts/full-light-demo.py` for the terminal view.
+
 use arkiv_db::{decode_exact, encode};
 use arkiv_node::demo::{
     auth::{SignedHeader, TrustConfig},
@@ -26,9 +27,11 @@ fn read_bounded(path: &Path, cap: usize) -> Result<Vec<u8>, Box<dyn std::error::
     }
     Ok(bytes)
 }
+
 fn option<'a>(args: &'a BTreeMap<String, String>, name: &str, default: &'a str) -> &'a str {
     args.get(name).map(String::as_str).unwrap_or(default)
 }
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

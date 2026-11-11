@@ -22,9 +22,16 @@ scripts/bench-compare.sh --all --dry-run               # print the plan only
 scripts/bench-compare.sh --all --runs 3 --no-cache-sweep --no-readers \
   --golem-old-rev 95a24ea --golem-new-rev 57c48ca \
   --engines golem-old,golem-new,arkiv-new               # two golem-db revisions vs. arkiv
-echo '/home/ubuntu/arkiv-network/arkiv-state-db-experiment/scripts/bench-compare.sh --all \
-  >>/home/ubuntu/arkiv-bench/at-console.log 2>&1' | at 01:00   # at uses the machine's time zone
+echo "BENCH_WORK=$BENCH_WORK $REPO/scripts/bench-compare.sh --all \
+  >>$BENCH_WORK/at-console.log 2>&1" | at 01:00   # at uses the machine's time zone
 ```
+
+Environment: `BENCH_WORK` is required and names the work directory (exports,
+builds, databases and results). `BENCH_REPO` is the repository the revisions
+are taken from (default: the checkout the script is in). `BENCH_CONF_SEED`
+optionally names a local clone of `golem-db-conformance-testing` to copy
+instead of cloning. `GITHUB_TOKEN`, if set, is used only when an anonymous
+fetch fails.
 
 Options: `--all` (default) | `--quick` | `--scenarios LIST`
 (comma-separated scenario ids or prefixes, such as `index-layout,commit-growth`),
@@ -38,7 +45,7 @@ defaults to the pinned commit; not combined with `--golem-rev`),
 `--engines LIST` (comma-separated; default every engine of the mode:
 `golem,arkiv-old,arkiv-new,arkiv-mem` or
 `golem-old,golem-new,arkiv-old,arkiv-new,arkiv-mem`),
-`--out DIR` (default `/home/ubuntu/arkiv-bench/results/<UTC timestamp>`),
+`--out DIR` (default `$BENCH_WORK/results/<UTC timestamp>`),
 `--resume DIR`, `--max-wait-load MIN` (120), `--load-threshold X` (1.5),
 `--cpus LIST` (`2-9`), `--timeout MIN` (60 per run), `--full-large`
 (also run the full-size `scenarios/large`, with a 6 h timeout per run),
@@ -47,12 +54,12 @@ defaults to the pinned commit; not combined with `--golem-rev`),
 ## What it does
 
 1. **Prepare** (no measurement yet). Everything lives under
-   `/home/ubuntu/arkiv-bench` on the NVMe disk, not on the `/tmp` tmpfs:
+   `$BENCH_WORK`, which should be on a real disk, not a tmpfs:
    - `git archive` exports of both revisions into `src/arkiv-<sha>`. The
      main checkout is never touched.
    - A copy of `golem-db-conformance-testing` at `686ddfc` in
-     `src/golem-db-conformance-testing`. It is copied from a local clone if
-     one exists; otherwise it is cloned with `--recurse-submodules`.
+     `src/golem-db-conformance-testing`. It is copied from the local clone
+     named by `BENCH_CONF_SEED` if that is set; otherwise it is cloned with `--recurse-submodules`.
    - One harness copy per pair of arkiv and golem-db revision
      (`harness/h-<arkiv sha>-g<golem sha>`), with **that arkiv revision's
      own** kit applied (`harness.patch`, `src/*.rs` and `scenarios-scaled`)
@@ -135,7 +142,7 @@ size and a small reader run, and skips the load gate.
 `--resume DIR` reuses that directory's `config.env`, so it keeps the same
 revisions, engines, mode and runs. It skips every run that has a `done` marker and
 retries the failed ones. Only `--max-wait-load` and `--dry-run` can be
-overridden on resume. A lock file (`/home/ubuntu/arkiv-bench/.bench-compare.lock`)
+overridden on resume. A lock file (`$BENCH_WORK/.bench-compare.lock`)
 stops two runners from running at the same time (exit code 3).
 
 Exit codes:

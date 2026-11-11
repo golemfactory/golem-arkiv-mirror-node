@@ -1,4 +1,5 @@
 //! Signed execution, independent replay, retained metadata and publication faults.
+
 use arkiv_db::{
     B256, Budget, Cell, CellName, OwnerId, Projection, RecordKey, Value,
     durable::{Options, WriterState},
@@ -24,9 +25,11 @@ use std::sync::Arc;
 
 mod signed_support;
 use signed_support::signer;
+
 fn genesis() -> SignedGenesis {
     signed_support::genesis(9100, 1000, [7; 16], 1, 100, &[1, 2, 3])
 }
+
 fn create(
     state: Arc<dyn VersionedStore>,
     history: Arc<dyn VersionedStore>,
@@ -45,6 +48,7 @@ fn create(
     )
     .unwrap()
 }
+
 fn memory(producer: bool) -> Host {
     create(
         Arc::new(MemoryVersionedStore::new()),
@@ -52,6 +56,7 @@ fn memory(producer: bool) -> Host {
         producer,
     )
 }
+
 fn reopen(
     state: Arc<dyn VersionedStore>,
     history: Arc<dyn VersionedStore>,
@@ -67,6 +72,7 @@ fn reopen(
     )
     .unwrap()
 }
+
 fn tx(key: u8, nonce: u64, request: u8, operations: Vec<ArkivOperation>) -> SignedTx {
     let signer = signer(key);
     SignedTx::sign(
@@ -89,6 +95,7 @@ fn tx(key: u8, nonce: u64, request: u8, operations: Vec<ArkivOperation>) -> Sign
     )
     .unwrap()
 }
+
 /// An entity with an indexed `group` and its data in an unindexed `body`.
 fn create_entity(salt: u128, body: &[u8]) -> ArkivOperation {
     ArkivOperation::Create {
@@ -110,12 +117,14 @@ fn create_entity(salt: u128, body: &[u8]) -> ArkivOperation {
         ],
     }
 }
+
 fn body(e: &arkiv::ArkivEntityProjection) -> Vec<u8> {
     match e.attribute("body").map(|c| &c.value) {
         Some(Value::Bytes(b)) => b.to_vec(),
         other => panic!("no bytes body: {other:?}"),
     }
 }
+
 fn entity_key(key: u8, creation_nonce: u64, salt: u128) -> RecordKey {
     RecordKey::new(&arkiv::derive_entity_key(
         genesis().genesis.chain_id,
@@ -125,6 +134,7 @@ fn entity_key(key: u8, creation_nonce: u64, salt: u128) -> RecordKey {
     ))
     .unwrap()
 }
+
 fn entity(host: &Host, key: &RecordKey) -> Option<arkiv::ArkivEntityProjection> {
     host.engine
         .head_snapshot()
@@ -139,6 +149,7 @@ fn entity(host: &Host, key: &RecordKey) -> Option<arkiv::ArkivEntityProjection> 
         .value
         .map(|row| arkiv::project(&row).unwrap())
 }
+
 fn creation_nonce(host: &Host, actor: OwnerId) -> u64 {
     host.engine
         .head_snapshot()
@@ -146,9 +157,11 @@ fn creation_nonce(host: &Host, actor: OwnerId) -> u64 {
         .unwrap()
         .map_or(0, |bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
 }
+
 fn message<T>(result: arkiv_node::signed::Result<T>) -> &'static str {
     result.err().expect("expected rejection").0
 }
+
 fn relay(producer: &Host, full: &mut Host, light: &mut Light) {
     let block = producer.block(producer.head.height).unwrap();
     full.import(block.clone()).unwrap();
@@ -194,10 +207,7 @@ fn signed_lifecycle_replays_bootstrap_ownership_failures_and_native_proofs() {
         producer.submit(create_tx.clone()).unwrap()["status"],
         "pending"
     );
-    assert_eq!(
-        producer.submit(create_tx.clone()).unwrap()["status"],
-        "pending"
-    );
+    assert_eq!(producer.submit(create_tx).unwrap()["status"], "pending");
     assert_eq!(producer.pool.len(), 1);
     producer.produce().unwrap();
     relay(&producer, &mut full, &mut light);
@@ -316,7 +326,7 @@ fn multi_operation_failure_rolls_back_entity_nonce_but_consumes_transaction_nonc
             },
         ],
     );
-    producer.submit(failure.clone()).unwrap();
+    producer.submit(failure).unwrap();
     producer.produce().unwrap();
     let block = producer.block(3).unwrap();
     full.import(block.clone()).unwrap();
@@ -377,10 +387,7 @@ fn restart_preserves_inclusion_nonce_and_old_bodies_but_drops_pending_entries() 
     let mut producer = reopen(state.clone(), history.clone(), true);
     assert!(producer.pool.is_empty());
     assert_eq!(producer.committed_nonce(signer(2).address()).unwrap(), 1);
-    assert_eq!(
-        producer.submit(included.clone()).unwrap()["status"],
-        "included"
-    );
+    assert_eq!(producer.submit(included).unwrap()["status"], "included");
     assert_eq!(
         producer
             .request_status(signer(2).address(), [2; 32])
@@ -460,8 +467,8 @@ fn reference_only_engine_envelope_excludes_calldata_and_preserves_intended_entit
         body(&entity(&producer, &entity_key(2, 0, 10)).unwrap()),
         sentinel
     );
-    // Exact closed decode of the host packet proves its contents, instead of a
-    // misleading grep over engine pages that intentionally include entity state.
+    // Decode the host packet exactly; engine pages hold entity state, so
+    // searching them proves nothing.
     let mut decoder = arkiv_db::Decoder::new(&stored.bytes);
     assert_eq!(decoder.array::<8>().unwrap(), *b"ARKSGNR1");
     let certificate: SignedHeader = decoder.get().unwrap();
@@ -476,6 +483,7 @@ fn reference_only_engine_envelope_excludes_calldata_and_preserves_intended_entit
 fn recertify(block: &mut SignedBlock) {
     block.header = SignedHeader::sign(&genesis(), block.header.header, &signer(1)).unwrap();
 }
+
 #[test]
 fn full_replay_rejects_authenticated_but_invalid_body_nonce_root_outcomes_and_parent() {
     let mut producer = memory(true);
@@ -640,7 +648,7 @@ fn full_authentic_equivocation_freezes_history_and_changed_signer_cannot_reopen(
     full.import(producer.block(1).unwrap()).unwrap();
     full.import(producer.block(2).unwrap()).unwrap();
     let wrong_signer = Host::open(
-        state.clone(),
+        state,
         History::open(history.clone(), genesis().hash()).unwrap(),
         &genesis(),
         Some(signer(3)),
@@ -895,6 +903,7 @@ fn create_until(salt: u128, height: u64) -> ArkivOperation {
         )],
     }
 }
+
 fn chain(genesis: &SignedGenesis, producer: bool) -> Host {
     let certificate = SignedHeader::sign(genesis, genesis.header(), &signer(1)).unwrap();
     Host::create(
@@ -908,6 +917,7 @@ fn chain(genesis: &SignedGenesis, producer: bool) -> Host {
     )
     .unwrap()
 }
+
 fn tx_on(
     genesis: &SignedGenesis,
     key: u8,
@@ -937,6 +947,7 @@ fn tx_on(
     )
     .unwrap()
 }
+
 fn expiry_total(host: &Host, height: u64) -> u64 {
     host.engine
         .head_snapshot()
@@ -944,6 +955,7 @@ fn expiry_total(host: &Host, height: u64) -> u64 {
         .unwrap()
         .map_or(0, |bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
 }
+
 /// The expiry height each `EntityCreated`/`ExpiryExtended` event of a block
 /// reports, by entity key.
 fn logged_expiries(host: &Host, height: u64) -> Vec<(String, String, u64)> {
@@ -1387,6 +1399,7 @@ fn expiry_sweep_timing() {
     }
     std::fs::remove_dir_all(&root).unwrap();
 }
+
 fn ops_of(operations: Vec<ArkivOperation>) -> Vec<TxOp> {
     operations
         .into_iter()

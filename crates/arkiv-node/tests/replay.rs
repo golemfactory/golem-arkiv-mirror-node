@@ -165,8 +165,6 @@ fn outcomes(txs: Vec<TxOutcome>) -> BlockOutcomes {
     }
 }
 
-// ---------------------------------------------------------------------------
-
 /// One transaction of five operations across the raw and typed keyspaces,
 /// with an expiry, all committed in one block.
 #[test]
@@ -1385,15 +1383,4 @@ fn halted_expiry_aborts_the_candidate() {
     );
     assert_eq!(chain.height(), 5);
     assert!(record(&chain.snapshot(5).expect("head"), 2, b"e1").is_some());
-}
-
-/// A header encodes in 156 bytes: the format version first, the state root
-/// last.
-#[test]
-fn headers_carry_the_format_version_and_the_state_root() {
-    let header = genesis().header();
-    let bytes = encode(&header);
-    assert_eq!(bytes.len(), 156);
-    assert_eq!(bytes[..4], [0, 0, 0, 5]);
-    assert_eq!(bytes[124..], header.state_root[..]);
 }

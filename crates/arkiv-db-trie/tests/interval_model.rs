@@ -1,52 +1,11 @@
 //! Independent interval results against a sorted-map model, including gaps.
+
+mod support;
+
 use std::collections::BTreeMap;
 
-use arkiv_db_trie::{IntervalLimits, KeyRange, MemoryOnly, MerkleMap, Probe, ProofError};
-
-/// The closed-interval form these tests were written against.
-#[allow(dead_code)]
-fn walk_interval<N: AsRef<[u8]>>(
-    root: arkiv_db_trie::ObjectId,
-    lower: &[u8],
-    upper: &[u8],
-    nodes: &[N],
-    max_entries: usize,
-) -> Result<arkiv_db_trie::IntervalEntries, ProofError> {
-    arkiv_db_trie::walk_interval(
-        root,
-        &KeyRange::closed(lower, upper),
-        nodes,
-        IntervalLimits {
-            max_entries,
-            max_key_len: 256,
-        },
-    )
-}
-
-#[allow(dead_code)]
-fn inspect_interval<N: AsRef<[u8]>>(
-    root: arkiv_db_trie::ObjectId,
-    lower: &[u8],
-    upper: &[u8],
-    nodes: &[N],
-    max_entries: usize,
-) -> Result<
-    (
-        arkiv_db_trie::IntervalEntries,
-        arkiv_db_trie::VerifiedInterval,
-    ),
-    ProofError,
-> {
-    arkiv_db_trie::inspect_interval(
-        root,
-        &KeyRange::closed(lower, upper),
-        nodes,
-        IntervalLimits {
-            max_entries,
-            max_key_len: 256,
-        },
-    )
-}
+use arkiv_db_trie::{KeyRange, MemoryOnly, MerkleMap, Probe, ProofError};
+use support::{inspect_closed, walk_closed};
 
 fn check<const N: usize>(model: BTreeMap<[u8; N], Vec<u8>>, bounds: Vec<[u8; N]>) {
     let mut map = MerkleMap::<[u8; N], Vec<u8>>::new();
@@ -68,11 +27,11 @@ fn check<const N: usize>(model: BTreeMap<[u8; N], Vec<u8>>, bounds: Vec<[u8; N]>
                 .collect::<Result<_, _>>()
                 .unwrap();
             assert_eq!(
-                walk_interval(map.root_hash(), lower, upper, &proof, model.len()).unwrap(),
+                walk_closed(map.root_hash(), lower, upper, &proof, model.len()).unwrap(),
                 expected
             );
             let (inspected, trace) =
-                inspect_interval(map.root_hash(), lower, upper, &proof, model.len()).unwrap();
+                inspect_closed(map.root_hash(), lower, upper, &proof, model.len()).unwrap();
             assert_eq!(inspected, expected);
             let included_leaves: Vec<_> = trace
                 .nodes
@@ -83,7 +42,7 @@ fn check<const N: usize>(model: BTreeMap<[u8; N], Vec<u8>>, bounds: Vec<[u8; N]>
             assert_eq!(included_leaves, expected);
             if !expected.is_empty() {
                 assert_eq!(
-                    walk_interval(map.root_hash(), lower, upper, &proof, expected.len() - 1),
+                    walk_closed(map.root_hash(), lower, upper, &proof, expected.len() - 1),
                     Err(ProofError::EntryLimitExceeded)
                 );
             }
@@ -93,12 +52,12 @@ fn check<const N: usize>(model: BTreeMap<[u8; N], Vec<u8>>, bounds: Vec<[u8; N]>
                 let mut incomplete = proof.clone();
                 incomplete.remove(omitted);
                 assert!(
-                    walk_interval(map.root_hash(), lower, upper, &incomplete, model.len()).is_err()
+                    walk_closed(map.root_hash(), lower, upper, &incomplete, model.len()).is_err()
                 );
             }
             let mut extra = proof.clone();
             extra.push(vec![0xc0]);
-            assert!(walk_interval(map.root_hash(), lower, upper, &extra, model.len()).is_err());
+            assert!(walk_closed(map.root_hash(), lower, upper, &extra, model.len()).is_err());
         }
     }
 }

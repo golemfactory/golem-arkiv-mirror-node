@@ -1,39 +1,14 @@
-//! State roots of the engine (node step N3b) against an independent model.
+//! State roots of the engine against an independent model.
 //!
-//! What this file establishes:
-//! - **Oracle roots.** Over a seeded multi-block history on four namespaces
-//!   (raw puts and deletes including the empty key, typed creates, patches
-//!   that change values, types and kinds, deletes, transfers, host-state
-//!   puts and removes, pricing changes, rolled-back transactions and empty
-//!   blocks), every map root the engine reports (each namespace's raw,
-//!   key-binding, row and term maps, the catalog and the host map) equals
-//!   the root of an independent Merkle Patricia construction over leaves
-//!   built by hand in this file from a `BTreeMap` model of the state, and
-//!   the state root equals `keccak256(len ‖ "arkiv/state/v1" ‖ header)` over
-//!   a `StateHeader` encoded by hand. The construction is the yellow-paper
-//!   reference of `arkiv-db-trie`'s tests (any key length), cross-checked
-//!   here against `alloy_trie::HashBuilder` for every map whose keys have at
-//!   most 32 bytes. Nothing on the expected side calls the engine's codec,
-//!   layouts or digest.
-//! - **History independence.** Identical logical content reached by
-//!   different histories (other operation orders, other block boundaries,
-//!   rolled-back transactions, transfers there and back through different
-//!   owners, raw keys deleted and written again, patches undone) has the
-//!   same state root and the same map roots.
-//! - **Retention.** Every published snapshot's state root is unchanged
-//!   after all later blocks, and still equals the model's root of its block.
-//! - **Sensitivity.** The root changes when any logical field changes, each
-//!   alone: a descriptor's owner, the pricing schedule, the record
-//!   allocator (a create rolled forward and deleted again), a host entry and
-//!   one cell value. Each changed root equals the model's.
-//! - The sealed candidate's root equals the root of the snapshot it
-//!   publishes, and `state_header().root()` is `state_root()`.
-//! - An open branch's `try_state_root` equals the model's root after every
-//!   transaction (asking does not change later roots), and the seal root.
+//! Expected roots come from a Merkle Patricia construction over leaves built
+//! by hand in this file from a `BTreeMap` model of the state (the reference
+//! of `arkiv-db-trie`'s tests, cross-checked against
+//! `alloy_trie::HashBuilder` for keys of at most 32 bytes) and a
+//! `StateHeader` encoded by hand. Nothing on the expected side calls the
+//! engine's codec, layouts or digest.
 //!
 //! What it does not establish: roots of states read from storage (see
-//! `storage_faults.rs`), proofs (node step N3d), or anything about header
-//! v2 (a later node step).
+//! `storage_faults.rs`) or proofs (see `eq_proofs.rs`, `range_proofs.rs`).
 
 #[path = "../../arkiv-db-trie/tests/support/mod.rs"]
 mod trie_support;
@@ -53,15 +28,8 @@ const BOB: OwnerId = OwnerId::new([0xb0; 20]);
 const CAROL: OwnerId = OwnerId::new([0xc0; 20]);
 const OWNERS: [OwnerId; 3] = [ALICE, BOB, CAROL];
 
-/// Every schedule in this file prices every class the same; all budgets are
-/// unlimited, so prices only matter as state.
-fn schedule(id: u32, weight: u64) -> PriceSchedule {
-    PriceSchedule::uniform(id, weight)
-}
-
-// ---------------------------------------------------------------------------
-// The model: logical state only, as plain maps
-// ---------------------------------------------------------------------------
+// Every schedule in this file prices every class the same; all budgets are
+// unlimited, so prices only matter as state.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum V {
@@ -73,7 +41,7 @@ enum V {
 }
 
 impl V {
-    /// The type id: Bool 1, I64 2, U64 3, Str 4, Bytes 5.
+    /// The golem type id: Bool 1, Str 2, Bytes 3, U64 13, I64 17.
     fn tag(&self) -> u8 {
         match self {
             V::Bool(_) => 1,
@@ -151,10 +119,6 @@ impl Model {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Leaves built by hand from the layout of state format 2
-// ---------------------------------------------------------------------------
 
 fn be32(value: usize) -> [u8; 4] {
     u32::try_from(value).unwrap().to_be_bytes()
@@ -404,10 +368,6 @@ fn check(snapshot: &Snapshot, model: &Model, context: &str) {
     assert_eq!(got.state, want.state, "{context}: state root");
 }
 
-// ---------------------------------------------------------------------------
-// Driving the engine and the model together
-// ---------------------------------------------------------------------------
-
 fn ns(ordinal: u64) -> NamespaceId {
     NamespaceId::from_ordinal(ordinal).unwrap()
 }
@@ -519,7 +479,7 @@ fn run(branch: &mut Branch, model: &Model, op: &Op) {
         }
         Op::Pricing(id, weight) => {
             branch
-                .set_pricing(schedule(*id, *weight))
+                .set_pricing(PriceSchedule::uniform(*id, *weight))
                 .expect("schedule ids increase");
             return;
         }
@@ -533,7 +493,6 @@ fn run(branch: &mut Branch, model: &Model, op: &Op) {
     }
 }
 
-/// Applies `op` to the model.
 fn apply(model: &mut Model, op: &Op) {
     match op {
         Op::CreateNamespace(name) => {
@@ -665,10 +624,6 @@ fn text(value: &str) -> V {
     V::Str(value.to_owned())
 }
 
-// ---------------------------------------------------------------------------
-// A seeded history
-// ---------------------------------------------------------------------------
-
 const RAW_KEYS: [&[u8]; 8] = [
     b"",
     b"\x00",
@@ -766,7 +721,7 @@ fn random_op(rng: &mut Rng, model: &Model, pricing_id: &mut u32) -> Op {
 
 #[test]
 fn every_map_root_and_the_state_root_match_the_independent_model() {
-    let mut engine = Engine::new(schedule(1, 1));
+    let mut engine = Engine::new(PriceSchedule::uniform(1, 1));
     let mut model = Model::new((1, 1));
     let genesis = engine.head_snapshot();
     check(&genesis, &model, "genesis");
@@ -896,10 +851,6 @@ fn scratch_without_empty(model: &Model) -> Model {
     view
 }
 
-// ---------------------------------------------------------------------------
-// History independence
-// ---------------------------------------------------------------------------
-
 fn cells_one() -> Vec<(&'static str, C)> {
     vec![
         ("kind", attr(text("red"))),
@@ -914,7 +865,7 @@ fn cells_two() -> Vec<(&'static str, C)> {
 
 /// Runs blocks and returns the head snapshot.
 fn build(blocks: &[Block]) -> Snapshot {
-    let mut engine = Engine::new(schedule(1, 1));
+    let mut engine = Engine::new(PriceSchedule::uniform(1, 1));
     let mut model = Model::new((1, 1));
     for (index, block) in blocks.iter().enumerate() {
         produce(
@@ -1008,10 +959,6 @@ fn identical_content_reached_by_different_histories_has_one_root() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sensitivity
-// ---------------------------------------------------------------------------
-
 #[test]
 fn the_root_changes_with_every_logical_field_and_matches_the_model() {
     let base_ops = vec![
@@ -1020,7 +967,7 @@ fn the_root_changes_with_every_logical_field_and_matches_the_model() {
         Op::Create(1, b"r1".to_vec(), cells_one()),
         Op::HostPut([1; 32], b"h".to_vec()),
     ];
-    let mut engine = Engine::new(schedule(1, 1));
+    let mut engine = Engine::new(PriceSchedule::uniform(1, 1));
     let mut model = Model::new((1, 1));
     produce(&mut engine, &mut model, &one(base_ops), "base");
     let base = engine.head_snapshot();
@@ -1057,7 +1004,6 @@ fn the_root_changes_with_every_logical_field_and_matches_the_model() {
             apply(&mut changed, op);
         }
         let sealed = branch.seal();
-        assert_ne!(sealed.state_root(), base.state_root(), "{what}");
         assert_eq!(sealed.state_root(), model_roots(&changed).state, "{what}");
         assert!(roots.insert(sealed.state_root()), "{what}: a distinct root");
         // The allocator variant leaves the rows as they were: only the

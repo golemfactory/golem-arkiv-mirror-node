@@ -15,26 +15,20 @@ This document defines the Arkiv host/RPC contract and the corresponding
 requirements on [Golem-DB](https://github.com/Arkiv-Network/arkiv-source-of-truth/blob/main/golem-db.md). The engine targets Arkiv's block
 workload and may expose block-oriented execution APIs. It can still use
 separate snapshot/commit identities internally; the host establishes finality.
-Implementation has begun entirely in memory as described below. The
-namespace catalog, immutable snapshots, branches with checkpoint/rollback,
-atomic in-process publication, deterministic metering, a host block map,
-typed records with per-namespace indexes, the declared query subset with
-snapshot-pinned keyset pagination and host-executed expiry are implemented,
-and since node step N3b every state has a deterministic logical state root;
-complete equality-page proofs, verification and state roots in every block
-header now exist. N3c persists engine snapshots and the same
-proof material; durable node/block integration and broader proof profiles
-remain open. Requirements in this
-document are targets; where the prototype meets one, the
-[plan](snapshot-query-plan.md) says so.
+Implemented: the namespace catalog, immutable snapshots, branches with
+checkpoint/rollback, atomic publication, deterministic metering, a host
+block map, typed records with per-namespace indexes, the declared query
+subset with snapshot-pinned keyset pagination, host-executed expiry, a
+deterministic logical state root committed by every block header, complete
+equality-page proofs and bounded complete range proofs with verification,
+and durable storage of the same state and proof material (`DurableEngine`,
+used by the simulator and the signed proposer). Broader proof profiles are
+not implemented. The requirements in this document are targets; the
+[acceptance list](#acceptance-requirements) says which are met.
 
-The additional [node and storage plan](node-storage-plan.md) implements this
-contract through a running append-only host and then atomic durable block
-publication. The immediate [full/light-node demo](full-light-demo.md) adds
-continuous following and a bounded complete equality-proof profile before
-durability, with no pruning. Its pinned-producer signatures
-authenticate development headers; they do not prove execution validity or
-public-chain consensus/finality, which remains a separate integration.
+In the node runtimes a proposer signature authenticates a header; it does
+not prove execution validity or public-chain consensus or finality, which
+remain a separate integration.
 
 Every ordinary query also selects one immutable project namespace ID, as
 defined by the [namespace contract](project-namespaces.md). Names and current
@@ -184,13 +178,11 @@ abstract operation units, not execution time; a provider decides how to bill
 those units. In-memory storage does not remove the metering requirement.
 
 Write/read meters, budget checks, cost receipts and optional debug ledgers
-are implemented with the first snapshot milestone, and the second milestone
-extended them to record writes, index maintenance, record reads, every query
-step, counts and term listings under model version 2 (counting rules in the
-[plan](snapshot-query-plan.md#operation-cost-is-part-of-the-first-milestone)).
-Model version 3 (node step N0b-1) makes every write prepay root maintenance
-and reserves the `ProofNode`/`ProofByte` classes for point proofs; extend the
-same mechanism to proof generation when it is introduced. The
+are implemented for raw writes and reads, record writes, index maintenance,
+record reads, every query step, counts and term listings (counting rules in
+[metering](metering.md)). Every write prepays root maintenance, and proof
+generation is charged through the `ProofNode`/`ProofByte` classes
+([proof charges](eq-proof-charges.md)). The
 meter stops before work exceeds the available budget and restores a failed
 write's logical changes while preserving its spent-cost receipt. A query that
 runs out of budget returns no partial page. Exhaustion must not look like a
@@ -269,78 +261,22 @@ Snapshot import cannot claim coverage for history it did not import or backfill.
 Before a node participates in consensus-path historical reads it must possess
 the full required window; local incomplete coverage cannot change consensus.
 
-## Implementation stages
-
-Tests started with block packets: one ordered batch of accepted mutations
-per block, checked before submission and after application, with many
-operations on the same key, empty blocks, discarded candidates and rejected
-batches. Those raw KV tests use block numbers only as workload labels. The
-engine tests establish retained snapshot identity, historical reads and
-queries, cost accounting and transaction-level rollback through real
-branches and a host block map; keep the two kinds distinct as the execution
-API grows.
-
-The Rust prototype keeps its KV store, snapshots, indexes and (later) proof
-nodes and caches **entirely in memory for now**. Published snapshots are
-immutable and internally consistent, but process termination loses them.
-Call this a volatile reference implementation, not durable commits or a
-production archive. Every published snapshot is retained for its process
-lifetime; pruning is deferred and there is no snapshot capacity limit yet. A
-bounded capacity failure must not partly publish a new snapshot or silently
-evict promised history.
-
-The feature stages below retain their original numbers. Execution order is
-now the [demo's D0–D3](full-light-demo.md#implementation-order-and-review-gates),
-then the remaining [node/storage steps](node-storage-plan.md#ordered-implementation-steps-and-exit-criteria):
-the bounded complete-Eq profile moves ahead of durability, broader proofs
-and SDK support follow it, and pruning/archive distinctions remain later.
-
-0. Done: namespace IDs, ownership/transfer transitions and local addressing
-   are specified and implemented; the directory-work bound is defined and
-   measured for every implemented operation.
-1. Done in memory: metered writes/basic reads with budgets, receipts and
-   debug ledgers, the namespace catalog, immutable snapshots, branches and
-   atomic in-process publication with a host test harness mapping blocks to
-   snapshots. Pricing is an uncalibrated fixture.
-2. Done in memory: namespace-local records/cells and historical indexes,
-   deterministic queries in record-id order with snapshot-pinned keyset
-   pagination, host-executed expiry, and model-version-2 accounting of index
-   and query work. Not done: attribute sorting, descending order, offset
-   paging and engine-assigned keys. The SDK 32-byte key encoding was settled
-   later, in node step N0b-1 (`RecordKey` encoding version 2).
-3. Namespace/directory roots and point inclusion/absence proofs using the
-   vendored trie over the frozen encodings, with bounded proof generation and
-   prepaid write-side root maintenance (charged since model version 3). The
-   roots are done in memory (node step N3b: the state root composes every
-   namespace's map roots through the directory); point proofs are node step
-   N3d, and point proofs alone are not complete query proofs.
-4. Complete query proofs for the declared query subset, an independent
-   verifier, and SDK/RPC integration preserving `atBlock`.
-5. Persistent atomic publication, recovery, retained-history management,
-   snapshot transfer/backfill, and archive operation.
-
-The final stage retains Golem-DB's durability and bounded recovery requirements.
-Before production use, records, indexes, roots, and block mapping must recover
-as one complete published block. A lost acknowledgement requires reconciliation
-of commit identity; it is not proof that a durable commit did not happen.
-
 ## Acceptance requirements
 
-Each item is a target; those the in-memory prototype meets are marked.
+Each item is a target; those the implementation meets are marked.
 
 - Namespace transfer preserves IDs and content without reindexing; earlier
   blocks preserve the previous owner. Mixed namespace updates publish together.
-  Met in memory.
+  Met.
 - Growing other projects leaves local query work and charges unchanged, with
   directory visits and proof size inside the specified bound. Check namespace
   binding in cursors, caches and verification; no global scans are hidden by
   a constant cost charge. See the namespace contract's adversarial tests.
-  Met in memory for every operator and engine cursor, and for the demo's
+  Met for every operator and engine cursor, and for the demo's
   Eq proofs and bounded verified-continuation cache.
 - Query before creation, after creation, after patch, after deletion, and on
   either side of expiry. Repeat old queries after later mutations; results
-  and roots are unchanged. Met in memory for results and, since node step
-  N3b, for state roots (`roots.rs`).
+  and roots are unchanged. Met for results and for state roots (`roots.rs`).
 - Identical state, operations and pricing yield identical costs and abort
   points with cold/warm caches. Exact-budget execution succeeds; insufficient
   budget rolls back the call while retaining its spent receipt. Estimation
@@ -349,14 +285,14 @@ Each item is a target; those the in-memory prototype meets are marked.
 - Debug mode preserves costs; checked counters cannot wrap. Index-term
   creation, projection and proof work have explicit counting vectors. Read
   receipts remain outside consensus and cannot be confused with gas charges.
-  Met in memory for index-term creation and projection; Eq proof work has
-  [model-4 charge vectors](eq-proof-charges.md).
+  Met for index-term creation and projection; Eq proof work has
+  [charge vectors](eq-proof-charges.md).
 - Historical predicates still find records removed from current indexes.
   Key reuse never joins histories of distinct record identities. Met in
   memory.
 - A failed span restores its changes; losing speculative candidates cannot
   alter any published snapshot. All successful operations in a block appear
-  together at its publication boundary. Met in memory.
+  together at its publication boundary. Met.
 - Mixed admin/data transitions and empty blocks resolve to the intended
   complete state, without assuming block number equals commit number. Met in
   memory.
@@ -366,15 +302,18 @@ Each item is a target; those the in-memory prototype meets are marked.
   verified continuation evidence is implemented for the Eq proof profile.
 - Verification rejects altered values, missing/extra matches, wrong ordering,
   false end-of-results claims, and proofs substituted from another state.
-  Implemented for the bounded positive Eq profile. Broader operators,
-  including negation, remain later proof work.
+  Implemented for the bounded positive Eq profile and for
+  [complete ranges](range-proofs.md). Other operators, including negation,
+  have no proof.
 - Proof verification uses an independently trusted root. Corrupted witness
   nodes or an unauthenticated replacement root cannot make a result valid.
-  Planned.
+  Met: the verifiers take the caller's accepted root (`eq_proofs.rs`,
+  `range_proofs.rs`).
 - Availability errors never appear as empty query results. Import and pruning
   preserve all advertised answers and proof material. Met for storage
-  errors beneath engine state over a test object reader (node step N3b,
-  `storage_faults.rs`); import, pruning and durable storage are planned.
-- In the durable stage, fault injection exposes a complete old or new state;
+  errors beneath engine state (`storage_faults.rs`, `durable_failures.rs`);
+  snapshot import and physical pruning are not implemented.
+- In durable storage, fault injection exposes a complete old or new state;
   acknowledged publications survive restart and uncertain outcomes reconcile
-  without duplicate commits. Planned.
+  without duplicate commits. Met (`durable_failures.rs`, and
+  `engine_crashes.rs` and `engine_process.rs` in `arkiv-db-redb`).

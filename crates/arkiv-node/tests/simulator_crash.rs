@@ -1,4 +1,5 @@
 //! Actual redb write/sync cuts retain a complete parent or candidate host packet.
+
 use arkiv_db::{
     CellName, NamespaceId, Value,
     durable::Options,
@@ -14,6 +15,7 @@ use arkiv_node::simulator::{
     workload::Workload,
 };
 use std::sync::Arc;
+
 fn store(disk: &CrashDisk) -> Arc<RedbStore> {
     let disk = disk.clone();
     Arc::new(
@@ -24,12 +26,14 @@ fn store(disk: &CrashDisk) -> Arc<RedbStore> {
         .unwrap(),
     )
 }
+
 fn options() -> Options {
     Options {
         cache_bytes: 0,
         ..Default::default()
     }
 }
+
 fn step(h: &Host) -> Control {
     Control {
         command_id: hex(&[19; 32]),
@@ -40,6 +44,7 @@ fn step(h: &Host) -> Control {
         config: None,
     }
 }
+
 fn open(image: &[u8]) -> (CrashDisk, Arc<RedbStore>, Host) {
     let disk = CrashDisk::from_image(image.to_vec());
     let store = store(&disk);
@@ -139,9 +144,4 @@ fn every_redb_mutating_boundary_atomically_keeps_state_body_outbox_and_inclusion
         }
     }
     assert!(parents > 0 && candidates > 0);
-    eprintln!(
-        "simulator redb cuts={} images={} parent={parents} candidate={candidates}",
-        trace.len() + 1,
-        (trace.len() + 1) * 3
-    );
 }

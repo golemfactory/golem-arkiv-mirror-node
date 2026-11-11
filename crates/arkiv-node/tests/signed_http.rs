@@ -1,4 +1,5 @@
 //! Real-socket signed submission, body replication and light proof verification.
+
 use alloy_primitives::U256;
 use arkiv_db::{
     CellName, Value as DbValue,
@@ -37,26 +38,31 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOKEN: &str = "signed-test-replication-token-0123456789";
+
 struct Server {
     url: String,
     task: tokio::task::JoinHandle<()>,
 }
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
+
 async fn serve(router: Router) -> Server {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", socket.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
     Server { url, task }
 }
+
 fn signer(who: u8) -> Signer {
     let mut key = [0; 32];
     key[31] = who;
     Signer::from_bytes(key).unwrap()
 }
+
 fn genesis() -> SignedGenesis {
     let funded = [1, 2, 3].map(|who| {
         (
@@ -73,6 +79,7 @@ fn genesis() -> SignedGenesis {
     )
     .unwrap()
 }
+
 fn host(producer: bool) -> Host {
     let genesis = genesis();
     let cert = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
@@ -87,6 +94,7 @@ fn host(producer: bool) -> Host {
     )
     .unwrap()
 }
+
 fn create(who: u8, nonce: u64, salt: u128) -> SignedTx {
     let signer = signer(who);
     let mut request = [0; 32];
@@ -126,6 +134,7 @@ fn create(who: u8, nonce: u64, salt: u128) -> SignedTx {
     )
     .unwrap()
 }
+
 async fn post(client: &reqwest::Client, url: &str, path: &str, body: Value) -> reqwest::Response {
     client
         .post(format!("{url}/signed/v1/{path}"))
@@ -134,6 +143,7 @@ async fn post(client: &reqwest::Client, url: &str, path: &str, body: Value) -> r
         .await
         .unwrap()
 }
+
 async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
     let r = client
         .get(format!("{url}/signed/v1/{path}"))
@@ -143,6 +153,7 @@ async fn get(client: &reqwest::Client, url: &str, path: &str) -> Value {
     assert!(r.status().is_success(), "GET {path}: {}", r.status());
     r.json().await.unwrap()
 }
+
 async fn step(client: &reqwest::Client, url: &str) {
     let r = client
         .post(format!("{url}/signed/v1/control"))
@@ -155,12 +166,23 @@ async fn step(client: &reqwest::Client, url: &str) {
     let body: Value = r.json().await.unwrap();
     assert!(status.is_success(), "{body}");
 }
+
 fn head(rt: &Shared) -> arkiv_node::Header {
     rt.node.lock().unwrap().head()
 }
+
 fn query() -> Value {
-    json!({"height":"2","namespace":"1","attribute":"group","valueType":"u64","value":"1","limit":1,"cursor":null})
+    json!({
+        "height": "2",
+        "namespace": "1",
+        "attribute": "group",
+        "valueType": "u64",
+        "value": "1",
+        "limit": 1,
+        "cursor": null,
+    })
 }
+
 fn light_rt(source: &str, producer: &Shared) -> Shared {
     let node = producer.node.lock().unwrap();
     let light = Light::create(
@@ -478,10 +500,42 @@ async fn external_admission_full_replay_and_light_paginated_proofs() {
         assert_eq!(v["execution"]["status"], supported);
         assert!(v.get("verification").is_none());
     }
-    let text=post(&client,&local.url,"query/text",json!({"query":"group = u64(1)","requireProof":true,"height":"2","namespace":"1","limit":2,"cursor":null})).await.json::<Value>().await.unwrap();
+    let text = post(
+        &client,
+        &local.url,
+        "query/text",
+        json!({
+            "query": "group = u64(1)",
+            "requireProof": true,
+            "height": "2",
+            "namespace": "1",
+            "limit": 2,
+            "cursor": null,
+        }),
+    )
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
     assert_eq!(text["verificationStatus"]["status"], "verified");
     assert_eq!(text["rows"].as_array().unwrap().len(), 2);
-    let unsupported=post(&client,&local.url,"query/text",json!({"query":"group >= u64(1)","requireProof":true,"height":"2","namespace":"1","limit":2,"cursor":null})).await.json::<Value>().await.unwrap();
+    let unsupported = post(
+        &client,
+        &local.url,
+        "query/text",
+        json!({
+            "query": "group >= u64(1)",
+            "requireProof": true,
+            "height": "2",
+            "namespace": "1",
+            "limit": 2,
+            "cursor": null,
+        }),
+    )
+    .await
+    .json::<Value>()
+    .await
+    .unwrap();
     assert_eq!(unsupported["error"], "UnsupportedProof");
     assert_eq!(unsupported["verificationStatus"]["status"], "not_executed");
     assert!(unsupported.get("rows").is_none());
@@ -507,6 +561,7 @@ fn hold_node(rt: &Shared) -> std::sync::mpsc::Sender<()> {
     locked_rx.recv().unwrap();
     release_tx
 }
+
 async fn until(what: &str, condition: impl Fn() -> bool) {
     let started = std::time::Instant::now();
     while !condition() {
@@ -517,7 +572,9 @@ async fn until(what: &str, condition: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
+
 type Answer = tokio::task::JoinHandle<(reqwest::StatusCode, Value)>;
+
 fn spawn_post(client: &reqwest::Client, url: &str, path: &'static str, body: Value) -> Answer {
     let (client, url) = (client.clone(), url.to_owned());
     tokio::spawn(async move {
@@ -525,6 +582,7 @@ fn spawn_post(client: &reqwest::Client, url: &str, path: &'static str, body: Val
         (response.status(), response.json::<Value>().await.unwrap())
     })
 }
+
 fn assert_verified(path: &str, (status, value): (reqwest::StatusCode, Value)) {
     assert!(
         status.is_success() && value.get("error").is_none(),
@@ -534,6 +592,7 @@ fn assert_verified(path: &str, (status, value): (reqwest::StatusCode, Value)) {
         assert_eq!(verification["status"], "verified", "{path}: {value}");
     }
 }
+
 /// A producer at height 2 with one `group = 1` entity and a light node
 /// synced to it, both served.
 async fn light_chain() -> (Shared, Server, Shared, Server) {
@@ -548,12 +607,21 @@ async fn light_chain() -> (Shared, Server, Shared, Server) {
     let local = serve(runtime::public_router(light.clone())).await;
     (producer, public, light, local)
 }
+
 fn text_query() -> Value {
-    json!({"query":"group = u64(1)","requireProof":true,"height":"2","namespace":"1","limit":2,"cursor":null})
+    json!({
+        "query": "group = u64(1)",
+        "requireProof": true,
+        "height": "2",
+        "namespace": "1",
+        "limit": 2,
+        "cursor": null,
+    })
 }
+
 fn range_query() -> Value {
-    json!({"height":"2","namespace":"1","attribute":"group","valueType":"u64",
-        "lower":{"value":"1","inclusive":true},"upper":null})
+    json!({"height":"2", "namespace":"1", "attribute":"group", "valueType":"u64",
+        "lower":{"value":"1", "inclusive":true}, "upper":null})
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -673,13 +741,22 @@ async fn sustained_reads_never_hold_up_production_or_light_sync() {
                 let answer = if path == "rpc" {
                     let response = client
                         .post(format!("{url}/"))
-                        .json(&json!({"jsonrpc":"2.0","id":1,"method":"arkiv_getEntityCount","params":[]}))
+                        .json(&json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "arkiv_getEntityCount",
+                            "params": [],
+                        }))
                         .send()
                         .await
                         .unwrap();
                     (response.status(), response.json::<Value>().await.unwrap())
                 } else {
-                    let body = if path == "query/text" { text_query() } else { range_query() };
+                    let body = if path == "query/text" {
+                        text_query()
+                    } else {
+                        range_query()
+                    };
                     let response = post(&client, &url, path, body).await;
                     (response.status(), response.json::<Value>().await.unwrap())
                 };
@@ -764,7 +841,13 @@ async fn streamed_submission_caps_private_auth_and_bounded_jobs() {
         let address = public.url.strip_prefix("http://").unwrap();
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let prefix = format!(
-            "POST /signed/v1/{path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            "POST /signed/v1/{path} HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Content-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {:x}\r\n",
             cap + 1
         );
         stream.write_all(prefix.as_bytes()).await.unwrap();
@@ -852,6 +935,7 @@ async fn mutate(State(source): State<String>, Json(body): Json<Value>) -> Json<V
     v["proof"] = json!(hex(&proof));
     Json(v)
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn altered_or_truncated_proof_never_returns_verified_rows() {
     let mut h = host(true);
@@ -969,7 +1053,11 @@ async fn future_sampled_and_advertised_conflict_freezes_before_replication() {
     let sampled = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
     let (full, history_store) = full_with_retained_history();
     assert_eq!(full.head.height, 0);
-    let headers = json!({"identity":full.identity,"certificates":[pack(&block.header)],"sampled":pack(&sampled)});
+    let headers = json!({
+        "identity": full.identity,
+        "certificates": [pack(&block.header)],
+        "sampled": pack(&sampled),
+    });
     let bodies = Arc::new(AtomicUsize::new(0));
     let count = bodies.clone();
     let source = serve(
@@ -1028,7 +1116,11 @@ async fn authentic_replication_certificate_conflict_persists_freeze_before_execu
     changed.inputs_digest = arkiv_db::B256::repeat_byte(18);
     let advertised = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
     let (full, history_store) = full_with_retained_history();
-    let headers = json!({"identity":full.identity,"certificates":[pack(&advertised)],"sampled":pack(&advertised)});
+    let headers = json!({
+        "identity": full.identity,
+        "certificates": [pack(&advertised)],
+        "sampled": pack(&advertised),
+    });
     let bodies = Arc::new(AtomicUsize::new(0));
     let count = bodies.clone();
     let source = serve(
@@ -1090,8 +1182,16 @@ async fn advertised_header_survives_failed_body_fetch_and_detects_later_conflict
     changed.inputs_digest = arkiv_db::B256::repeat_byte(29);
     let conflicting = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
     let (full, history_store) = full_with_retained_history();
-    let first = json!({"identity":full.identity,"certificates":[pack(&advertised)],"sampled":pack(&sampled)});
-    let second = json!({"identity":full.identity,"certificates":[pack(&conflicting)],"sampled":pack(&sampled)});
+    let first = json!({
+        "identity": full.identity,
+        "certificates": [pack(&advertised)],
+        "sampled": pack(&sampled),
+    });
+    let second = json!({
+        "identity": full.identity,
+        "certificates": [pack(&conflicting)],
+        "sampled": pack(&sampled),
+    });
     let polls = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(AtomicUsize::new(0));
     let count = bodies.clone();
@@ -1173,8 +1273,8 @@ async fn range_inspection_exposes_only_complete_authenticated_branching_witnesse
     runtime::sync_once(light.clone()).await.unwrap();
     let local = serve(runtime::public_router(light)).await;
     let client = reqwest::Client::new();
-    let query = json!({"height":"2","namespace":"1","attribute":"price","valueType":"u64",
-        "lower":{"value":"10","inclusive":true},"upper":{"value":"20","inclusive":false}});
+    let query = json!({"height":"2", "namespace":"1", "attribute":"price", "valueType":"u64",
+        "lower":{"value":"10", "inclusive":true}, "upper":{"value":"20", "inclusive":false}});
     let response = post(&client, &local.url, "query/range/inspect", query.clone()).await;
     let status = response.status();
     let result: Value = response.json().await.unwrap();
@@ -1325,7 +1425,15 @@ async fn state_explorer_walks_pinned_real_nodes_and_nested_postings() {
     let producer = Runtime::new(Node::Full(Box::new(source)), None, None, None).unwrap();
     let public = serve(runtime::public_router(producer.clone())).await;
     let client = reqwest::Client::new();
-    let read = |map: &str, path: Value, term_path: Value| json!({"height":"2","map":map,"namespace":if map=="catalog"{Value::Null}else{json!("1")},"path":path,"termPath":term_path});
+    let read = |map: &str, path: Value, term_path: Value| {
+        json!({
+            "height": "2",
+            "map": map,
+            "namespace": if map=="catalog"{Value::Null}else{json!("1")},
+            "path": path,
+            "termPath": term_path,
+        })
+    };
     let response = post(
         &client,
         &public.url,

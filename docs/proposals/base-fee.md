@@ -1,8 +1,7 @@
-# Proportional base fee plan
+# Proposal: proportional base fee
 
-Selected by the user on 2026-09-25 while GLM account fee collection was being
-implemented. This is a design decision for a subsequent versioned fee profile;
-it does not change the fixed-price account profile by itself.
+Status: not implemented. Decided on 2026-09-25 as the design for a later
+versioned fee profile; the current profile keeps its fixed 1 gwei price.
 
 ## Parameters and recurrence
 
@@ -37,20 +36,20 @@ otherwise valid production.
 | 75,000,000 | +10% |
 | 100,000,000 | +15% |
 
-The user explicitly selected this proportional response, rather than a capped
-+5% response or a fixed upward/downward step. A 100M block is four times the
+The response is proportional, rather than a capped +5% response or a fixed
+upward/downward step. A 100M block is four times the
 25M target, so its increase is 15%, not 5%. The target is a feedback setpoint;
 it does not guarantee average usage when demand is low or the fee hits its floor.
 
-## Repository reference
+## Reference implementations
 
-The local `arkiv/crates/arkiv-reth-chainspec/src/lib.rs` implements
-`max(inner.next_block_base_fee(parent), genesis floor)` in
-`EthChainSpec::next_block_base_fee`. The local
-`arkiv-op-geth/consensus/misc/eip1559/eip1559.go` implements the proportional
-parent-gas recurrence with a minimum one-unit upward adjustment. These are
-read-only reference repositories. Their configured defaults vary; this plan
-selects its own floor, target and denominator explicitly.
+In the `arkiv` repository, `crates/arkiv-reth-chainspec/src/lib.rs`
+implements `max(inner.next_block_base_fee(parent), genesis floor)` in
+`EthChainSpec::next_block_base_fee`. In the `arkiv-op-geth` repository,
+`consensus/misc/eip1559/eip1559.go` implements the proportional parent-gas
+recurrence with a minimum one-unit upward adjustment. Their configured
+defaults vary; this proposal selects its own floor, target and denominator
+explicitly.
 
 ## Integration work before activation
 
@@ -74,5 +73,4 @@ selects its own floor, target and denominator explicitly.
    blocks, integer boundaries, fee-cap deferral, balance reservation/refunds,
    failed execution, independent replay, proof verification and durable restart.
 
-Activation follows implementation and validation, using a fresh disposable demo
-chain. The current account implementation and deployment remain separate work.
+Activation follows implementation and validation, using a fresh chain.

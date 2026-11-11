@@ -1,5 +1,6 @@
 //! A durable catalog of proposer-authenticated native headers and Eq proofs.
 //! This follower never executes transaction bodies and makes no finality claim.
+
 use super::{
     Error, Result,
     protocol::{SignedGenesis, SignedHeader},
@@ -25,6 +26,7 @@ pub struct Light {
     pub observed: u64,
     sequence: Head,
 }
+
 impl Light {
     pub fn create(
         store: Arc<dyn VersionedStore>,
@@ -147,6 +149,7 @@ impl Light {
             _ => Ok(()),
         }
     }
+
     fn read_header(&self, height: u64) -> Result<SignedHeader> {
         let bytes = self
             .store
@@ -169,6 +172,7 @@ impl Light {
         }
         Ok(certificate)
     }
+
     fn read_observation(&self, height: u64) -> Result<Option<SignedHeader>> {
         self.store
             .read_record_bounded(Table::Inclusions, &height.to_be_bytes(), CERTIFICATE_LEN)?
@@ -183,6 +187,7 @@ impl Light {
             })
             .transpose()
     }
+
     pub fn header(&self, height: u64) -> Result<SignedHeader> {
         self.available()?;
         if height > self.head.height {
@@ -469,6 +474,7 @@ pub fn verify_range_at(
     }
     Ok(verified)
 }
+
 fn catalog_head(genesis: B256, sequence: u64, header: &crate::Header, observed: u64) -> Head {
     let mut bytes = genesis.to_vec();
     bytes.extend_from_slice(&sequence.to_be_bytes());
@@ -478,6 +484,7 @@ fn catalog_head(genesis: B256, sequence: u64, header: &crate::Header, observed: 
         hash: digest("arkiv/signed-light-catalog/v1", &bytes).0,
     }
 }
+
 fn authenticate(genesis: &SignedGenesis, certificate: &SignedHeader) -> Result<()> {
     certificate.authenticate(genesis)?;
     let h = certificate.header;

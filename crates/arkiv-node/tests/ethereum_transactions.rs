@@ -1,5 +1,6 @@
 //! Independent viem 2.x signed Ethereum fixtures; never resigned by the native host.
 //! `fixtures/ethereum-sdk-vectors.mjs` regenerates them.
+
 use alloy_primitives::{U256, keccak256};
 use arkiv_db::{Cell, CellName, Value, encode};
 use arkiv_node::{
@@ -7,18 +8,23 @@ use arkiv_node::{
     arkiv::ArkivOperation,
     signed::{crypto::Signer, ethereum, protocol::*},
 };
+
 mod signed_support;
+
 fn genesis() -> SignedGenesis {
     signed_support::genesis(9300, 1000, [7; 16], 2, 1000, &[2])
 }
+
 fn bytes(s: &str) -> Vec<u8> {
     alloy_primitives::hex::decode(s).unwrap()
 }
+
 fn fixture(name: &str) -> Vec<u8> {
     let json: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/ethereum-sdk-vectors.json")).unwrap();
     bytes(json[name].as_str().unwrap())
 }
+
 #[test]
 fn independent_sdk_legacy_and_1559_authentication_and_exact_native_mapping() {
     let g = genesis();
@@ -81,6 +87,7 @@ fn independent_sdk_legacy_and_1559_authentication_and_exact_native_mapping() {
         }
     }
 }
+
 fn udc_attributes() -> Vec<(CellName, Cell)> {
     vec![
         (
@@ -101,6 +108,7 @@ fn udc_attributes() -> Vec<(CellName, Cell)> {
         ),
     ]
 }
+
 #[test]
 fn calldata_rejects_trailing_aliases_and_unknown_selector() {
     let calldata = fixture("data");
@@ -225,7 +233,17 @@ fn ethereum_original_auth_survives_mining_and_independent_full_replay() {
     );
     // Query the UDC entity back the way the SDK does.
     let key = arkiv_node::arkiv::derive_entity_key(9300, actor.as_bytes(), 0, 9);
-    let select = serde_json::json!({"key":true,"owner":true,"creator":true,"createdAt":true,"updatedAt":true,"expiresAt":true,"creationFlags":true,"attributeSchema":true,"attributes":true});
+    let select = serde_json::json!({
+        "key": true,
+        "owner": true,
+        "creator": true,
+        "createdAt": true,
+        "updatedAt": true,
+        "expiresAt": true,
+        "creationFlags": true,
+        "attributeSchema": true,
+        "attributes": true,
+    });
     let query = |host: &Host, source: &str| {
         arkiv_node::signed::rpc_reads::dispatch(
             host,
@@ -248,19 +266,19 @@ fn ethereum_original_auth_survives_mining_and_independent_full_replay() {
         assert_eq!(
             entity["attributeSchema"],
             serde_json::json!([
-                {"name":"arkiv.schema","type":"str","indexed":true},
-                {"name":"body","type":"bytes","indexed":false},
-                {"name":"score","type":"u64","indexed":true},
-                {"name":"title","type":"str","indexed":false},
+                {"name":"arkiv.schema", "type":"str", "indexed":true},
+                {"name":"body", "type":"bytes", "indexed":false},
+                {"name":"score", "type":"u64", "indexed":true},
+                {"name":"title", "type":"str", "indexed":false},
             ])
         );
         assert_eq!(
             entity["attributes"],
             serde_json::json!([
-                {"name":"arkiv.schema","type":"str","value":"posts"},
-                {"name":"body","type":"bytes","value":"0x010203"},
-                {"name":"score","type":"u64","value":"0x2a"},
-                {"name":"title","type":"str","value":"hello"},
+                {"name":"arkiv.schema", "type":"str", "value":"posts"},
+                {"name":"body", "type":"bytes", "value":"0x010203"},
+                {"name":"score", "type":"u64", "value":"0x2a"},
+                {"name":"title", "type":"str", "value":"hello"},
             ])
         );
         assert!(entity.get("payload").is_none() && entity.get("contentType").is_none());
@@ -372,7 +390,17 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
         )
     };
     // getEntity, as the SDK spells it.
-    let select = json!({"key":true,"owner":true,"creator":true,"createdAt":true,"updatedAt":true,"expiresAt":true,"creationFlags":true,"attributeSchema":true,"attributes":true});
+    let select = json!({
+        "key": true,
+        "owner": true,
+        "creator": true,
+        "createdAt": true,
+        "updatedAt": true,
+        "expiresAt": true,
+        "creationFlags": true,
+        "attributeSchema": true,
+        "attributes": true,
+    });
     let entity = call(
         "arkiv_query",
         json!([format!("$key = key({key_hex})"), {"select":select,"limit":"0x1"}]),
@@ -417,7 +445,10 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     assert!(only["result"].get("cursor").is_none(), "{only}");
     let range = call(
         "arkiv_query",
-        json!([format!("$key BETWEEN key({key_hex}) AND key({key_hex})"), {"select": {"count": true}}]),
+        json!([
+            format!("$key BETWEEN key({key_hex}) AND key({key_hex})"),
+            {"select": {"count": true}},
+        ]),
     )
     .await;
     assert_eq!(range["result"]["count"], "0x1", "{range}");
@@ -455,7 +486,13 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
         serde_json::from_str(include_str!("fixtures/ethereum-sdk-vectors.json")).unwrap();
     let estimate = call(
         "eth_estimateGas",
-        json!([{"from":arkiv_node::simulator::wire::hex(actor.as_bytes()),"to":"0x4400000000000000000000000000000000000044","data":vectors["permanentData"]}]),
+        json!([
+            {
+                "from": arkiv_node::simulator::wire::hex(actor.as_bytes()),
+                "to": "0x4400000000000000000000000000000000000044",
+                "data": vectors["permanentData"],
+            },
+        ]),
     )
     .await;
     let gas = u64::from_str_radix(

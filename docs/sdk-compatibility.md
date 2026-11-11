@@ -1,18 +1,17 @@
 # Native engine SDK compatibility
 
-> **Pre-UDC document.** This page and `scripts/sdk-compat-smoke.{py,ts}`
-> describe and test the payload-era SDK (0.8.x: an entity payload and content
-> type, `payload`/`contentType` selections). The node
-> now implements the SDK's user-defined-columns model instead; for current
+> **Pre-UDC document.** This page was written for the payload-era SDK (0.8.x:
+> an entity payload and content type, `payload`/`contentType` selections). The
+> node implements the SDK's user-defined-columns model instead; for current
 > write rules, read shapes and error codes see the
 > [node API reference](node-api-reference.md#entities-user-defined-columns).
 > The transport, gas and account behaviour below is unchanged.
 >
-> The current-SDK smoke is `scripts/udc-sdk-smoke.{py,ts}`: it runs
+> The SDK smoke is `scripts/udc-sdk-smoke.{py,ts}`: it runs
 > `@arkiv-network/sdk` 1.0.x (a checkout of its `main` or `develop` with
 > dependencies installed; point `ARKIV_SDK_DIR` at it) against disposable
 > producer/full/light nodes, through a three-role restart and follower reads.
-> It no longer supports the pre-1.0 `udc/*` branches: 1.0 removed
+> It does not support the pre-1.0 `udc/*` branches: 1.0 removed
 > `ExpirationTime.permanent()`, cursors and `atBlock`.
 
 The signed node exposes Ethereum/Arkiv JSON-RPC at `/` on its existing public
@@ -232,81 +231,16 @@ There is no snapshot bootstrap.
 
 The repository includes independent viem-signed authentication fixtures,
 producer/full replay tests, real prefilled-state query tests, RPC simulation and
-rollback/event tests, and an unchanged-SDK end-to-end harness:
+rollback/event tests, and an SDK end-to-end smoke:
 
 ```sh
 cargo test --workspace
 cargo build -p arkiv-node --bin arkiv-proposer
-python3 scripts/sdk-compat-smoke.py
+ARKIV_SDK_DIR=../arkiv-sdk-js python3 scripts/udc-sdk-smoke.py
 ```
 
 The smoke script uses isolated temporary producer, full and light nodes. It does
-not reset or deploy the public chain. See the script for environment variables
-selecting the local SDK checkout and optional upstream integration suite.
-
-### Rogue One balance-independent estimation rollout (2026-09-26)
-
-Node change `bb688b2` is deployed to the producer, full follower and light
-follower on chain 9008. Existing genesis, state/history, two-second production
-and public metrics endpoints were retained. Followers were upgraded and caught
-up before the producer; explicit downtime catch-up added 32 real blocks.
-
-The exact previously failing wallet-6 create (5,000-byte payload) now estimates
-`0x1b53c` (111,932 gas), identical to a funded caller, on all three public
-endpoints over HTTP and WebSocket. Wallet-6 remains at zero balance and nonce.
-Each endpoint rejected a genuinely signed unfunded EIP-1559 transaction with
-`-32000` / `insufficient funds for gas * price + value`.
-
-A funded signed copy submitted through the full follower committed in block
-31794 with 100,848 gas used and 100,848,000,000,000 wei charged. All three nodes
-returned the same successful receipt for transaction
-`0x66ffd5f8e178ebb7d075040b0b322edc22670d054b2ef8b2b15e55ca4059a2c1`.
-The pre-upgrade block 31611 retained its hash and state root on every role.
-Thirteen parsed Prometheus scrapes per role over 60.5 seconds passed type and
-unique-series checks with no new error counters. The producer advanced 31
-blocks; all roles agreed on block 31823, its hash and state root afterward.
-
-Validation passed 960 workspace tests (three explicitly ignored heavy crash
-tests), the unchanged-SDK lifecycle/indexer/WebSocket/restart/replay harness,
-and the new 5 KB unfunded SDK-create regression. Unit coverage checks identical
-funded/unfunded metering and actual execution gas, transfer value including
-`U256::MAX`, pending reservations, out-of-gas and missing-entity failures,
-`eth_call` account enforcement, and unchanged state/nonces/burn counter/pool.
-
-The deployed worker now fails at `eth_sendRawTransaction`, with the correct
-insufficient-funds cause; it no longer fails during estimation. The SDK still
-wraps non-revert contract errors in the generic outer message
-`EntityMutationError: Transaction failed: Execution error without revert data`.
-That presentation issue is separate from this RPC fix; company SDK/indexer
-repositories and wallet funding were not changed.
-
-The integration references are SDK commit
-`db27f4c360e1b1e081bb674224fb6858b4356091` and Arkiv commit
-`0fd58ce5bd6a0a196b0079f60d4679539346adc6`. The optional upstream run copies the
-SDK's integration tests unchanged to an isolated temporary directory and runs
-both HTTP and WebSocket cases. Its explicit permanent-entity test is excluded
-because this chain requires finite rent; the harness does not alter that policy
-or rewrite the upstream test to manufacture a pass:
-
-```sh
-SDK_RUN_UPSTREAM=1 \
-SDK_UPSTREAM_PATTERN='^(?!.*permanent entity).*' \
-ARKIV_PROPOSER_BIN="$PWD/target/release/arkiv-proposer" \
-python3 scripts/sdk-compat-smoke.py
-```
-
-The focused smoke additionally imports the existing indexer's actual
-`EthereumRpcClient` for block, receipt and batched-balance checks. Neither
-reference repository is modified.
-
-Validated on 2026-09-25: 31 applicable unchanged upstream SDK integration tests
-passed over HTTP/WebSocket; the single permanent-entity case was explicitly
-filtered out. The complete unfiltered run identified that deliberate policy
-difference. Workspace regression tests passed (947 tests in the build that then
-carried the Arkiv entity protocol, 907 in the generic build; the node now has a
-single build), including dependency/doctest suites, and
-workspace/all-target Clippy passed with warnings denied. Existing genesis-bundle
-and GLM-account real-process smoke tests also passed against the release binary.
+not reset or deploy a public chain.
 
 ## Full released indexer acceptance
 
@@ -356,13 +290,7 @@ Validated on 2026-11-17 against arkiv-chain-indexer `9f424c6` (v0.6.2) with
 with cached images (about 75 blocks, 22 transactions, 20 decoded operations,
 a delete among them, 3 genesis entities imported), before and after `ORDER BY`
 joined the exercise. `scripts/udc-sdk-smoke.py` passed against the same
-checkout through its exercise, three-role restart and follower stages. Earlier runs used SDK commit `3526519`, the last pre-1.0 `udc`
-revision, which this smoke no longer supports.
-
-An earlier version of this smoke targeted the experimental indexer's
-`compose.signed-chain.yml` (released v0.5.20 images, payload-era
-`scripts/sdk-compat-smoke.ts`); neither that file nor the payload-era SDK fits
-the regular UDC indexer.
+checkout through its exercise, three-role restart and follower stages.
 
 The indexer's genesis importer uncovered two additional RPC requirements:
 `arkiv_getEntityCount([{block: 0}])` reads the requested snapshot (with optional

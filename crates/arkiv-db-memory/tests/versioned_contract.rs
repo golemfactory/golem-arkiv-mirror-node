@@ -1,9 +1,8 @@
 //! The versioned storage contract suite against the memory store.
 //!
 //! Runs every case of `arkiv_db_storage::testing::contract` against
-//! `MemoryVersionedStore` and against the same store wrapped in a
-//! `FaultyStore` without armed faults. The `faulty_*` cases wrap the store in
-//! a latching `FaultyStore` themselves. The memory store is volatile, so the
+//! `MemoryVersionedStore`, and the cases that arm no fault against the same
+//! store wrapped in a `FaultyStore`. The memory store is volatile, so the
 //! reopen case has nothing to check here.
 //!
 //! Object ids come from a standard-library stand-in for `keccak256` (four
@@ -67,5 +66,5 @@ mod memory {
 }
 
 mod faulty_memory {
-    arkiv_db_storage::versioned_store_contract!(super::WrappedMemory);
+    arkiv_db_storage::versioned_store_contract!(@base super::WrappedMemory);
 }

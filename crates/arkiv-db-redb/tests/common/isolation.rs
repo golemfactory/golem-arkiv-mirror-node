@@ -23,17 +23,13 @@ use arkiv_db_storage::versioned::{
 
 use super::{BenchDir, block, commit, object};
 
-/// Namespace A.
 pub const A: SpaceId = SpaceId::Namespace(1);
-/// Namespace B.
 pub const B: SpaceId = SpaceId::Namespace(2);
 
 /// Sizes of one isolation run.
 #[derive(Clone, Debug)]
 pub struct Params {
-    /// Objects in A.
     pub a_objects: u64,
-    /// Bytes per object.
     pub object_len: usize,
     /// B's object count as multiples of A's, in phase order (the first is
     /// the baseline).
@@ -53,19 +49,14 @@ pub struct Params {
 pub struct Phase {
     /// What grew.
     pub name: String,
-    /// B's objects.
     pub b_objects: u64,
     /// Namespaces holding objects.
     pub namespaces: u64,
-    /// Committed blocks.
     pub blocks: u64,
-    /// File size.
     pub file_bytes: u64,
     /// redb's table-directory height.
     pub directory_height: u32,
-    /// Tables in the file.
     pub tables: u64,
-    /// A's table height.
     pub a_height: u32,
     /// Application-level reads per space during the uncached pass.
     pub app: Vec<(SpaceId, SpaceStats)>,
@@ -97,7 +88,7 @@ impl Chain {
         batch.expected_head = self.parent;
         batch.new_head = super::head(self.height, 1);
         // Keep the records consistent with the (re-numbered) head.
-        batch.records.retain(|(table, _, _)| *table == Table::Meta);
+        batch.records.clear();
         let hash = batch.new_head.hash;
         batch
             .put_record(
@@ -268,20 +259,17 @@ pub fn run(dir: &BenchDir, params: &Params) -> Vec<Phase> {
         ));
     }
 
-    // History grows: many small blocks touching B, the catalog and records.
+    // History grows: many small blocks touching B and the catalog.
     if params.history_blocks > 0 {
         let store = RedbStore::open(&path, RedbConfig::default()).expect("open");
         for _ in 0..params.history_blocks {
             let height = chain.height;
-            let mut batch = block(
+            let batch = block(
                 None,
                 height,
                 1,
                 &[(B, 4, params.object_len), (SpaceId::Catalog, 1, 120)],
             );
-            batch
-                .records
-                .retain(|(table, _, _)| *table == Table::Manifests || *table == Table::Inclusions);
             b_objects += 4;
             chain.commit(&store, batch);
         }

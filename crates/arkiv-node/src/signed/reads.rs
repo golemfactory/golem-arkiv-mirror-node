@@ -1,7 +1,7 @@
 //! Detached reads: heavy full-node reads evaluated outside the node lock.
 //!
 //! The node lock serializes production, admission and every other request.
-//! A read whose cost grows with the state (`arkiv_query`,
+//! A read whose cost grows with the state (`arkiv_query`, `arkiv_getEntity`,
 //! `arkiv_getEntityCount`, equality and range proofs, the state tree
 //! explorer) holds it only to check heights and capture what it needs: a
 //! pinned [`arkiv_db::Snapshot`] plus identity and limits. It then
@@ -45,7 +45,8 @@
 //!   (HTTP 503). If the caller goes away first, the read is abandoned. In
 //!   both cases its [`Interrupt`] is raised; its metered walk (an
 //!   interruptible budget) stops at the next charge and releases its
-//!   permit. Metering, budgets and every successful response are unchanged.
+//!   permit.
+
 use super::{Error, Result};
 use arkiv_db::Interrupt;
 use std::{
@@ -168,6 +169,7 @@ pub(super) struct Admitted {
 /// client disconnected, the deadline passed or the read finished (then the
 /// flag is no longer observed).
 struct RaiseOnDrop(Interrupt);
+
 impl Drop for RaiseOnDrop {
     fn drop(&mut self) {
         self.0.raise();

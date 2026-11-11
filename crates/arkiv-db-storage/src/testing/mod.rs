@@ -1,7 +1,7 @@
 //! Test support for [`VersionedStore`](crate::versioned::VersionedStore)
 //! implementations and their callers.
 //!
-//! - [`FaultyStore`] wraps any store and injects read failures, commit
+//! - [`FaultyStore`] wraps any store and injects read failures, write
 //!   outcomes, disk-full conditions, lost acknowledgements and failed
 //!   recoveries, optionally latching by `RedbStore`'s rule.
 //! - [`contract`] is the behavioural suite every store implementation runs,
@@ -13,4 +13,4 @@
 pub mod contract;
 mod faulty;
 
-pub use faulty::{CommitFault, DiskFull, FaultCounters, FaultyStore, ReadFault, ReadScope};
+pub use faulty::{CommitFault, DiskFull, FaultCounters, FaultyStore, ReadScope};

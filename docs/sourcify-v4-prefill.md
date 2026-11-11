@@ -21,7 +21,7 @@ would accept a stream converted for another chain, with every reference
 dangling. `conversion-report.json` records `chainId` and `creator`.
 
 The base genesis must be a permanent-prefill one (`[prefill] allow_permanent = true`,
-see [unlimited expiry](sourcify-prefill-converter.md#unlimited-expiry---expiry-policy-unlimited)):
+see [row expiry](streaming-genesis-v2.md#row-expiry)):
 `stream-build` then commits a version-4 launch with `burnedWei` 0. `inventory`
 runs every check and publishes only the report.
 
@@ -131,8 +131,8 @@ the owner in creation order against the predicted keys, counts per kind, and
 Results on 2026-10-29 (arkiv-state-db-experiment `2aff63b` node, processor `udc`
 `dec4261`):
 
-- The SafeProxy record (`docs/data/hydrated-contract.json`, owner `0x11…11`)
-  gives the processor's `docs/udc-examples/safeproxy` entities (6 keys and every
+- The processor repository's SafeProxy record (`docs/data/hydrated-contract.json`,
+  owner `0x11…11`) gives its `docs/udc-examples/safeproxy` entities (6 keys and every
   attribute equal) and converts to 6 rows, 19,325 storage units.
 - The processor's PostgreSQL fixture (`SEED_FORMAT=udc pipeline/run.sh run`):
   16 contracts, 216 rows, 230 references, one chunk list.
@@ -170,4 +170,4 @@ dataset owner `0x68cf…5c56` on chain 7706815:
   walks exactly in `matchid` order. A descending walk from the very top
   exceeds the read deadline: a two-sided `matchid` window far from the start
   of creation order is driven by the `arkiv.schema` posting once its range run
-  passes 65,536 terms (see the planner rules in `snapshot-query-plan.md`).
+  passes 65,536 terms (the query planner's cap on a range run).

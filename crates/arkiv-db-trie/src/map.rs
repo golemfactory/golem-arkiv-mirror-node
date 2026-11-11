@@ -159,10 +159,9 @@ pub(crate) fn key_nibbles<K: TrieKey>(key: &K) -> Vec<u8> {
 ///
 /// A handle is a root [`Link`] and the entry count. Cloning is O(1); an
 /// update returns a new handle and shares every node off the updated path
-/// with the old one, which stays valid. Handles hold no loader: operations
-/// that may follow a stored link take a [`NodeLoader`] by reference and are
-/// fallible, returning the loader's error type; a failed read is never
-/// reported as an absent key. Iteration is in encoded key order.
+/// with the old one, which stays valid. Operations that may follow a stored
+/// link take a [`NodeLoader`] by reference and return its error type.
+/// Iteration is in encoded key order.
 pub struct MerkleMap<K, V> {
     pub(crate) root: Link<V>,
     len: u64,
@@ -868,11 +867,8 @@ fn stage_link<V: TrieValue>(
         let id = reference
             .as_hash()
             .unwrap_or_else(|| keccak256(buffer.as_slice()));
-        // The walk continues even when the sink already holds `id`: maps
-        // with different value types can share a sink, and a leaf of one
-        // can be byte-identical to a leaf of another whose value names a
-        // nested map, so an equal id does not mean the nested maps below
-        // were staged.
+        // Keep walking: an equal id in the sink does not prove the nested
+        // maps below were staged (see the `stage` module).
         sink.record(id, buffer);
     }
     match &node.node {

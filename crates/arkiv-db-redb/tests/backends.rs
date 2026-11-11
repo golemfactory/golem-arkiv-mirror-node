@@ -18,7 +18,7 @@ use std::{io, ops::Bound};
 use arkiv_db_redb::{CountingBackend, RedbConfig, RedbStore};
 use arkiv_db_storage::versioned::{SpaceId, StorageErrorKind, VersionedStore};
 use common::{BenchDir, block, commit};
-use redb::{BackendError, StorageBackend, backends::FileBackend};
+use redb::{StorageBackend, backends::FileBackend};
 
 /// Forwards I/O but not locks (redb's defaults: unsupported).
 #[derive(Debug)]
@@ -103,7 +103,6 @@ fn every_lock_method_is_forwarded() {
     assert!(first.try_lock_range(other.0, other.1).unwrap());
     assert_eq!(first.probe().lock_calls(), 7);
     first.close().unwrap();
-    let _: Option<BackendError> = None;
 }
 
 #[test]

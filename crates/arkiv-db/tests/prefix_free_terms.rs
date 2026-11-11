@@ -212,7 +212,7 @@ fn check_strings(limits: Limits) {
     let strings = tricky_strings(max);
     let values: Vec<Value> = strings.iter().map(|s| Value::str(s)).collect();
     let (engine, model) = fixture(limits, &values);
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     // `terms` lists every distinct value in byte order.
     let listed = snapshot
         .terms(
@@ -331,7 +331,7 @@ fn indexed_string_admission_is_consistent_per_profile() {
         (generic, Value::INDEXED_LEN_CEILING),
     ] {
         let (engine, _) = fixture(limits, &[]);
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         for (len, accepted) in [(admitted, true), (admitted + 1, false)] {
             // UTF-8 bytes, not characters: a two-byte character over the edge.
             for text in ["x".repeat(len), format!("{}é", "x".repeat(len - 2))] {
@@ -469,7 +469,7 @@ fn every_scalar_type_orders_and_proves_like_the_model() {
     ];
     for values in groups {
         let (engine, model) = fixture(Limits::DEFAULT, &values);
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         let tag = values[0].tag();
         let mut sorted = values.clone();
         sorted.sort_by(|a, b| a.cmp_ordered(b).unwrap());
@@ -513,7 +513,7 @@ fn tampered_or_misdirected_proofs_never_verify_to_another_result() {
         .map(Value::str)
         .collect();
     let (engine, model) = fixture(Limits::DEFAULT, &values);
-    let snapshot = engine.snapshot(engine.head()).unwrap();
+    let snapshot = engine.head_snapshot();
     // Equality for "a": a different attribute, type or value must not accept
     // the proof of another request.
     let honest = eq_request(&snapshot, "v", Value::str("a"));
@@ -665,7 +665,7 @@ fn ceiling_profile_longest_names_and_values_query_and_prove() {
     ];
     // One record each, plus a single-entry namespace whose term map is one
     // leaf holding the whole 548-byte key.
-    for values in [strings.clone(), vec![long.clone()]] {
+    for values in [strings, vec![long]] {
         let mut engine = Engine::with_limits(PriceSchedule::FIXTURE, limits);
         let mut branch = engine.begin(engine.head(), None).unwrap();
         branch
@@ -699,7 +699,7 @@ fn ceiling_profile_longest_names_and_values_query_and_prove() {
             });
         }
         engine.publish(&branch.seal()).unwrap();
-        let snapshot = engine.snapshot(engine.head()).unwrap();
+        let snapshot = engine.head_snapshot();
         for (index, text) in values.iter().enumerate() {
             let request = EqRequest {
                 snapshot: snapshot_ref(&snapshot),

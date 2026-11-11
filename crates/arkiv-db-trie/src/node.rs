@@ -35,9 +35,8 @@ pub type ObjectId = B256;
 
 /// A reference to a node from a map handle or a parent node.
 ///
-/// Links own no loader or store context. A [`Stored`](Self::Stored) link is
-/// only an id; reading through it takes a [`NodeLoader`](crate::NodeLoader)
-/// argument. Cloning a link is O(1).
+/// A [`Stored`](Self::Stored) link is only an id; reading through it takes
+/// a [`NodeLoader`](crate::NodeLoader) argument. Cloning a link is O(1).
 pub enum Link<V> {
     /// No node: an empty map, or an unused branch slot.
     Empty,
@@ -181,7 +180,7 @@ impl<V: TrieValue> NodeBox<V> {
     /// Computed on first use and cached. Computing it for a node built in
     /// memory hashes its dirty descendants; it never reads the store,
     /// because a stored child's reference is its id.
-    pub fn reference(&self) -> &RlpNode {
+    pub(crate) fn reference(&self) -> &RlpNode {
         self.rlp.get_or_init(|| {
             let mut encoding = Vec::new();
             self.node.encode(&mut encoding);
@@ -282,7 +281,8 @@ impl<V: TrieValue> Node<V> {
     }
 }
 
-/// The shared encoders for persistent and streaming construction.
+// The encoders shared by persistent and streaming construction.
+
 pub(crate) fn encode_leaf(path: &[u8], value: &[u8], out: &mut Vec<u8>) {
     let mut encoded_path = Vec::with_capacity(nibbles::encoded_path_len(path.len()));
     nibbles::encode_path(path, true, &mut encoded_path);
@@ -674,7 +674,7 @@ mod tests {
         });
         let id = keccak256(&leaf);
         assert!(NodeBox::<Vec<u8>>::decode_stored(&id, &leaf).is_ok());
-        let mut flipped = leaf.clone();
+        let mut flipped = leaf;
         flipped[10] ^= 1;
         assert_eq!(
             NodeBox::<Vec<u8>>::decode_stored(&id, &flipped).unwrap_err(),
@@ -726,7 +726,7 @@ mod tests {
         let mut trailing = leaf.clone();
         trailing.push(0);
         assert!(decode_raw(&trailing).is_err());
-        let mut junk_padding = leaf.clone();
+        let mut junk_padding = leaf;
         // [0xc4, 0x82, 0x20, 0x12, 0x05]: set the even path's low nibble.
         junk_padding[2] = 0x21;
         assert!(decode_raw(&junk_padding).is_err());
@@ -810,7 +810,7 @@ mod tests {
         // of returning an error. Our decoder returns the node.
         let path: Vec<u8> = vec![0x5; 70];
         let node = encode(&Node::Leaf {
-            path: path.clone().into_boxed_slice(),
+            path: path.into_boxed_slice(),
             value: vec![1],
         });
         let outcome = std::panic::catch_unwind(|| {

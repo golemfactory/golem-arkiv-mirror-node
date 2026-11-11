@@ -289,7 +289,7 @@ fn reader_recovery_rejects_old_candidates_but_keeps_pinned_snapshots_readable() 
 #[test]
 fn foreign_stale_and_reopened_candidates_are_rejected_without_a_commit() {
     let (store, mut engine) = seeded();
-    let mut memory = Engine::new(PriceSchedule::FIXTURE);
+    let memory = Engine::new(PriceSchedule::FIXTURE);
     let foreign = memory.begin(memory.head(), None).unwrap().seal();
     assert_eq!(
         engine.prepare(foreign).unwrap_err().error,
@@ -311,9 +311,6 @@ fn foreign_stale_and_reopened_candidates_are_rejected_without_a_commit() {
         DurableError::Engine(EngineError::ForeignCandidate)
     );
     assert_eq!(store.stats().committed, commits);
-    // Keep the memory facade's ordinary publication path covered unchanged.
-    let candidate = memory.begin(memory.head(), None).unwrap().seal();
-    memory.publish(&candidate).unwrap();
 }
 
 #[test]
@@ -556,9 +553,7 @@ fn metadata_and_manifest_damage_is_rejected_on_open() {
         hash: [0x99; 32],
     }));
     assert_eq!(
-        storage_kind(
-            DurableEngine::open(store.clone(), genesis(), Options::default()).unwrap_err()
-        ),
+        storage_kind(DurableEngine::open(store, genesis(), Options::default()).unwrap_err()),
         StorageErrorKind::Corrupt
     );
 }
@@ -592,9 +587,7 @@ fn expected_identity_and_unknown_complete_versions_are_incompatible() {
         StorageErrorKind::Incompatible
     );
     assert_eq!(
-        storage_kind(
-            DurableEngine::initialize(store.clone(), genesis(), Options::default()).unwrap_err()
-        ),
+        storage_kind(DurableEngine::initialize(store, genesis(), Options::default()).unwrap_err()),
         StorageErrorKind::Incompatible
     );
 }
@@ -1231,10 +1224,6 @@ fn sequence_exhaustion_fails_before_hashing_staging_or_commit() {
     assert_eq!(engine.head(), id(u64::MAX));
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent reads through the durable context
-// ---------------------------------------------------------------------------
-
 type ReadHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A latching faulty store whose object reads first run a test hook, and
@@ -1391,7 +1380,7 @@ fn concurrent_readers_are_inside_the_store_read_at_the_same_time() {
     let met = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(AtomicUsize::new(0));
     let hook = {
-        let (rendezvous, met, entered) = (rendezvous.clone(), met.clone(), entered.clone());
+        let (rendezvous, met, entered) = (rendezvous, met.clone(), entered.clone());
         // Only each thread's first read waits: a serialized context would
         // let the second reader in only after the first gave up.
         move || {
@@ -1438,12 +1427,8 @@ fn recovery_waits_for_an_in_flight_reader() {
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let blocked = Arc::new(AtomicBool::new(false));
     let hook = {
-        let (entered, release, blocked, store_events) = (
-            entered.clone(),
-            release.clone(),
-            blocked.clone(),
-            store.clone(),
-        );
+        let (entered, release, blocked, store_events) =
+            (entered.clone(), release.clone(), blocked, store.clone());
         move || {
             // Only the first read blocks.
             if blocked.swap(true, Ordering::SeqCst) {
@@ -1554,7 +1539,7 @@ fn cold_warm_and_disabled_caches_report_identical_logical_work() {
     let candidate = put_candidate(&engine, b"value");
     commit(&mut engine, candidate);
     let disabled = DurableEngine::open(
-        store.clone(),
+        store,
         genesis(),
         Options {
             cache_bytes: 0,

@@ -1,8 +1,10 @@
 //! Diagnostic full-node tree reads; these responses are not light-node proofs.
+
 use super::{Node, Shared, parse, snapshot};
 use crate::{
     signed::{Error, Result},
     simulator::wire::{REQUEST_CAP, hex, number, pack},
+    value_json::to_json,
 };
 use arkiv_db::{
     NamespaceId,
@@ -26,9 +28,11 @@ struct Request {
     #[serde(default)]
     term_path: Vec<u8>,
 }
+
 fn catalog() -> String {
     "catalog".into()
 }
+
 fn nibbles(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -69,34 +73,178 @@ pub(super) async fn handle(
     let height = number(&q.height)?;
     let admitted = rt.reads.admit()?;
     drop(admission);
-    admitted.run("state/explore", move||{
-        let (certificate,s,identity)={
-            let node=rt.read_node()?;
-            let Node::Full(host)=&*node else{return Err(Error("UnsupportedNodeRole"))};
-            (host.certificate(height)?,host.state(height)?,host.identity.clone())
-        };
-        let h=s.state_header();
-        if h.root()!=certificate.header.state_root{return Err(Error("InvalidProof"))}
-        let m=s.explore_tree(&q.map,ns,&q.path,&q.term_path)?.ok_or(Error("TreePathNotFound"))?;
-        // Values can carry payloads. Bound bytes before hexadecimal/JSON amplification.
-        if m.node.as_ref().is_some_and(|n|n.rlp.len()+n.value.as_ref().map_or(0,Vec::len)>384*1024){return Err(Error("ResponseTooLarge"))}
-        let decoded=match m.decoded {
-            None=>Json::Null,
-            Some(ExploredLeaf::Namespace{descriptor,maps})=>json!({"namespace":descriptor.id.ordinal().to_string(),"name":descriptor.name.as_str(),"owner":hex(descriptor.owner.as_bytes()),"maps":maps.into_iter().map(|(kind,root,count)|json!({"kind":kind,"root":hex(root.as_slice()),"count":count.to_string()})).collect::<Vec<_>>()}),
-            Some(ExploredLeaf::Term{attribute,tag,value,root,count})=>json!({"attribute":attribute,"valueType":crate::simulator::inspection::tag_name(tag),"value":value.as_ref().map(crate::simulator::inspection::typed_value),"existence":value.is_none(),"postingRoot":hex(root.as_slice()),"postingCount":count.to_string(),"termPath":q.path}),
-            Some(ExploredLeaf::RecordId(id))=>json!({"recordId":id.to_string()}),
-            Some(ExploredLeaf::Row{id,key,cells})=>json!({"recordId":id.to_string(),"recordKey":hex(&key),"cellCount":cells.len(),"cells":cells.into_iter().map(|(name,cell)|{
-                let (value,truncated,byte_length)=match &cell.value {
-                    arkiv_db::Value::Bytes(b)=>(json!(hex(&b[..b.len().min(32)])),b.len()>32,Some(b.len())),
-                    arkiv_db::Value::Str(s)=>{let preview:String=s.chars().take(256).collect();let truncated=preview.len()!=s.len();(json!(preview),truncated,Some(s.len()))},
-                    value=>(crate::simulator::inspection::typed_value(value),false,None)
+    admitted
+        .run("state/explore", move || {
+            let (certificate, s, identity) = {
+                let node = rt.read_node()?;
+                let Node::Full(host) = &*node else {
+                    return Err(Error("UnsupportedNodeRole"));
                 };
-                json!({"name":name.as_str(),"kind":if cell.is_attribute(){"attribute"}else{"field"},"valueType":crate::simulator::inspection::tag_name(cell.value.tag()),"value":value,"valueTruncated":truncated,"byteLength":byte_length})
-            }).collect::<Vec<_>>()}),
-        };
-        let tree_node=m.node.map(|n|json!({"path":q.path,"prefix":nibbles(&n.prefix),"hash":hex(n.hash.as_slice()),"rlp":hex(&n.rlp),"kind":match n.kind{NodeKind::Leaf=>"leaf",NodeKind::Extension=>"extension",NodeKind::Branch=>"branch"},"compressedPath":nibbles(&n.compressed_path),"key":n.key.as_ref().map(|k|hex(k)),"valueBytes":n.value.as_ref().map(|v|hex(v)),"decoded":decoded,"children":n.children.into_iter().map(|c|{let mut path=q.path.clone();path.push(c.slot);json!({"slot":c.slot,"kind":if c.hash.is_none(){"empty"}else if c.inline.is_some(){"inline"}else{"hash"},"hash":c.hash.map(|h|hex(h.as_slice())),"rlp":c.inline.map(|b|hex(&b)),"path":path})}).collect::<Vec<_>>()}));
-        let result=json!({"apiVersion":1,"identity":identity,"snapshot":snapshot(&certificate.header),"certificateBytes":pack(&certificate),"verification":{"status":"exploratory","source":"full-node"},"stateComposition":{"domain":"arkiv/state/v1","encodedHeader":pack(&h),"stateRoot":hex(h.root().as_slice()),"catalogRoot":hex(h.catalog_root.as_slice()),"catalogCount":h.catalog_len.to_string(),"hostRoot":hex(h.host_root.as_slice()),"hostCount":h.host_len.to_string()},"map":{"kind":q.map,"namespace":q.namespace,"root":hex(m.root.as_slice()),"count":m.count.to_string(),"termPath":q.term_path},"node":tree_node});
-        crate::simulator::wire::json_bytes(&result,1024*1024)?;
-        Ok(result)
-    }).await
+                (
+                    host.certificate(height)?,
+                    host.state(height)?,
+                    host.identity.clone(),
+                )
+            };
+            let h = s.state_header();
+            if h.root() != certificate.header.state_root {
+                return Err(Error("InvalidProof"));
+            }
+            let m = s
+                .explore_tree(&q.map, ns, &q.path, &q.term_path)?
+                .ok_or(Error("TreePathNotFound"))?;
+            // Values can carry payloads. Bound bytes before hexadecimal/JSON amplification.
+            let node_bytes = m
+                .node
+                .as_ref()
+                .map_or(0, |n| n.rlp.len() + n.value.as_ref().map_or(0, Vec::len));
+            if node_bytes > 384 * 1024 {
+                return Err(Error("ResponseTooLarge"));
+            }
+            let decoded = match m.decoded {
+                None => Json::Null,
+                Some(ExploredLeaf::Namespace { descriptor, maps }) => {
+                    let maps = maps
+                        .into_iter()
+                        .map(|(kind, root, count)| {
+                            json!({
+                                "kind": kind,
+                                "root": hex(root.as_slice()),
+                                "count": count.to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "namespace": descriptor.id.ordinal().to_string(),
+                        "name": descriptor.name.as_str(),
+                        "owner": hex(descriptor.owner.as_bytes()),
+                        "maps": maps,
+                    })
+                }
+                Some(ExploredLeaf::Term {
+                    attribute,
+                    tag,
+                    value,
+                    root,
+                    count,
+                }) => json!({
+                    "attribute": attribute,
+                    "valueType": tag.name(),
+                    "value": value.as_ref().map(to_json),
+                    "existence": value.is_none(),
+                    "postingRoot": hex(root.as_slice()),
+                    "postingCount": count.to_string(),
+                    "termPath": q.path,
+                }),
+                Some(ExploredLeaf::RecordId(id)) => json!({"recordId":id.to_string()}),
+                Some(ExploredLeaf::Row { id, key, cells }) => {
+                    let cell_count = cells.len();
+                    let cells = cells
+                        .into_iter()
+                        .map(|(name, cell)| {
+                            let (value, truncated, byte_length) = match &cell.value {
+                                arkiv_db::Value::Bytes(b) => (
+                                    json!(hex(&b[..b.len().min(32)])),
+                                    b.len() > 32,
+                                    Some(b.len()),
+                                ),
+                                arkiv_db::Value::Str(s) => {
+                                    let preview: String = s.chars().take(256).collect();
+                                    let truncated = preview.len() != s.len();
+                                    (json!(preview), truncated, Some(s.len()))
+                                }
+                                value => (to_json(value), false, None),
+                            };
+                            let kind = if cell.is_attribute() {
+                                "attribute"
+                            } else {
+                                "field"
+                            };
+                            json!({
+                                "name": name.as_str(),
+                                "kind": kind,
+                                "valueType": cell.value.tag().name(),
+                                "value": value,
+                                "valueTruncated": truncated,
+                                "byteLength": byte_length,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "recordId": id.to_string(),
+                        "recordKey": hex(&key),
+                        "cellCount": cell_count,
+                        "cells": cells,
+                    })
+                }
+            };
+            let tree_node = m.node.map(|n| {
+                let kind = match n.kind {
+                    NodeKind::Leaf => "leaf",
+                    NodeKind::Extension => "extension",
+                    NodeKind::Branch => "branch",
+                };
+                let children = n
+                    .children
+                    .into_iter()
+                    .map(|c| {
+                        let mut path = q.path.clone();
+                        path.push(c.slot);
+                        let kind = if c.hash.is_none() {
+                            "empty"
+                        } else if c.inline.is_some() {
+                            "inline"
+                        } else {
+                            "hash"
+                        };
+                        json!({
+                            "slot": c.slot,
+                            "kind": kind,
+                            "hash": c.hash.map(|h| hex(h.as_slice())),
+                            "rlp": c.inline.map(|b| hex(&b)),
+                            "path": path,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "path": q.path,
+                    "prefix": nibbles(&n.prefix),
+                    "hash": hex(n.hash.as_slice()),
+                    "rlp": hex(&n.rlp),
+                    "kind": kind,
+                    "compressedPath": nibbles(&n.compressed_path),
+                    "key": n.key.as_ref().map(|k| hex(k)),
+                    "valueBytes": n.value.as_ref().map(|v| hex(v)),
+                    "decoded": decoded,
+                    "children": children,
+                })
+            });
+            let result = json!({
+                "apiVersion": 1,
+                "identity": identity,
+                "snapshot": snapshot(&certificate.header),
+                "certificateBytes": pack(&certificate),
+                "verification": {"status": "exploratory", "source": "full-node"},
+                "stateComposition": {
+                    "domain": "arkiv/state/v1",
+                    "encodedHeader": pack(&h),
+                    "stateRoot": hex(h.root().as_slice()),
+                    "catalogRoot": hex(h.catalog_root.as_slice()),
+                    "catalogCount": h.catalog_len.to_string(),
+                    "hostRoot": hex(h.host_root.as_slice()),
+                    "hostCount": h.host_len.to_string(),
+                },
+                "map": {
+                    "kind": q.map,
+                    "namespace": q.namespace,
+                    "root": hex(m.root.as_slice()),
+                    "count": m.count.to_string(),
+                    "termPath": q.term_path,
+                },
+                "node": tree_node,
+            });
+            crate::simulator::wire::json_bytes(&result, 1024 * 1024)?;
+            Ok(result)
+        })
+        .await
 }

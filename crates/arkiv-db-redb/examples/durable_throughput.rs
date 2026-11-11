@@ -122,7 +122,7 @@ fn main() {
         cache_entries: entries as usize,
         ..Options::default()
     };
-    let mut engine = match DurableEngine::initialize(store.clone(), genesis(), options).unwrap() {
+    let mut engine = match DurableEngine::initialize(store, genesis(), options).unwrap() {
         Initialization::Committed(engine) => engine,
         other => panic!("initialization: {other:?}"),
     };

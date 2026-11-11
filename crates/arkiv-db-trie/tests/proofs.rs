@@ -1,24 +1,15 @@
 //! Point proofs and the strict verifier `walk`.
 //!
-//! Establishes: generated proofs equal the independent proofs of
-//! `ProofRetainer` (keys ≤ 32 bytes, retained entries under 32 bytes other
-//! than the root dropped because they are inline) and of the reference
-//! construction (33- and 88-byte keys), for present and absent keys; `walk`
-//! returns exactly the model's answer for every honest proof, including
-//! the empty map and single-entry maps whose root node is under 32 bytes;
-//! honest proofs whose root node is at least 32 bytes also pass
-//! `alloy_trie::proof::verify_proof`; `alloy_trie::proof::verify_proof`
-//! alone is unsound as a verifier (it accepts truncated inclusion proofs as
-//! absence, a node supplied after a leaf whose value is that node's
-//! reference, and a hash reference as a value), and `walk` rejects each of
-//! those forgeries; under randomized mutation (bit flips, truncation of the
-//! list and of node bytes, reordering, duplication, extra nodes, inline
-//! nodes supplied separately, wrong roots, proofs of another key or of an
-//! older root) `walk` never panics and never returns a value other than
-//! the honest one; self-consistent adversarial tries (hashes fixed up after
-//! mutating node contents) and random garbage never make it panic; a key
-//! of the wrong length (a caller error `walk` cannot detect) is never
-//! proven included.
+//! Generated proofs are compared with `ProofRetainer` (keys ≤ 32 bytes;
+//! retained entries under 32 bytes other than the root are inline and
+//! dropped) and with the reference construction in `support` (33- and
+//! 88-byte keys). `walk` must return the model's answer for every honest
+//! proof, and under mutation, self-consistent adversarial tries and garbage
+//! it must neither panic nor return another value.
+//! `alloy_trie::proof::verify_proof` alone is unsound as a verifier: three
+//! tests build forgeries it accepts and `walk` rejects. A key of the wrong
+//! length is a caller error `walk` cannot detect; it is never proven
+//! included.
 
 mod support;
 

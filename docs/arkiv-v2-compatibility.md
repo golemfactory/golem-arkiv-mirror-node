@@ -2,7 +2,7 @@
 
 The node (`arkiv-node`) implements the Arkiv SDK's user-defined-columns (UDC)
 entity model as its host protocol (`arkiv-entity-v3` in status capabilities,
-protocol version 2). There is one build and one protocol: every chain reserves
+protocol version 5). There is one build and one protocol: every chain reserves
 namespace 1 for Arkiv entities, and the database engine (`arkiv-db`) has a
 single layout. The earlier payload model (`arkiv-entity-v2`, with `$payload`
 and `$contentType`) is retired; see the
@@ -50,13 +50,14 @@ values and proofs are never feed or database metadata.
 
 | Boundary | Value |
 | --- | --- |
-| Engine layout, canonical codec, state format | 1 |
-| Name / indexed-value / term-key bytes (hard caps) | 32 / 128 / 164 |
+| Engine layout and state format | 2 |
+| Canonical codec | 1 |
+| Name / indexed-value / term-key bytes (hard caps) | 32 / 512 / 548 |
 | Proof profiles | `eq-page-v1`, `range-complete-v1` |
-| Node block format / protocol | 1 / 1 (every header carries the state root) |
+| Node block format / protocol | 5 / 5 (every header carries the state root) |
 | Durable engine magic | ARKENG01 |
 | Simulator run / light store | 1 / ARKSIMLIGHT1 |
-| Record-key encoding | 33 bytes |
+| Record-key encoding | `len ‖ bytes`, 2 to 33 bytes |
 
 The cell limits within the hard caps are chain parameters (`Limits`, set in
 the genesis): the entity profile sets 32-byte names, 128-byte indexed

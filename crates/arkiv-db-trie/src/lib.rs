@@ -7,9 +7,7 @@
 //! below 32 bytes and by keccak256 otherwise). Its shape is canonical, so
 //! the root hash is a function of the key/value set alone and matches
 //! `alloy_trie::HashBuilder` over the same sorted leaves. It is the one
-//! structure the engine's state is built from (node step N3a of
-//! `docs/node-storage-plan.md`; the engine uses it since N3b, and its
-//! persistence and proofs are N3c–N3d).
+//! structure the engine's state is built from.
 //!
 //! - **Persistence and sharing.** A handle is a root [`Link`] plus the
 //!   entry count. Updates copy the nodes on one key path and share the
@@ -37,6 +35,8 @@
 //! - **Proofs.** [`MerkleMap::proof`] yields the root node and every
 //!   hash-referenced node on a key's path; [`walk`] is the strict verifier
 //!   that returns the proven value or rejects the proof.
+//!   [`MerkleMap::interval_proof`] and [`walk_interval`] do the same for
+//!   every entry of a key interval.
 //! - **Visit counting.** Every operation reports a [`Probe`]: nodes
 //!   examined (independent of what was cached or loaded) and loads made.
 //! - **Key encodings.** [`TrieKey`] bounds a key's length and fixes its

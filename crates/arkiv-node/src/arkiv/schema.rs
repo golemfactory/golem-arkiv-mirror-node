@@ -1,4 +1,5 @@
 //! Public adapter: SDK IDs are deliberately independent of engine tags.
+
 use super::ArkivFault;
 use alloy_primitives::U256;
 use arkiv_db::{Cell, CellKind, CellName, Row, Value};
@@ -17,6 +18,7 @@ pub enum ArkivTypeId {
     Addr = 9,
     Key = 10,
 }
+
 impl ArkivTypeId {
     pub fn of(value: &Value) -> Result<Self, ArkivFault> {
         Ok(match value {
@@ -35,6 +37,7 @@ impl ArkivTypeId {
         })
     }
 }
+
 pub fn protocol_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
@@ -43,6 +46,7 @@ pub fn protocol_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
+
 pub fn sdk_safe_name(name: &str) -> bool {
     protocol_name(name)
         && !name.contains("--")
@@ -68,6 +72,7 @@ pub fn sdk_safe_name(name: &str) -> bool {
         ]
         .contains(&name.to_ascii_lowercase().as_str())
 }
+
 /// Bit 7 of an ABI `typeId`: the attribute is indexed. The low seven bits
 /// are the [`ArkivTypeId`].
 pub const INDEXED_FLAG: u8 = 0x80;
@@ -97,6 +102,7 @@ pub fn validate_value(value: &Value) -> Result<(), ArkivFault> {
         _ => Ok(()),
     }
 }
+
 /// A user attribute as written: an SDK-safe name and an SDK value, indexed
 /// ([`CellKind::Attribute`]) or not ([`CellKind::Field`]). `bytes` is stored
 /// but never indexed. `$` names belong to the host.
@@ -110,6 +116,7 @@ pub fn validate_user_cell(name: &CellName, cell: &Cell) -> Result<(), ArkivFault
     }
     Ok(())
 }
+
 pub fn validate_remove(name: &CellName) -> Result<(), ArkivFault> {
     if sdk_safe_name(name.as_str()) {
         Ok(())
@@ -117,6 +124,7 @@ pub fn validate_remove(name: &CellName) -> Result<(), ArkivFault> {
         Err(ArkivFault::Name)
     }
 }
+
 /// The bytes held by the `bytes` values among `cells`.
 pub fn entity_bytes<'a>(cells: impl IntoIterator<Item = &'a (CellName, Cell)>) -> usize {
     cells
@@ -127,6 +135,7 @@ pub fn entity_bytes<'a>(cells: impl IntoIterator<Item = &'a (CellName, Cell)>) -
         })
         .sum()
 }
+
 /// Parse decimal scaled units without floating point or rounding.
 pub fn parse_decimal(input: &str) -> Result<[u8; 32], ArkivFault> {
     let (negative, s) = match input.as_bytes().first() {
@@ -156,6 +165,7 @@ pub fn parse_decimal(input: &str) -> Result<[u8; 32], ArkivFault> {
     }
     .to_be_bytes())
 }
+
 pub fn format_decimal(bytes: &[u8; 32]) -> String {
     let value = U256::from_be_bytes(*bytes);
     let negative = bytes[0] & 128 != 0;
@@ -189,6 +199,7 @@ pub struct ArkivEntityProjection {
     /// indexed ([`CellKind::Attribute`]) or only stored ([`CellKind::Field`]).
     pub attributes: Vec<(CellName, Cell)>,
 }
+
 impl ArkivEntityProjection {
     /// The user attribute `name`, if the entity holds one.
     pub fn attribute(&self, name: &str) -> Option<&Cell> {
@@ -198,6 +209,7 @@ impl ArkivEntityProjection {
             .map(|(_, c)| c)
     }
 }
+
 pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
     let structural: [u8; 32] = row
         .key
@@ -209,16 +221,12 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
     if row.cells.windows(2).any(|w| w[0].0 >= w[1].0) {
         return Err(ArkivFault::Corrupt);
     }
-    let mut seen = std::collections::BTreeSet::new();
     for (name, cell) in &row.cells {
-        if !seen.insert(name) {
-            return Err(ArkivFault::Corrupt);
-        }
         validate_value(&cell.value).map_err(|_| ArkivFault::Corrupt)?;
         let system = |valid: bool, kind: CellKind| valid && cell.kind == kind;
         let expected = match name.as_str() {
             "$key" => system(
-                matches!(cell.value,Value::Key(k) if k==structural),
+                matches!(cell.value, Value::Key(k) if k == structural),
                 CellKind::Attribute,
             ),
             "$creator" | "$owner" => {
@@ -227,7 +235,10 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
             "$createdAt" | "$updatedAt" | "$expiresAt" => {
                 system(matches!(cell.value, Value::U64(_)), CellKind::Attribute)
             }
-            "$creationFlags" => system(matches!(cell.value,Value::U64(n) if n<=3), CellKind::Field),
+            "$creationFlags" => system(
+                matches!(cell.value, Value::U64(n) if n <= 3),
+                CellKind::Field,
+            ),
             // Users write indexed or unindexed attributes; `bytes` only unindexed.
             n => {
                 protocol_name(n) && !(cell.is_attribute() && matches!(cell.value, Value::Bytes(_)))
@@ -276,6 +287,7 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
     }
     Ok(result)
 }
+
 pub fn validate_proven_row(row: &Row) -> Result<(), ArkivFault> {
     project(row).map(|_| ())
 }
@@ -317,6 +329,7 @@ pub fn decode_abi_value(type_id: u8, bytes: &[u8]) -> Result<Value, ArkivFault> 
     validate_value(&value)?;
     Ok(value)
 }
+
 pub fn encode_abi_value(value: &Value) -> Result<Vec<u8>, ArkivFault> {
     validate_value(value)?;
     let mut word = [0; 32];
@@ -336,12 +349,14 @@ pub fn encode_abi_value(value: &Value) -> Result<Vec<u8>, ArkivFault> {
     }
     Ok(word.to_vec())
 }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbiAttribute {
     pub name: [u8; 32],
     pub type_id: u8,
     pub value: Vec<u8>,
 }
+
 /// Strict protocol triple validation; SDK-safe authoring is a separate policy.
 ///
 /// The low seven bits of `typeId` are the [`ArkivTypeId`] and bit 7
@@ -397,41 +412,4 @@ pub fn decode_protocol_triples(
         result.push((name, cell));
     }
     Ok(result)
-}
-
-/// Production's natural-width stored value bytes, distinct from ABI words and
-/// ordered term bytes. Generic row framing continues to use its own engine codec.
-pub fn encode_natural_value(value: &Value) -> Result<Vec<u8>, ArkivFault> {
-    validate_value(value)?;
-    Ok(match value {
-        Value::Bool(v) => vec![u8::from(*v)],
-        Value::I32(v) => v.to_be_bytes().to_vec(),
-        Value::U64(v) => v.to_be_bytes().to_vec(),
-        Value::U256(v) | Value::Dec(v) | Value::Bytes32(v) | Value::Key(v) => v.to_vec(),
-        Value::Addr(v) => v.to_vec(),
-        Value::Str(v) => v.as_bytes().to_vec(),
-        Value::Bytes(v) => v.to_vec(),
-        // i64 and the golem-grid scalars are not SDK types.
-        _ => return Err(ArkivFault::Value),
-    })
-}
-pub fn decode_natural_value(type_id: u8, bytes: &[u8]) -> Result<Value, ArkivFault> {
-    let width = match type_id {
-        1 => 1,
-        2 => 4,
-        3 => 8,
-        9 => 20,
-        4..=6 | 10 => 32,
-        7 | 8 => return decode_abi_value(type_id, bytes),
-        _ => return Err(ArkivFault::Value),
-    };
-    if bytes.len() != width {
-        return Err(ArkivFault::Value);
-    }
-    let mut word = [0u8; 32];
-    if type_id == 2 && bytes[0] & 128 != 0 {
-        word.fill(255);
-    }
-    word[32 - width..].copy_from_slice(bytes);
-    decode_abi_value(type_id, &word)
 }

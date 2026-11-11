@@ -1,22 +1,28 @@
 //! Resource policy for private bulk genesis construction and final installation.
+
 use arkiv_db::durable::Options;
 use arkiv_db_redb::RedbConfig;
 use std::path::Path;
 type Result<T> = std::result::Result<T, String>;
+
 fn err(e: impl std::fmt::Display) -> String {
     format!("import resources: {e}")
 }
+
 /// One redb cache plus decoded engine caches remain bounded independently of rows.
 const IMPORT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const IMPORT_CACHE_ENTRIES: usize = 262_144;
+
 pub fn import_options(mut options: Options) -> Options {
     options.cache_bytes = IMPORT_CACHE_BYTES;
     options.cache_entries = IMPORT_CACHE_ENTRIES;
     options
 }
+
 pub fn import_redb_config() -> RedbConfig {
     RedbConfig::with_cache_size(IMPORT_CACHE_BYTES)
 }
+
 /// Enforce a configurable free-space reserve before growing an import.
 /// `additional_bytes` is a conservative projection, not an exact disk quota.
 /// Operational full imports should set ARKIV_PREFILL_RESERVE_GIB=80 or higher.
@@ -44,7 +50,8 @@ pub fn check_disk(path: &Path, additional_bytes: u64) -> Result<()> {
     let available = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
     if available < u128::from(required) {
         return Err(format!(
-            "insufficient prefill disk space: available={available} required={required} bytes (including reserve)"
+            "insufficient prefill disk space: \
+             available={available} required={required} bytes (including reserve)"
         ));
     }
     Ok(())

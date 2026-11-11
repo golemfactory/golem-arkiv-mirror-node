@@ -6,7 +6,7 @@ mod trie_support;
 use arkiv_db::{
     B256, Budget, Cell, CellName, Decode, Decoder, Effect, Encoder, Engine, Limits, NamespaceId,
     NamespaceName, OperationClass as Op, OwnerId, PriceSchedule, RecordId, RecordKey, Row,
-    Snapshot, StateHeader, Value, WriteOp,
+    Snapshot, StateHeader, Value, WriteOp, decode_exact, encode,
     proof::{
         EqCursor, EqQuery, EqRequest, ProofError, ProofLimits, SnapshotRef, VerifiedContinuation,
         VerifiedEq, verify_eq,
@@ -388,7 +388,7 @@ fn fixed_root_rejects_omissions_membership_only_pages_and_all_witness_mutations(
     let mut extra = bytes.clone();
     extra.push(0);
     assert!(verify(&req, None, &extra).is_err());
-    let mut extra_node = original.clone();
+    let mut extra_node = original;
     extra_node.catalog.push(vec![0x80]);
     assert!(verify(&req, None, &extra_node.bytes()).is_err());
     for byte in [0, 3, 7, 50, bytes.len() - 1] {
@@ -565,7 +565,7 @@ fn resource_caps_reject_before_large_allocation_and_never_return_partial_rows() 
         verify(&req, None, &bad),
         Err(ProofError::ProofLimitExceeded)
     );
-    let mut bad = bytes.clone();
+    let mut bad = bytes;
     bad[..4].copy_from_slice(&999u32.to_be_bytes());
     assert_eq!(
         verify(&req, None, &bad),
@@ -610,11 +610,9 @@ fn codecs_have_literal_version_two_vectors_and_reject_unknown_tags() {
     assert_eq!(encode(&cursor), expected_cursor);
     assert_eq!(decode_exact::<EqCursor>(&expected_cursor).unwrap(), cursor);
     for at in [3, 17, 26, 27] {
-        if at < expected.len() {
-            let mut bytes = expected;
-            bytes[at] = 99;
-            assert!(decode_exact::<EqQuery>(&bytes).is_err());
-        }
+        let mut bytes = expected;
+        bytes[at] = 99;
+        assert!(decode_exact::<EqQuery>(&bytes).is_err());
     }
     let mut extra = expected_cursor;
     extra.push(0);
@@ -1210,5 +1208,3 @@ fn inspection_binds_map_roots_keys_and_complete_posting_reconstruction() {
         Err(ProofError::ProofLimitExceeded)
     );
 }
-
-use arkiv_db::{decode_exact, encode};

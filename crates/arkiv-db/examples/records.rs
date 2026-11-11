@@ -1,4 +1,4 @@
-//! The milestone-2 flow: typed records with attributes and fields written in
+//! The record flow: typed records with attributes and fields written in
 //! metered blocks, queries over the attribute indexes (equality, range,
 //! prefix, inequality and negation, AND, OR and projection), a patch that
 //! moves a record between type indexes, a keyset walk pinned to one snapshot
@@ -34,10 +34,6 @@ const BLOCK_BUDGET: Cost = Cost::new(2_000);
 /// Per-operation budgets: writes are capped, reads run to completion.
 const WRITE: Budget = Budget::limit(500);
 const READ: Budget = Budget::unlimited();
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
 
 fn name(text: &str) -> CellName {
     CellName::new(text).expect("a valid cell name")
@@ -168,12 +164,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let after_block_2 = engine.head_snapshot();
     assert_eq!(after_block_2.typed_record_count(shop), Some(4));
 
-    // -----------------------------------------------------------------------
     // Queries against the state after block 2. Every query pays
     // DirectoryLookup 1, then QueryGroup 5 per group, then whatever the
     // group's first literal needs to position itself, then per candidate
     // revealed and per row emitted.
-    // -----------------------------------------------------------------------
 
     // Eq seeks the value term kind="book" (TermSeek 4) and reads its posting
     // {1, 2} entry by entry (PostingEntry 2). Each emitted row pays ResultRow 3
@@ -276,7 +270,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check("count records with a u64 $expiresAt", &counted.receipt, 14);
     assert_eq!(counted.value, 4);
 
-    // -----------------------------------------------------------------------
     // Block 3: a patch changes the type of sku/1's price from I64 to U64 and
     // drops its note. The record leaves the (price, I64) index, whose value
     // term 10 is now empty and dropped, and joins a brand new (price, U64)
@@ -290,13 +283,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // terms) = 20, two inserts {IndexInsert 6 + IndexTermCreate 30 +
     // RootUpdate 4} (new value and existence terms) = 80. Total 1 + 3 + 79 +
     // 20 + 80 = 183.
-    // -----------------------------------------------------------------------
     let mut branch = engine.begin(engine.head(), Some(BLOCK_BUDGET))?;
     let patch = WriteOp::PatchRecord {
         namespace: shop,
         key: key("sku/1"),
         set: vec![(price.clone(), Cell::attribute(Value::U64(10)))],
-        remove: vec![note.clone()],
+        remove: vec![note],
     };
     let patched = branch.execute(ALICE, patch, WRITE)?;
     assert_eq!(patched.effect, Effect::RecordPatched { id: rec(1) });
@@ -323,9 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sealed = branch.seal();
     blocks.record(BlockNumber(3), engine.publish(&sealed)?)?;
 
-    // -----------------------------------------------------------------------
     // Keyset walk pinned to block 3 while block 4 publishes.
-    // -----------------------------------------------------------------------
     let pinned = engine.head_snapshot();
     let everything = Query::match_all();
 
@@ -336,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page_1 = pinned.query(shop, &everything, &Projection::KEY_ONLY, 2, None, READ)?;
     check("walk page 1 at block 3", &page_1.receipt, 25);
     assert_eq!(ids(&page_1.value), [1, 2]);
-    let cursor = page_1.value.next.clone().expect("records 3 and 4 follow");
+    let cursor = page_1.value.next.expect("records 3 and 4 follow");
     assert_eq!(cursor.after(), rec(2));
     assert_eq!(cursor.snapshot(), Some(pinned.id()));
     println!(
@@ -354,7 +344,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         namespace: shop,
         key: key("sku/5"),
         cells: vec![
-            (kind.clone(), Cell::attribute(Value::str("book"))),
+            (kind, Cell::attribute(Value::str("book"))),
             (price.clone(), Cell::attribute(Value::I64(12))),
             (expires_at.clone(), Cell::attribute(Value::U64(7))),
         ],
@@ -406,10 +396,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check("count everything at head", &counted.receipt, 11);
     assert_eq!(counted.value, 5);
 
-    // -----------------------------------------------------------------------
     // History: the block table pins the state after block 2, where sku/1
     // still had an I64 price.
-    // -----------------------------------------------------------------------
     let at_block_2 = blocks.at(&engine, BlockNumber(2))?;
     // Same run as before the patch: 5, 7, 10 visited; ids 1, 3, 4. Total 31.
     let page = at_block_2.query(shop, &cheap, &Projection::ID_ONLY, 10, None, READ)?;
@@ -446,7 +434,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(then.cells.len(), 4);
     assert_eq!(now.cells.len(), 3);
 
-    // -----------------------------------------------------------------------
     // Block 5: host expiry. The engine has no clock; the host deletes, with
     // host authority, every record whose $expiresAt is at most the block
     // number, in the block where it expires. Records 1, 2 and 3 carry 5;
@@ -457,7 +444,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // × 2a. rec:1 has c = 3, a = 3: 1 + 3 + 38 + 60 = 102; rec:2 and rec:3
     // have c = 4, a = 3: 1 + 3 + 42 + 60 = 106 each.
     // The expiry query is a read and never enters the block's receipts.
-    // -----------------------------------------------------------------------
     let mut branch = engine.begin(engine.head(), Some(BLOCK_BUDGET))?;
     let expired = expire_records(&mut branch, shop, &expires_at, BlockNumber(5), READ, WRITE)?;
     for (id, receipt) in &expired {

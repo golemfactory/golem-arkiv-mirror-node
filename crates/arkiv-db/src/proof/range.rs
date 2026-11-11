@@ -8,10 +8,10 @@ use super::*;
 use crate::TypeTag;
 
 pub const RANGE_PROOF_PROFILE: &str = "range-complete-v1";
-// Distinct envelope discriminator; neither equality nor state encoding changes.
+// Version of the request envelope.
 const RANGE_VERSION: u32 = 1;
-// The response envelope: its term-key interval follows the state layout
-// (version 2: unpadded term keys and inclusive/exclusive endpoints).
+// Version of the response envelope: its term-key interval follows the state
+// layout.
 const RANGE_PROOF_VERSION: u32 = crate::LAYOUT_VERSION;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -384,7 +384,7 @@ fn terms_inner<N: AsRef<[u8]>>(
             .collect();
         inspection.interval = Some(InspectedRangeInterval {
             root,
-            range: range.clone(),
+            range,
             supplied_nodes: witness.len(),
             trace,
             leaves,
@@ -640,7 +640,6 @@ fn verify_range_inner(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_range(
     catalog: &Catalog,
     nodes: &Nodes,

@@ -103,7 +103,7 @@ metadata is committed by the canonical header.
 
 The whole-block metadata profile replaces section paging for this bounded genesis.
 At most 128 user operations plus 16 expiry deletions touch terminal records, with
-at most 32 cells per row. Even 512 bytes per maximally escaped attribute, 640 per operation
+at most 39 cells per row (7 system cells and 32 attributes). Even 512 bytes per maximally escaped attribute, 640 per operation
 and an additional 128 × 256 bytes for namespace/key metadata remain below 3 MiB.
 A bounded serializer independently rejects feeds above 4 MiB before publication.
 Canonical bodies are capped at 1 MiB; stored node envelopes have an 8 MiB engine
@@ -139,3 +139,15 @@ parity, historical pages at sizes 1/3/64, all commit outcomes, controls, field
 redaction, shared metadata codecs, header gaps/stale batches, local proof failures,
 real sockets/bootstrap and actual redb write/sync crash cuts. Cross-repository PG
 and deployment measurements are recorded by the simulator integration runner.
+
+## Container image
+
+`Dockerfile.simulator` builds a release `arkiv-simulator` into a slim image
+with `/data` as its working directory:
+
+```sh
+docker build -f Dockerfile.simulator -t arkiv-simulator .
+```
+
+The binary listens on `127.0.0.1:9400` by default, so a container needs
+`--listen 0.0.0.0:9400`. CI does not build the image.

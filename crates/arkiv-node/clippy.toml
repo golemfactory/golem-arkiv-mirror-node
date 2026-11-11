@@ -2,8 +2,7 @@
 # storage error of the persistent engine must abort the candidate block,
 # never be unwrapped into a panic, a rejection or an empty read. These are
 # the infallible forms of every Branch/Snapshot method that walks state,
-# and the infallible expiry sweep. Tests that inspect the memory engine may
-# allow the lint explicitly.
+# and the infallible expiry sweep.
 disallowed-methods = [
     { path = "arkiv_db::engine::Branch::execute", reason = "use try_execute" },
     { path = "arkiv_db::engine::Branch::execute_host", reason = "use try_execute_host" },

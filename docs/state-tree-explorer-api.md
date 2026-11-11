@@ -21,7 +21,7 @@ the node. The HTML contains a direct specification link if the script cannot
 load. No Rust dependency or frontend build step is needed. The embedded OpenAPI
 schemas and examples live beside the handler in
 `crates/arkiv-node/src/signed/state-openapi.json`; update them when the wire format
-changes. The signed API uses the Arkiv v2 layout and state layout 2 (at most 1,096 path steps).
+changes. The signed API uses the Arkiv entity profile and state layout 2 (at most 1,096 path steps).
 
 ## Endpoint
 

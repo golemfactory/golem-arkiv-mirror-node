@@ -131,11 +131,6 @@ impl MemoryNodeStore {
     pub fn overwrite(&mut self, id: ObjectId, bytes: Vec<u8>) {
         self.objects.insert(id, bytes);
     }
-
-    /// Iterates over the stored ids, in no particular order.
-    pub fn ids(&self) -> impl Iterator<Item = &ObjectId> {
-        self.objects.keys()
-    }
 }
 
 impl<V: TrieValue> NodeLoader<V> for MemoryNodeStore {

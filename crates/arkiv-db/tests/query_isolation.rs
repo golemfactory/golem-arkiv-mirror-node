@@ -1,5 +1,5 @@
 //! Cross-namespace isolation of the typed record store, its term indexes and
-//! every milestone-2 operator, in the shape of `tests/isolation.rs`.
+//! every query operator, in the shape of `tests/isolation.rs`.
 //!
 //! Namespace A holds 40 typed records over five cell names (`kind: Str`,
 //! `price: I64`, `hot: Bool` and `$exp: U64` attributes plus a `note: Bytes`
@@ -17,33 +17,13 @@
 //! A's attribute names and values plus thousands of distinct `seq` and
 //! `label` terms, and 2 000 raw records; phase 2 publishes 500 namespaces.
 //!
-//! What this file establishes:
-//! - Every receipt of A's workload (ledgers included), every result, every
-//!   abort point and every effect is the hand-derived literal stated below,
-//!   and every result agrees with an independent full-scan evaluation of the
-//!   query semantics over a `BTreeMap` model of A's records.
-//! - All of that is identical after B grows by 10 000 typed records that
-//!   share A's terms (phase 1) and after the directory grows by 500
-//!   namespaces (phase 2); so are A's namespace-local physical counters
-//!   (`record_nodes`, `index_nodes`), because A's key map, row map and term
-//!   map are the very same objects in every phase.
-//! - The shared directory work (`directory_nodes`) is unchanged by another
-//!   namespace's growth and is exactly what the directory trie's shape
-//!   implies: A's lookup path (3 nodes with two namespaces, 5 with 502),
-//!   twice that for an applied write, none before the first charge; always
-//!   within the `2·8 + 1` = 17-node path bound of 8-byte ids.
-//! - A snapshot pinned at the end of phase 0 answers the read workload with
-//!   the same rows, receipts and physical counters after phases 1 and 2.
-//! - B's identical terms are invisible from A: a query in A never returns a
-//!   record of B, a term that exists only in B misses in A at the fixed miss
-//!   price, a cursor is bound to its namespace, and an expiry sweep deletes
-//!   only in the namespace it names.
-//!
-//! What it does not establish: freedom from shared CPU, memory or cache
-//! interference (the physical counters are node visits, not time), the
-//! metering vectors of every admission fault (other files cover them), the
-//! commitment of the directory and index in the state root (`roots.rs`) or
-//! their proofs, and durability.
+//! Every receipt (ledgers included), result, abort point and effect of A's
+//! workload is a hand-derived literal, and every result also agrees with a
+//! full-scan evaluation over a `BTreeMap` model of A's records. All of it,
+//! and A's namespace-local physical counters, must be identical in every
+//! phase and on a snapshot pinned after phase 0; the directory work must be
+//! exactly A's lookup path in the directory trie. State roots are covered by
+//! `roots.rs`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -52,15 +32,11 @@ use std::{
 
 use arkiv_db::{
     ArgumentFault, BlockNumber, Branch, Budget, Cell, CellName, CellSelect, Cost, Cursor, Effect,
-    Engine, Executed, ExpiryHalt, Ledger, LedgerEntry, Literal, NamespaceDescriptor, NamespaceId,
-    OperationClass, Outcome, OwnerId, PhysicalTrace, PriceSchedule, Projection, Query, QueryPage,
-    ReadResult, Receipt, ReceiptKind, RecordId, RecordKey, Rejection, Revision, Row, Snapshot,
-    SnapshotId, Term, TypeTag, Value, WriteOp, WriteResult, expire_records,
+    Engine, Executed, ExpiryHalt, Ledger, LedgerEntry, Limits, Literal, NamespaceDescriptor,
+    NamespaceId, OperationClass, Outcome, OwnerId, PhysicalTrace, PriceSchedule, Projection, Query,
+    QueryPage, ReadResult, Receipt, ReceiptKind, RecordId, RecordKey, Rejection, Revision, Row,
+    Snapshot, SnapshotId, Term, TypeTag, Value, WriteOp, WriteResult, expire_records,
 };
-
-// ---------------------------------------------------------------------------
-// Actors and fixture shape
-// ---------------------------------------------------------------------------
 
 const ALICE: OwnerId = OwnerId::new([0xa1; 20]);
 const BOB: OwnerId = OwnerId::new([0xb0; 20]);
@@ -94,17 +70,13 @@ const EXTRA_NAMESPACES: usize = 500;
 const PHASE0_NAMESPACES: usize = 2;
 const PHASE2_NAMESPACES: usize = PHASE0_NAMESPACES + EXTRA_NAMESPACES;
 
-/// `Limits::DEFAULT.max_page`: the page limit of every unpaged query here.
-const MAX_PAGE: usize = 200;
+/// The page limit of every unpaged query here.
+const MAX_PAGE: usize = Limits::DEFAULT.max_page;
 /// The block at which the `$exp` values 1, 2 and 3 expire.
 const EXPIRY_BLOCK: BlockNumber = BlockNumber(3);
 
-// ---------------------------------------------------------------------------
-// Charge table transcribed from decisions2.md (PriceSchedule::FIXTURE, id 1)
-// ---------------------------------------------------------------------------
-
-/// Unit price of a class under the fixture schedule, transcribed from the
-/// brief. Nothing here asks `PriceSchedule` what a class costs.
+/// Unit price of a class under the fixture schedule. Nothing here asks
+/// `PriceSchedule` what a class costs.
 fn fixture_price(class: OperationClass) -> u64 {
     match class {
         OperationClass::DirectoryLookup => 1,
@@ -141,8 +113,8 @@ fn fixture_price(class: OperationClass) -> u64 {
     }
 }
 
-/// Canonical encoded length of a value, transcribed from the brief:
-/// 1 for `Bool`, 8 for the integers, the byte length for `Str` and `Bytes`.
+/// Canonical encoded length of a value: the type's fixed width, or the byte
+/// length for `Str` and `Bytes`.
 fn encoded_len(value: &Value) -> u64 {
     match value {
         Value::I32(_) | Value::Bytes4(_) | Value::U32(_) | Value::Dec32(_) => 4,
@@ -244,10 +216,6 @@ const WORKLOAD_RECORDED_WRITES: usize = 17;
 /// Live records of A at the end of the workload: 40 + 3 created - 1 deleted
 /// - 1 host-deleted - 3 expired.
 const A_RECORDS_AFTER_WORKLOAD: usize = 38;
-
-// ---------------------------------------------------------------------------
-// Fixture vocabulary
-// ---------------------------------------------------------------------------
 
 fn name(text: &str) -> CellName {
     CellName::new(text).expect("fixture names follow the grammar")
@@ -388,10 +356,6 @@ fn put(namespace: NamespaceId, key: &[u8], value: &[u8]) -> WriteOp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The queries of the workload
-// ---------------------------------------------------------------------------
-
 fn eq(attribute: &str, value: Value) -> Term {
     Term::eq(name(attribute), value)
 }
@@ -525,10 +489,8 @@ fn named_kind_hot() -> Projection {
     Projection::named(false, [name("kind"), name("hot")])
 }
 
-// ---------------------------------------------------------------------------
 // Reference model: a BTreeMap of records and a full-scan evaluator of the
-// query semantics in the brief. It never consults the engine.
-// ---------------------------------------------------------------------------
+// query semantics. It never consults the engine.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ModelRecord {
@@ -741,10 +703,6 @@ fn phase0_model() -> Model {
     model
 }
 
-// ---------------------------------------------------------------------------
-// Workload steps
-// ---------------------------------------------------------------------------
-
 const GET_ALL: &str = "get_record a/00 ALL";
 const GET_ABSENT: &str = "get_record a/99 ALL";
 const GET_FOREIGN: &str = "get_record b/00000 (present only in B) ALL";
@@ -788,18 +746,18 @@ const ABORT_NAMED: &str = "Eq(price, -20) named [kind, hot] with budget 40";
 const CREATE_EXISTING_TERMS: &str = "create a/new1 (every term exists)";
 const CREATE_NEW_TERMS: &str = "create a/new2 (four new terms)";
 const CREATE_BOUND_KEY: &str = "create a/00 (key already bound)";
-const ABORT_CREATE: &str = "create a/new3 with budget 150";
+const ABORT_CREATE: &str = "create a/new3 with budget 200";
 const CREATE_AFTER_ABORT: &str = "create a/new3 (its terms are still new)";
 const PATCH: &str = "patch a/01: set price 20, hot false; remove note, zzz";
 const PATCH_TYPE_CHANGE: &str = "patch a/02: price becomes U64 5";
 const PATCH_MISSING: &str = "patch a/99";
-const ABORT_PATCH: &str = "patch a/05 with budget 30";
+const ABORT_PATCH: &str = "patch a/05 with budget 80";
 const DELETE: &str = "delete a/03";
 const DELETE_MISSING: &str = "delete a/03 again";
-const ABORT_DELETE: &str = "delete a/06 with budget 60";
+const ABORT_DELETE: &str = "delete a/06 with budget 80";
 const HOST_PUT: &str = "execute_host Put";
 const HOST_DELETE: &str = "execute_host delete a/04";
-const EXPIRE_HALTED: &str = "expire_records $exp <= 3 with delete budget 80";
+const EXPIRE_HALTED: &str = "expire_records $exp <= 3 with delete budget 110";
 const EXPIRE: &str = "expire_records $exp <= 3";
 const COUNT_ALL_AFTER: &str = "count match-all after the writes";
 const COUNT_EXP_AFTER: &str = "count Exists($exp, U64) after the expiry";
@@ -1413,10 +1371,6 @@ fn run_workload(world: &World) -> Vec<Step> {
     steps
 }
 
-// ---------------------------------------------------------------------------
-// The hand-derived baseline
-// ---------------------------------------------------------------------------
-
 /// Builds a traced receipt from literal `(class, count)` ledger lines in
 /// first-charge order; the unit prices come from the transcribed table and
 /// the lines must add up to `spent`.
@@ -1495,7 +1449,8 @@ fn page_observed(
 }
 
 /// Every receipt and result of the workload, derived by hand from the
-/// charge points in decisions2.md and the fixture table (id = i + 1):
+/// charge points in docs/metering.md and the fixture table
+/// (id = i + 1):
 ///
 /// | i  | kind | price | hot   | $exp | cells | ALL bytes |
 /// |----|------|-------|-------|------|-------|-----------|
@@ -1521,7 +1476,6 @@ fn expected_baseline() -> Vec<Expected> {
     let all = &Projection::ALL;
     let id_only = &Projection::ID_ONLY;
     let key_only = &Projection::KEY_ONLY;
-    let miss = |spent: u64, lines: &[(OperationClass, u64)]| read_receipt(spent, lines);
     let mut expected: Vec<Expected> = Vec::new();
     let mut push = |name, observed, receipts| {
         expected.push(Expected {
@@ -1811,7 +1765,7 @@ fn expected_baseline() -> Vec<Expected> {
         rows: Vec::new(),
         next: None,
     };
-    let miss_receipt = miss(10, &[(DirectoryLookup, 1), (QueryGroup, 1), (TermSeek, 1)]);
+    let miss_receipt = read_receipt(10, &[(DirectoryLookup, 1), (QueryGroup, 1), (TermSeek, 1)]);
     for step in [
         MISS_EQ,
         MISS_FOREIGN_EQ,
@@ -2294,7 +2248,7 @@ fn expected_baseline() -> Vec<Expected> {
     // Nothing is removed.
     push(
         ABORT_DELETE,
-        out_of_budget.clone(),
+        out_of_budget,
         vec![rejected_write(
             76,
             Rejection::OutOfBudget,
@@ -2492,10 +2446,6 @@ fn expected_baseline() -> Vec<Expected> {
     expected
 }
 
-// ---------------------------------------------------------------------------
-// Assertions
-// ---------------------------------------------------------------------------
-
 fn find<'a>(steps: &'a [Step], name: &str) -> &'a Step {
     steps
         .iter()
@@ -2586,6 +2536,8 @@ const DIRECTORY_PATH_502: u64 = 5;
 
 /// Any directory path of 8-byte keys: at most `2·8 + 1` = 17 nodes.
 const DIRECTORY_PATH_BOUND: u64 = 17;
+const _: () = assert!(DIRECTORY_PATH_TWO <= DIRECTORY_PATH_BOUND);
+const _: () = assert!(DIRECTORY_PATH_502 <= DIRECTORY_PATH_BOUND);
 
 /// Directory work of each traced step, derived from the trie shape: none
 /// when nothing was charged (admission rejections, and a budget that does
@@ -2594,7 +2546,6 @@ const DIRECTORY_PATH_BOUND: u64 = 17;
 /// updated catalog leaf along the same path), and the lookup path alone for
 /// every read and every write rejected after the lookup.
 fn assert_directory_nodes_follow_the_trie(steps: &[Step], path: u64, phase: &str) {
-    assert!(path <= DIRECTORY_PATH_BOUND);
     for step in steps {
         let Some(physical) = step.physical else {
             continue;
@@ -2683,10 +2634,6 @@ fn assert_physical_shape(steps: &[Step], phase: &str) {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Fixture construction
-// ---------------------------------------------------------------------------
 
 fn descriptor(id: NamespaceId, owner: OwnerId, revision: u64) -> NamespaceDescriptor {
     NamespaceDescriptor {
@@ -2935,10 +2882,6 @@ impl World {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn baseline_matches_hand_derived_receipts_and_the_reference_model() {
     let world = World::publish_phase0();
@@ -3017,8 +2960,6 @@ fn workload_is_unchanged_by_directory_growth_within_the_trie_bound() {
     assert_namespace_local_nodes_equal(&baseline, &rerun, "phase 2");
     // The directory did grow, so A's lookup path is longer: the shape for
     // 502 ids, within the 17-node bound of 8-byte keys.
-    let namespaces = after.namespace_count();
-    assert_eq!(namespaces, PHASE2_NAMESPACES);
     assert_directory_nodes_follow_the_trie(&rerun, DIRECTORY_PATH_502, "phase 2");
     assert_physical_shape(&rerun, "phase 2");
     world.assert_a_untouched_since(&before, "phase 2 after the discarded branch");

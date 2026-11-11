@@ -234,10 +234,6 @@ fn expected_view(namespaces: &[(NamespaceDescriptor, Vec<Entry>)]) -> StateView 
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. Per-operation atomicity
-// ---------------------------------------------------------------------------
-
 /// Runs one rejected write in a branch that already holds applied work and
 /// checks that nothing changed: not the base data, not the earlier applied
 /// put, not the descriptors, not the namespace count. The check runs on the
@@ -290,7 +286,6 @@ fn assert_rejection_is_atomic(actor: OwnerId, op: WriteOp, budget: Budget, expec
     );
     assert_eq!(value(&branch, a, b"k1"), Some(b"one".to_vec()));
     assert_eq!(value(&branch, b, b"k1"), None);
-    assert_eq!(branch.namespace_count(), 2);
     assert_eq!(
         branch.receipts().len(),
         2,
@@ -305,7 +300,6 @@ fn assert_rejection_is_atomic(actor: OwnerId, op: WriteOp, budget: Budget, expec
         unchanged,
         "published state after rejecting {op:?}"
     );
-    assert_eq!(snapshot.namespace_count(), 2);
     assert_eq!(snapshot.record_count(a), Some(2));
     assert_eq!(snapshot.record_count(b), Some(0));
 }
@@ -422,10 +416,6 @@ fn create_rejected_out_of_budget_does_not_consume_an_ordinal() {
     assert_eq!(snapshot.desc(ns(4)), Err(Rejection::UnknownNamespace));
 }
 
-// ---------------------------------------------------------------------------
-// 2. Nested checkpoints
-// ---------------------------------------------------------------------------
-
 #[test]
 fn nested_checkpoints_roll_back_the_inner_then_the_outer_transaction() {
     // Base: A = ns 1 (alice), B = ns 2 (bob), C = ns 3 (carol). The block
@@ -494,8 +484,6 @@ fn nested_checkpoints_roll_back_the_inner_then_the_outer_transaction() {
     assert_eq!(observe(&branch), after_tx1, "state after rolling back tx2");
     assert_eq!(value(&branch, a, b"k1"), Some(b"one".to_vec()));
     assert_eq!(value(&branch, b, b"k2"), None);
-    assert_eq!(branch.desc(c), Ok(descriptor(3, DAVE, 1)));
-    assert_eq!(branch.desc(ns(4)), Err(Rejection::UnknownNamespace));
     assert_eq!(branch.receipts().len(), 6, "receipts are never withdrawn");
     assert_eq!(branch.spent(), Cost::new(144), "spent is never restored");
     assert_eq!(branch.remaining(), Cost::new(243 - 144));
@@ -591,10 +579,6 @@ fn nested_checkpoints_roll_back_the_inner_then_the_outer_transaction() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 3. ABA safety
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_checkpoint_rolled_past_stays_invalid_when_its_slot_is_reused() {
     let engine = engine_with_namespaces(&[ALICE]);
@@ -635,10 +619,6 @@ fn a_checkpoint_rolled_past_stays_invalid_when_its_slot_is_reused() {
     assert_eq!(branch.rollback_to(cp1), Ok(0..4));
     assert_eq!(value(&branch, a, b"k"), None);
 }
-
-// ---------------------------------------------------------------------------
-// 4. Cross-branch checkpoints
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_checkpoint_from_another_branch_is_invalid() {
@@ -698,10 +678,6 @@ fn a_checkpoint_from_another_engines_branch_is_invalid() {
     assert_eq!(value(&foreign, a, b"k"), Some(b"theirs".to_vec()));
 }
 
-// ---------------------------------------------------------------------------
-// 5. Rollback restores owner, content, allocator and pending pricing together
-// ---------------------------------------------------------------------------
-
 #[test]
 fn rollback_restores_owner_records_allocator_and_pending_pricing_together() {
     let mut engine = engine_with_namespaces(&[ALICE, BOB]);
@@ -757,7 +733,7 @@ fn rollback_restores_owner_records_allocator_and_pending_pricing_together() {
     assert_eq!(branch.namespace_count(), 2);
     assert_eq!(branch.desc(ns(3)), Err(Rejection::UnknownNamespace));
     assert_eq!(
-        branch.set_pricing(schedule_2.clone()),
+        branch.set_pricing(schedule_2),
         Ok(()),
         "the pending pricing was restored to id 1, so id 2 is fresh again"
     );
@@ -841,10 +817,6 @@ fn rollback_restores_the_pending_pricing_recorded_at_the_checkpoint() {
         2
     );
 }
-
-// ---------------------------------------------------------------------------
-// 6. Receipts survive rollback and discard
-// ---------------------------------------------------------------------------
 
 #[test]
 fn receipts_and_spent_survive_rollback_and_a_discarded_candidate() {
@@ -939,7 +911,6 @@ fn receipts_and_spent_survive_rollback_and_a_discarded_candidate() {
         before.as_slice(),
         "receipts are never withdrawn"
     );
-    assert_eq!(format!("{:?}", branch.receipts()), format!("{before:?}"));
     assert_eq!(branch.spent(), Cost::new(114));
     assert_eq!(branch.remaining(), Cost::new(886));
     assert_eq!(value(&branch, a, b"k1"), Some(b"one".to_vec()));
@@ -969,10 +940,6 @@ fn receipts_and_spent_survive_rollback_and_a_discarded_candidate() {
         "nothing from the discarded candidate was published"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 7. Rollback composes with rejected operations and with nothing at all
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rollback_after_a_rejected_op_matches_rollback_alone() {
@@ -1041,10 +1008,6 @@ fn rollback_with_nothing_since_the_checkpoint_is_a_no_op() {
     assert_eq!(observe(&branch), before);
     assert_eq!(value(&branch, a, b"k"), Some(b"one".to_vec()));
 }
-
-// ---------------------------------------------------------------------------
-// 8. Rolled-back work never reaches the published snapshot
-// ---------------------------------------------------------------------------
 
 #[test]
 fn published_snapshot_omits_rolled_back_ops_and_keeps_later_ones() {

@@ -135,7 +135,7 @@ trie code to derive expectations. It verifies:
   accepted head and observed maximum unchanged, report stalled, and recover
   when the peer resumes serving current data, for both follower roles.
 - A proxy-mutated signature rejected by another header-only process.
-- Actual chunked request bodies: exactly 1 MiB accepted and one byte over
+- Actual chunked request bodies: exactly 4 MiB accepted and one byte over
   rejected; a chunked proof response one byte over 8 MiB is also rejected
   before a verified result is returned.
 - Capacity stopping without eviction, an old proof still readable,

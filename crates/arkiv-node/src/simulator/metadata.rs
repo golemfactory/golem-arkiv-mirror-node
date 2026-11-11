@@ -1,4 +1,5 @@
 //! One execution's bounded, terminal after-images. No payloads in these DTOs.
+
 use super::wire::*;
 use crate::{
     AdminOutcome, BlockInputs, BlockOutcomes, OpOutcome, TxOp, TxStatus, exec::ExpiredRecord,
@@ -16,18 +17,18 @@ pub struct Metadata {
     pub changes: Vec<Change>,
     pub spent: u64,
 }
+
 fn corrupt() -> StorageError {
     StorageError::new(
         StorageErrorKind::Corrupt,
         "metadata terminal state inconsistency",
     )
 }
-pub fn value_type(v: &Value) -> &'static str {
-    v.tag().name()
-}
+
 pub fn value_digest(v: &Value) -> String {
     hex(digest("arkiv/simulator-value/v1", &encode(v)).as_slice())
 }
+
 pub fn record_change(namespace: NamespaceId, row: arkiv_db::Row) -> super::Result<Change> {
     let mut attributes = Vec::new();
     let mut fields = Vec::new();
@@ -45,13 +46,13 @@ pub fn record_change(namespace: NamespaceId, row: arkiv_db::Row) -> super::Resul
             let value = crate::value_json::to_json(&cell.value);
             attributes.push(Attribute {
                 name: name.as_str().into(),
-                value_type: value_type(&cell.value).into(),
+                value_type: cell.value.tag().name().into(),
                 value,
             });
         } else {
             fields.push(Field {
                 name: name.as_str().into(),
-                value_type: value_type(&cell.value).into(),
+                value_type: cell.value.tag().name().into(),
                 byte_length: cell.value.encoded_len().to_string(),
                 digest: value_digest(&cell.value),
                 reference: None,

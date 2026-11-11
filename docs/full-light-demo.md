@@ -1,13 +1,10 @@
 # Continuous full-node and light-node demo
 
-Status: implemented bounded demo profile, 2026-09-24. The producer, full
-and light processes, root-bearing execution and complete equality-proof API
-are present. This contract was written while the block format still had a
-header without a state root; today every chain uses the single block format
-(version 1, protocol 1) in which every header carries its state root, so the
-"activation" rules below describe that format. [Run and test the demo](full-light-demo-run.md); see the
-[literal proof charge vectors](eq-proof-charges.md). This contract records
-the implementation's scope, trust assumptions and acceptance requirements.
+The contract of the bounded in-memory demo (`arkiv-demo`): a producer, a
+full and a light process, and the complete equality-proof API `eq-page-v1`.
+Every chain uses the single block format (version 5, protocol 5), in which
+every header carries its state root. [Run and test the demo](full-light-demo-run.md);
+see the [literal proof charge vectors](eq-proof-charges.md).
 
 ## Goal and scope
 
@@ -18,7 +15,7 @@ can query a selected historical block and see the full node's locally
 executed answer alongside the light node's verified answer, while newer
 blocks continue arriving.
 
-The user-requested distinction is full versus light clients. **There is no
+The distinction shown is full versus light clients. **There is no
 pruning in this demo.** The producer and full node retain every block,
 outcome, snapshot and reachable proof object for their process lifetime.
 The light node retains all accepted headers but never acquires the database
@@ -27,33 +24,17 @@ retention windows, GC, compaction and archival routing are later work.
 
 The development authentication is one configured producer signing
 headers with a pinned Ed25519 key. This is a design choice for a runnable
-demo, not a user-mandated consensus protocol. The choice isolates query
+demo, not a consensus protocol. The choice isolates query
 verification from future host consensus integration. Multiple producers,
 fork choice, reorgs, public-chain consensus, transaction signatures and SDK
 wire compatibility are outside this deliverable.
 
-The first run remains volatile. A process restart loses its local history;
+The demo is volatile. A process restart loses its local history;
 a client can rebuild from a still-running peer. Every producer process
 restart creates a new genesis identity. Same-chain producer recovery needs
-a separate last-signed-height and exclusive-signer contract and is deferred.
-Follower replay is not durable engine recovery or completion of N3c/N4.
-
-## Existing code and required additions
-
-| Foundation today | Demo addition |
-| --- | --- |
-| `arkiv-node/src/replay.rs`: `MemoryChain::produce`, `apply`, historical snapshots and request identities | Process roles, a bounded queue, complete block/body retention, transport and catch-up. `apply` already compares re-executed outcomes and header bytes before publication. |
-| `arkiv-node/src/block.rs`: header encoding and hashes | Every header carries the terminal state root; genesis, successor validation and execution commit it. |
-| `arkiv-node/src/exec.rs`: one executor, admin/expiry/user sequencing, sealed terminal candidate | Put that candidate's state root in each produced v2 header, and compare it on full-node application before publication. |
-| `arkiv-db/src/state.rs` and `layout.rs`: state format 1, catalog roots, namespace map roots and canonical leaves | Bounded engine proof generation and stateless decoding/verification of the needed catalog, term, row and key-binding evidence. These layout types are mostly private today. |
-| `arkiv-db-trie`: point proofs and strict `walk` verifier | Compose those proofs up to a trusted state root; reconstruct a complete equality posting set to prove page completeness. Map-level point proofs alone are insufficient. |
-
-Keep execution/query semantics in `arkiv-db`, chain execution in
-`arkiv-node`, and process/RPC orchestration at the host boundary. Expose a
-stateless verification API which cannot access an `Engine`, loader, RPC or
-mutable head. Sharing the strict codec and trie verifier is acceptable;
-tests must independently derive expected results and posting roots. Do not
-expose mutable internal maps merely to make the proof server work.
+a separate last-signed-height and exclusive-signer contract, which the demo
+does not have (the signed proposer does). Follower replay is not durable
+recovery.
 
 ## Roles and trust boundaries
 
@@ -123,8 +104,8 @@ prefix is current. A timeout means `stalled`, not proof of a malicious peer.
 
 ## Versioned commitments and wire contract
 
-Use existing canonical codec version 1, state format 1, record-key encoding
-v2 and block-format-1 inputs/outcomes unchanged. JSON is transport only:
+Use the canonical codec, the state format, the record-key encoding and the
+block format's inputs/outcomes unchanged. JSON is transport only:
 hashes and bytes are lowercase, even-length hex with `0x`; all 64-bit
 integers, including signed I64 values, are decimal strings, so a browser
 cannot round heights, ids or values. Reject unknown
@@ -147,7 +128,7 @@ including on empty blocks.
 ### Authentication envelope
 
 All integers below use codec big-endian widths, and hashes are 32 raw bytes.
-These layouts are frozen with hand-built D0 vectors:
+These layouts are frozen with hand-built vectors:
 
 ```text
 TrustConfigV1 = u32(1) | bytes(canonical Genesis) | genesis_hash | key[32]
@@ -182,7 +163,7 @@ with exact protocol, authentication and proof-profile versions.
 | `produceBlock` | Producer only; deterministic test/manual trigger on the same writer path as the timer. |
 | `queryEq(request, proof: "eq-page-v1")` | Producer or caught-up full node; resolve and pin one exact block, return bounded equality evidence described below. |
 
-Unproved general queries may remain available through the existing N1 read
+Unproved general queries may remain available through the ordinary read
 surface, explicitly labelled unverified. The light-client verified path
 never falls back to them. A server may enforce stricter operational limits
 than advertised, but cannot truncate a successful page or downgrade proof
@@ -302,7 +283,7 @@ Verification proceeds as follows, under the caller's resource limits:
    proven absence returns `VerifiedNamespaceAbsent`, surfaced as
    `NamespaceNotFound`, **not** a successful empty query. A missing or
    truncated path is a verification error, not absence.
-3. Derive the exact 164-byte value-term key from the caller's attribute and
+3. Derive the value-term key from the caller's attribute and
    typed value using `layout.rs` rules (presence byte 1); prove it against
    the authenticated namespace term root. A proven absent term requires
    empty ids, empty rows and no next cursor: it proves an empty Eq result
@@ -330,7 +311,7 @@ Verification proceeds as follows, under the caller's resource limits:
    enforce row/cell limits, and verify that its requested cell is an
    attribute of exactly the requested type and value. A field, missing cell
    or differently typed value cannot satisfy equality. Derive the row's
-   33-byte record-key-v2 encoding and verify its binding under the namespace
+   record-key encoding (`len ‖ bytes`) and verify its binding under the namespace
    key-map root equals this id. Return the id, key and all decoded cells.
 7. Reject leftover paths, nodes, rows and bytes, inconsistent option tags
    and any mismatch. Construct `VerifiedPage` only after the entire page
@@ -352,7 +333,7 @@ arithmetic before loops, vector reservation or root reconstruction.
 | --- | --- |
 | Header batch | 128 |
 | Block batch | 16, further bounded by response bytes |
-| Request / response body | 1 MiB / 8 MiB, including hex/JSON transport expansion |
+| Request / response body | 4 MiB / 8 MiB, including hex/JSON transport expansion |
 | Pending queue | 1,024 transactions and 8 MiB encoded bytes |
 | Equality posting ids / page rows | 4,096 / min(64, genesis `max_page`); page limit must be at least 1 |
 | Proof response bytes / supplied trie nodes | 8 MiB / 8,192; also enforce each path's structural bound |
@@ -368,7 +349,7 @@ publish an unservable height. Batch responses include only whole blocks
 and at least one when the requested next block exists. Tests cover the
 largest admitted block and an over-cap candidate leaving head unchanged.
 
-The structural path bounds are catalog 17, term `2L + 1` (329 for the default limits since state layout 2; 177 in layout 1), row 17 and key
+The structural path bounds are catalog 17, term `2L + 1` (329 under the default limits), row 17 and key
 binding 67 visited nodes; inline nodes count toward traversal work, while
 wire nodes are only the root and hash-referenced descendants. Bound row
 decoding by the selected genesis's cell/value limits (at most 64 cells).
@@ -407,7 +388,7 @@ launcher reports it and uses an explicit configured run capacity. Reaching
 capacity stops production before another publication, leaving retained
 history readable; it never deletes old data. The full follower similarly
 stops applying before exceeding its capacity and reports the problem.
-Long-running, bounded-RAM operation belongs to the later durable engine.
+Long-running, bounded-RAM operation is what the durable hosts (simulator, signed proposer) provide.
 
 ## Demonstration and acceptance
 
@@ -444,33 +425,11 @@ does not require changing production proof verification.
 | Resource failures | One-above-cap inputs, huge claimed counts, malformed RLP, deeply nested/truncated payloads, proof budget exhaustion and unavailable objects return explicit errors without panic, partial verified output or unbounded allocation. Grow unrelated namespace B and require A's witness work to remain local plus the documented directory path. |
 | Retention/restart | Old proofs still verify after later changes; capacity halts without eviction. Restart a follower and rebuild from genesis. Every producer restart requires new genesis identity; a truncated valid recording cannot enable same-chain signing. No durable recovery claim. |
 
-## Implementation order and review gates
+## Implementation choices
 
-This changes the previous `N1 -> N3c/N3d -> N4 -> N5` sequence only for the
-bounded demo. N2, N3a and N3b are already done. Implement these reviewable
-steps, each with its relevant acceptance tests:
-
-| Step | Deliverable and exit gate |
-| --- | --- |
-| D0: freeze demo formats | Genesis/root timing; signed header, trust configuration, query/proof/cursor/error codecs and resource/charge rules with literal golden vectors. No runtime yet. |
-| D1: producer and full follower | N1 process/queue/manual and interval production, retained bodies and snapshots, bounded RPC/polling and independent full execution with v2 root checks. Late join, reconnect and false-root tests pass. |
-| D2: proof core | The in-memory N3d subset needed here (catalog/term/row/key proofs), complete Eq posting reconstruction and stateless verifier. Oracle, missing-result, absence, historical, cursor and resource tests pass without an RPC server. Other N3d point-read APIs remain pending if not delivered. |
-| D3: light follower and integrated demo | Header-only follow, bounded query/proof RPC, verifier-owned continuations, status view/workload and multi-process adversarial scenarios. Light query verification succeeds with no engine instance or block body access. |
-| Later: durable node | Resume N3c/N4 with the same logical roots and proof bytes. Engine state and historical proofs must survive restart without full-chain replay; use the existing redb gates. |
-| Later: broader proofs and archives | N5 adds other operators, more efficient coverage and SDK integration; N6 later decides pruned-full versus archive behavior, retention and capacity calibration. No pruning is pulled into D0–D3. |
-
-Completing D3 establishes this profile's complete equality queries under
-the stated trust model. It does not complete all of N3d, N5, milestone 4,
-durability or public consensus integration. The current
-[single-block contract](single-block-query-proofs.md),
-[namespace contract](project-namespaces.md) and storage acceptance gates
-remain in force.
-
-Implementation choices: `ed25519-dalek` 2.2.0 with strict verification,
-axum/tokio HTTP with streamed byte caps and deadlines, and reqwest bounded
-polling. JSON carries canonical binary objects as lowercase hex; read
-receipt model 4 is scoped to proof generation, with model-3 writes intact.
-The terminal launcher is the delivered UI. The library has no durable
-signer-resume path, and the CLI atomically creates a fresh run directory,
-genesis and key. Changing the security model or proof subset requires
-updating this specification before claiming interoperability.
+`ed25519-dalek` 2.2.0 with strict verification, axum/tokio HTTP with streamed
+byte caps and deadlines, and reqwest bounded polling. JSON carries canonical
+binary objects as lowercase hex; read receipt model 4 is scoped to proof
+generation, with model-3 writes intact. The terminal launcher is the UI. The
+library has no durable signer-resume path, and the CLI atomically creates a
+fresh run directory, genesis and key.

@@ -2,6 +2,7 @@
 //!
 //! This store has its own profile and storage sequence, independent of chain
 //! height. Callers publish engine references only after `persist` succeeds.
+
 use super::{Error, Result, protocol::SignedHeader};
 use alloy_primitives::keccak256;
 use arkiv_db::{B256, Decode, DecodeError, Decoder, Encode, Encoder, decode_exact, digest, encode};
@@ -27,12 +28,14 @@ pub struct BodyRef {
     pub id: B256,
     pub len: u32,
 }
+
 impl Encode for BodyRef {
     fn encode_to(&self, e: &mut Encoder) {
         e.put(&self.id);
         e.u32(self.len);
     }
 }
+
 impl Decode for BodyRef {
     const MIN_ENCODED_LEN: usize = 36;
     fn decode_from(d: &mut Decoder<'_>) -> std::result::Result<Self, DecodeError> {
@@ -62,6 +65,7 @@ pub struct History {
     frozen: bool,
     observation_failed: bool,
 }
+
 impl History {
     pub fn create(store: Arc<dyn VersionedStore>, genesis_hash: B256) -> Result<Self> {
         let head = entry_head(genesis_hash, 0, &[0]);
@@ -134,13 +138,15 @@ impl History {
         Ok(history)
     }
 
-    /// Idempotently persists the exact framed bytes. Different candidates at
-    /// the same chain height never compete for a storage key.
+    /// The reference [`Self::persist`] would return for `bytes`, without
+    /// writing.
     pub fn reference(&self, bytes: &[u8]) -> Result<BodyRef> {
         self.ready()?;
         self.frame(bytes).map(|(reference, _)| reference)
     }
 
+    /// Idempotently persists the exact framed bytes. Different candidates at
+    /// the same chain height never compete for a storage key.
     pub fn persist(&mut self, bytes: &[u8]) -> Result<BodyRef> {
         self.ready()?;
         let (reference, frame) = self.frame(bytes)?;
@@ -412,6 +418,7 @@ impl History {
             Ok(())
         }
     }
+
     fn frame(&self, bytes: &[u8]) -> Result<(BodyRef, Vec<u8>)> {
         if bytes.len() > BODY_CAP {
             return Err(Error("CapacityReached"));
@@ -430,6 +437,7 @@ impl History {
             frame,
         ))
     }
+
     fn unframe<'a>(&self, reference: &BodyRef, frame: &'a [u8]) -> Result<&'a [u8]> {
         if frame.len() != FRAME_OVERHEAD + reference.len as usize
             || keccak256(frame) != reference.id
@@ -460,6 +468,7 @@ fn check_identity(store: &dyn VersionedStore, genesis_hash: B256) -> Result<()> 
     }
     Ok(())
 }
+
 fn entry_head(genesis_hash: B256, sequence: u64, entry: &[u8]) -> Head {
     let mut bytes = genesis_hash.to_vec();
     bytes.extend_from_slice(&sequence.to_be_bytes());
