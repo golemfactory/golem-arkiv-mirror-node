@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### `str` values take any UTF-8
+
+- A `str` value may hold control characters (C0 and DEL were refused): only
+  valid UTF-8 and the 128-byte cap bound it, as on the Arkiv network. SDK
+  1.0's health suite writes `"line one\n\tline two"`, which
+  `eth_estimateGas` answered with `InvalidArkivAttribute`. The rule is shared
+  by transactions, genesis prefill rows and query literals, so such values
+  are stored, returned and queryable (`=`, ranges, `STARTSWITH`, `ORDER BY`)
+  with the characters raw inside `str('...')`.
+- **Consensus:** this widens which transactions and prefill rows are valid.
+  A producer on this version can include a transaction that a full follower
+  on an older binary refuses, so upgrade every node of a chain together.
+  Existing state stays valid.
+- `scripts/sourcify-v4-prefill.py` no longer refuses such strings either.
+
 ### `arkiv_query`: `ORDER BY`
 
 - A query may end with `ORDER BY name:type [ASC|DESC]`, as SDK 1.0's

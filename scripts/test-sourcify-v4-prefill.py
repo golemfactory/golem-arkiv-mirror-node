@@ -517,7 +517,6 @@ class V4PrefillTest(unittest.TestCase):
             (lambda l: l[0]["attributes"].extend({"name": f"z{i:02d}", "type": "u64", "indexed": False, "value": "0x1"}
                                                  for i in range(31)), r": more than 32 attributes$"),
             (lambda l: attr(source(l), "content").update(indexed=True), r": content: bytes cannot be indexed$"),
-            (lambda l: attr(contract(l), "name").update(value="a\nb"), r": name: str with control characters$"),
             (lambda l: attr(contract(l), "name").update(value="x" * 129), r": name: str longer than 128 bytes$"),
             (lambda l: attr(contract(l), "matchid").update(value="0x07"), r": matchid: u64 must be a compact 0x quantity$"),
             (lambda l: attr(contract(l), "optimizerruns").update(value=1 << 31), r": optimizerruns: i32 value$"),

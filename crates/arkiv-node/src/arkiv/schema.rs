@@ -90,11 +90,9 @@ pub const MAX_ENTITY_BYTES: usize = 128 * 1024;
 pub fn validate_value(value: &Value) -> Result<(), ArkivFault> {
     ArkivTypeId::of(value)?;
     match value {
-        Value::Str(s)
-            if s.len() > MAX_STR_BYTES || s.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}') =>
-        {
-            Err(ArkivFault::Value)
-        }
+        // Any UTF-8 within the length cap, control characters included, as
+        // on the Arkiv network.
+        Value::Str(s) if s.len() > MAX_STR_BYTES => Err(ArkivFault::Value),
         Value::Bytes(b) if b.len() > MAX_BYTES_LENGTH => Err(ArkivFault::Value),
         _ => Ok(()),
     }

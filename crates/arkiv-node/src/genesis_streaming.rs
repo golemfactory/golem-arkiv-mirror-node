@@ -1477,7 +1477,6 @@ mod tests {
             ("bad:name", Cell::attribute(Value::U64(1))),
             ("and", Cell::attribute(Value::U64(1))),
             ("okay", Cell::attribute(Value::I64(1))),
-            ("okay", Cell::field(Value::str("control\n"))),
             ("okay", Cell::field(Value::str(&"a".repeat(129)))),
         ] {
             let mut r = row(0);

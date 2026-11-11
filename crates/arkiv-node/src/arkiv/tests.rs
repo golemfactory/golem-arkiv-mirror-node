@@ -1721,3 +1721,55 @@ fn the_quote_margin_covers_an_extension_crossing_the_cap() {
     };
     assert_eq!(at_margin(64), at_margin(0));
 }
+
+#[test]
+fn str_values_take_any_utf8_within_the_length_cap() {
+    // Control characters included, as on the Arkiv network; only the 128-byte
+    // cap bounds a `str`.
+    let (_engine, mut b, c) = setup();
+    let texts = [
+        "line one\n\tline two",
+        "\u{0}",
+        "a\u{7f}b",
+        "\r\n",
+        "\u{85}é",
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        let value = Value::str(text);
+        assert_eq!(validate_value(&value), Ok(()));
+        // The transaction path: an indexed ABI triple decodes to the value.
+        let abi = encode_abi_value(&value).unwrap();
+        let base = ArkivTypeId::of(&value).unwrap() as u8;
+        assert_eq!(
+            decode_protocol_triples(&[triple("s", base | INDEXED_FLAG, abi)], false).unwrap(),
+            vec![(name("s"), Some(Cell::attribute(value.clone())))]
+        );
+        applied(run(
+            &mut b,
+            &c,
+            &ArkivOperation::Create {
+                salt: 100 + i as u128,
+                flags: 0,
+                expiry: Expiry {
+                    expires_at: 10,
+                    min_lifetime: 0,
+                },
+                attributes: vec![(name("s"), Cell::attribute(value.clone()))],
+            },
+        ));
+        let matches = b
+            .try_count(
+                entity_namespace(),
+                &arkiv_db::Query::term(Term::eq(name("s"), value)),
+                Budget::unlimited(),
+            )
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(matches, 1, "{text:?}");
+    }
+    assert_eq!(
+        validate_value(&Value::str(&"\n".repeat(MAX_STR_BYTES + 1))),
+        Err(ArkivFault::Value)
+    );
+}

@@ -61,7 +61,7 @@ Nothing is published unless every line passes:
   the report's entity, kind, contract and distinct counts, bytes values and
   storage units (recomputed with the node's formula).
 - **Node row rules.** At most 32 attributes, SDK-safe names strictly ascending,
-  only the format's SDK types, `str` at most 128 bytes without controls, `bytes`
+  only the format's SDK types, `str` at most 128 bytes, `bytes`
   unindexed and at most 128 KiB per value and per row, canonical base64.
 - **Format.** The 120,000-byte budget; `arkiv.schema` = `<prefix>.<kind>`; each
   kind's attributes, types, indexed flags and required set (`udc::ATTRIBUTES`);

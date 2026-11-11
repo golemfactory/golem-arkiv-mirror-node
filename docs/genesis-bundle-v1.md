@@ -96,7 +96,8 @@ write, with no system names:
   `--`, no reserved word), strictly ascending by their bytes; `arkiv.schema`
   is an ordinary name, and a named schema's tag is an indexed `str`;
 - only the ten SDK types: no `I64` or other engine-only types;
-- a `str` of at most 128 UTF-8 bytes without C0 controls or DEL;
+- a `str` of at most 128 UTF-8 bytes (any characters; C0 controls and DEL
+  were refused before the SDK 1.0 alignment);
 - a `bytes` value of at most 128 KiB, always with kind `02`, and at most
   128 KiB of `bytes` values in the row together;
 - kind `01` for every attribute the chain must answer queries on: an

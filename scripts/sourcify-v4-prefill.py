@@ -338,7 +338,6 @@ def parse_attribute(a):
         require(isinstance(raw, str), f"{name}: str value")
         data = raw.encode("utf-8")
         require(len(data) <= MAX_STR_BYTES, f"{name}: str longer than 128 bytes")
-        require(not any(c <= "\x1f" or c == "\x7f" for c in raw), f"{name}: str with control characters")
         payload = sized(data)
     else:  # bytes, base64 in the bundle
         require(isinstance(raw, str), f"{name}: bytes must be base64")

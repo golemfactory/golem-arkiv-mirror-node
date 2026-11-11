@@ -1869,6 +1869,11 @@ mod tests {
         fixture_with_period(1_000)
     }
     fn fixture_with_period(period_ms: u64) -> Host {
+        fixture_with(period_ms, Vec::new())
+    }
+    /// The four fixture entities, then one more per entry of `extra` holding
+    /// those indexed `str` values as `s0`, `s1`, ….
+    fn fixture_with(period_ms: u64, extra: Vec<Vec<&str>>) -> Host {
         use crate::{
             accounts::AccountConfig,
             genesis_bundle::*,
@@ -1895,7 +1900,7 @@ mod tests {
         };
         let indexed = |name: &str, value| (CellName::new(name).unwrap(), Cell::attribute(value));
         let field = |name: &str, value| (CellName::new(name).unwrap(), Cell::field(value));
-        let rows = (0..4)
+        let mut rows = (0..4)
             .map(|n| PrefillEntity {
                 creator: *signer.address().as_bytes(),
                 create_nonce: n,
@@ -1917,6 +1922,20 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
+        for (i, values) in extra.into_iter().enumerate() {
+            rows.push(PrefillEntity {
+                creator: *signer.address().as_bytes(),
+                create_nonce: 4 + i as u64,
+                salt: 4 + i as u128,
+                expires_at_height: 10,
+                flags: 0,
+                attributes: values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, v)| indexed(&format!("s{j}"), Value::str(v)))
+                    .collect(),
+            });
+        }
         let genesis = build_genesis(
             genesis,
             PrefillLimits {
@@ -1939,6 +1958,52 @@ mod tests {
             Some(encode_stream(&rows).unwrap()),
         )
         .unwrap()
+    }
+    #[test]
+    fn str_values_with_control_characters_are_stored_and_queryable() {
+        // SDK 1.0's health suite writes "line one\n\tline two"; the network
+        // accepts any UTF-8, and a query literal carries the characters raw.
+        let multi = "line one\n\tline two";
+        let tricky = "x' -- y\nORDER BY s0:str DESC";
+        let host = fixture_with(
+            1_000,
+            vec![vec![multi, "\u{0}nul\u{7f}"], vec![tricky, "\r\n"]],
+        );
+        let keys = |source: String| {
+            let page = query(&host, &json!([source, {"select":sdk_select(json!(true))}])).unwrap();
+            page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["attributes"][0]["value"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let quoted = |v: &str| format!("str('{}')", v.replace('\'', "''"));
+        assert_eq!(keys(format!("s0 = {}", quoted(multi))), [multi]);
+        assert_eq!(keys(format!("s0 = {}", quoted(tricky))), [tricky]);
+        assert_eq!(keys("s1 = str('\u{0}nul\u{7f}')".into()), [multi]);
+        assert_eq!(keys("s1 = str('\r\n')".into()), [tricky]);
+        assert_eq!(keys("s0 STARTSWITH str('line one\n\t')".into()), [multi]);
+        assert_eq!(keys("s0 STARTSWITH str('line one\n ')".into()), [""; 0]);
+        // Control characters order by their bytes, below printable text.
+        assert_eq!(keys("s1 < str(' ')".into()), [multi, tricky]);
+        assert_eq!(
+            keys("s0 >= str('') ORDER BY s1:str DESC".into()),
+            [tricky, multi]
+        );
+        // The literal's own `--` and ORDER BY text stay inside the string.
+        assert_eq!(
+            keys(format!("s0 = {} ORDER BY s0:str ASC", quoted(tricky))),
+            [tricky]
+        );
+        assert_eq!(
+            entity_count(
+                &host,
+                &json!([{"query": format!("s0 = {}", quoted(multi))}])
+            )
+            .unwrap(),
+            json!(1)
+        );
     }
     fn get_entity(host: &Host, params: &Json) -> Read<Json> {
         plan_entity(host, params, bounds(host))

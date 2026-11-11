@@ -60,6 +60,31 @@ costs, and follow-ups. Nothing here blocks the SDK smoke.
   upstream leaves the combination unspecified and its implementation does the
   same.
 
+## The SDK's own test suites
+
+`arkiv-sdk-js` v1.0.1 (`e9fa8dd`, unmodified) runs its own suites against this
+node through environment variables only: the CI "component" suite
+(`test/src/arkiv.test.ts`: `ARKIV_SDK_TEST_RPC_URL`, `ARKIV_SDK_TEST_WS_URL`,
+`ARKIV_SDK_TEST_CHAIN_ID`, `PRIVATE_KEY`) and the scheduled health suite
+(`test/src/network-health.test.ts`: `RPC_URL`, `PRIVATE_KEY`), against one
+loopback producer whose genesis funds the SDK CI's public test key.
+
+Run of 2026-11-17, 1-second blocks, after `str` values took control
+characters: unit 468/468, component 33/33, health 31/31. The reference node
+(`ghcr.io/arkiv-network/arkiv-reth-dev:latest`) scored component 33/33 and
+health 30/31 the same day.
+
+- With 500 ms blocks two health tests are timing-fragile, and neither is a
+  node fault. "an entity expires on its own" gives the entity five blocks,
+  which pass before the SDK's receipt poll returns; it also failed on the
+  reference node at 1-second blocks. "the chain reports its block timing"
+  wants `duration > 0`, but `arkiv_getBlockTiming` reports whole seconds
+  between the last two blocks, as upstream computes it, so it alternates
+  0 and 1 on a sub-second chain.
+- The suites are not part of this repository's CI. The helper scripts that
+  start the node and run them live outside the repository on the development
+  machine; moving them into `scripts/` is open.
+
 ## Supersets of the network
 
 SDK 1.0 removed `ne()`/`!=`, `not()`/`NOT`, `atBlock`, cursors and

@@ -14,7 +14,7 @@ and `$contentType`) is retired; see the
 | --- | --- |
 | Names | 32 ASCII bytes, protocol Ident32 grammar; SDK-safe authoring rejects reserved words and `--`; namespace names remain 20 bytes |
 | Scalars | Distinct bool, i32, u64, u256, dec, bytes32, bytes, str, addr, key; each attribute indexed or not by the writer (ABI `typeId` bit 7), `bytes` never indexed; other engine types (i64, the golem-db grid types) rejected at the Arkiv boundary |
-| Strings | 128 UTF-8 bytes, C0 and DEL rejected |
+| Strings | 128 UTF-8 bytes; any characters, control characters included, as on the Arkiv network |
 | Bytes | 128 KiB per value and 128 KiB for all `bytes` values of one entity together, separate block/proof/response limits |
 | Attributes | At most 32 per create or patch; indexed ones are queryable, unindexed ones stored and returned only |
 | Encodings | Explicit SDK IDs 1–10 with the `0x80` indexed flag; separate ABI, natural-width storage, canonical engine values and ordered index bytes |
