@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Receipt polling no longer starves block production
+
+- **Stored blocks are authenticated once.** `eth_getTransactionReceipt`,
+  `eth_getBlockByNumber`, `eth_getLogs` and the other block reads re-read and
+  re-authenticated the whole stored block on every call (a signature recovery
+  per transaction, every digest), under the node lock. A client polling for
+  receipts kept the lock busy, so the producer and `eth_sendRawTransaction`
+  waited: a wave of 8 transactions took two to three blocks. The host now
+  keeps the 32 highest blocks it has read (`Host::shared_block`).
+- **Logs hash each transaction once.** `block_logs` hashed the transaction
+  body and the block header once per log, 128 times for a full block.
+- Measured through the SDK (2,000 entities, 250 ms blocks, 8 transactions of
+  16 creates in flight): **485 entities per second, was 162**; 118 entities
+  per block of the 128 a block holds; p50 transaction latency 242 ms, was
+  663 ms (issue #12). No protocol or response change.
+
 ### Expiry: 128 per block, and a full block spills to the next
 
 - **A height holds up to 128 expiring entities** (was 16). A signed genesis

@@ -149,9 +149,18 @@ pub struct Host {
     /// stored record (signature recovery, genesis validation) would hold it
     /// for milliseconds; a stored certificate never changes.
     certificates: RefCell<BTreeMap<u64, SignedHeader>>,
+    /// Blocks [`Self::block`] read and authenticated, for up to
+    /// [`BLOCK_CACHE`] of the highest heights read. A receipt poll reads its
+    /// block under the node lock; re-authenticating it there (a signature
+    /// recovery per transaction, every digest) on each poll starves
+    /// production. A stored block never changes.
+    blocks: RefCell<BTreeMap<u64, std::sync::Arc<SignedBlock>>>,
 }
 /// Heights whose certificates a [`Host`] keeps authenticated.
 const CERTIFICATE_CACHE: usize = 256;
+/// Heights whose blocks a [`Host`] keeps authenticated: at most
+/// `BLOCK_CACHE × INPUT_CAP` (about 24 MiB) of inputs.
+const BLOCK_CACHE: usize = 32;
 impl Host {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
@@ -266,6 +275,7 @@ impl Host {
             refusal: Default::default(),
             block_executions: 0,
             certificates: Default::default(),
+            blocks: Default::default(),
         })
     }
     /// Install a verified, privately staged genesis without materializing its trie.
@@ -352,6 +362,7 @@ impl Host {
             refusal: Default::default(),
             block_executions: 0,
             certificates: Default::default(),
+            blocks: Default::default(),
         })
     }
     /// Relabel a verified, privately staged genesis store in place as this
@@ -526,6 +537,7 @@ impl Host {
             refusal: Default::default(),
             block_executions: 0,
             certificates: Default::default(),
+            blocks: Default::default(),
         };
         host.block(host.head.height)?;
         if host.signer.is_none() {
@@ -580,6 +592,25 @@ impl Host {
         Ok(self.record(height)?.feed)
     }
     pub fn block(&self, height: u64) -> Result<SignedBlock> {
+        Ok(SignedBlock::clone(&*self.shared_block(height)?))
+    }
+    /// [`Self::block`] without the copy: the authenticated block, shared
+    /// with the cache.
+    pub fn shared_block(&self, height: u64) -> Result<std::sync::Arc<SignedBlock>> {
+        if height <= self.head.height
+            && let Some(block) = self.blocks.borrow().get(&height)
+        {
+            return Ok(block.clone());
+        }
+        let block = std::sync::Arc::new(self.read_block(height)?);
+        let mut cache = self.blocks.borrow_mut();
+        cache.insert(height, block.clone());
+        if cache.len() > BLOCK_CACHE {
+            cache.pop_first();
+        }
+        Ok(block)
+    }
+    fn read_block(&self, height: u64) -> Result<SignedBlock> {
         let record = self.record(height)?;
         let bytes = self.history.read(&record.body)?;
         let block: SignedBlock = decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;

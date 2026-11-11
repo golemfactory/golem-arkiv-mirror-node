@@ -118,3 +118,30 @@ Sweep cost of a full block, measured separately on durable redb stores
 1 s block), so a 250 ms chain that must bound the worst case should set
 `expiry_per_block` to about 32; the default of 128 is sized for blocks of 1 s
 and more.
+
+## Addendum: the write gap (same day)
+
+The write gap was in the JSON-RPC read path, not in block production. A
+profile of the producer during the write run showed 9% of its CPU in
+`produce` and 68% in `eth_getTransactionReceipt`: every receipt poll re-read
+and re-authenticated the whole stored block under the node lock (a signature
+recovery per transaction and every digest), then hashed each transaction once
+per log. With 8 transactions polling every 50 ms the lock was busy most of
+the time, so production and `eth_sendRawTransaction` waited and every second
+or third block went out empty.
+
+The host now keeps recently read blocks authenticated, and logs hash each
+transaction once. Same workload, same machine, release build:
+
+| Writes, 2,000 entities, `BATCH=16 WAVE=8` | Before | After | Reference |
+| --- | --- | --- | --- |
+| Wall time | 12.3 s | 4.1 s | 4.0 s |
+| Entities per second | 162 | 485 | 499 |
+| Entities per block | 40 | 118 | 125 |
+| Transaction latency p50 / p95 | 663 / 924 ms | 242 / 390 ms | 256 / 291 ms |
+
+Writes are now bounded by `max_ops_per_block` (128, so 512 entities per
+second at 250 ms blocks), not by the node's speed: block production itself
+used about 15% of one core in the profile. One transaction at a time
+(`WAVE=1`) still gets one block per transaction, 64 entities per second, on
+either node.

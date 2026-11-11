@@ -179,7 +179,7 @@ fn args(v: &Value) -> Result<&[Value]> {
 fn index(host: &Host, state: &mut RpcState) -> Result<()> {
     let start = state.indexed.map_or(0, |n| n + 1);
     for h in start..=host.head.height {
-        let b = host.block(h)?;
+        let b = host.shared_block(h)?;
         if state.transactions.len() + b.inputs.txs.len() > INDEX_CAP
             || state.blocks.len() >= INDEX_CAP
         {
@@ -240,7 +240,7 @@ fn transaction(tx: &SignedTx, block: Option<(&crate::Header, usize)>) -> Result<
     Ok(v)
 }
 pub fn block_json(host: &Host, height: u64, full: bool) -> Result<Value> {
-    let b = host.block(height)?;
+    let b = host.shared_block(height)?;
     let h = &b.header.header;
     let txs = b
         .inputs
@@ -257,7 +257,7 @@ pub fn block_json(host: &Host, height: u64, full: bool) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     let gas = b.outcomes.spent;
     Ok(
-        json!({"number":quantity(height),"hash":hex(h.hash().as_slice()),"parentHash":hex(h.parent_hash.as_slice()),"timestamp":quantity(h.timestamp_ms/1000),"nonce":"0x0000000000000000","sha3Uncles":hex(keccak256([0xc0]).as_slice()),"logsBloom":bloom(&block_logs(host,height)?),"transactionsRoot":hex(h.inputs_digest.as_slice()),"stateRoot":hex(h.state_root.as_slice()),"receiptsRoot":hex(h.outcomes_digest.as_slice()),"miner":hex(&host.genesis.proposer),"difficulty":"0x0","totalDifficulty":"0x0","extraData":"0x","size":quantity(arkiv_db::encode(&b).len() as u64),"gasLimit":quantity(host.genesis.genesis.params.block_budget),"gasUsed":quantity(gas),"baseFeePerGas":quantity(crate::accounts::GAS_PRICE_WEI),"mixHash":ZERO_HASH,"uncles":[],"transactions":txs}),
+        json!({"number":quantity(height),"hash":hex(h.hash().as_slice()),"parentHash":hex(h.parent_hash.as_slice()),"timestamp":quantity(h.timestamp_ms/1000),"nonce":"0x0000000000000000","sha3Uncles":hex(keccak256([0xc0]).as_slice()),"logsBloom":bloom(&block_logs(host,height)?),"transactionsRoot":hex(h.inputs_digest.as_slice()),"stateRoot":hex(h.state_root.as_slice()),"receiptsRoot":hex(h.outcomes_digest.as_slice()),"miner":hex(&host.genesis.proposer),"difficulty":"0x0","totalDifficulty":"0x0","extraData":"0x","size":quantity(arkiv_db::encode(&*b).len() as u64),"gasLimit":quantity(host.genesis.genesis.params.block_budget),"gasUsed":quantity(gas),"baseFeePerGas":quantity(crate::accounts::GAS_PRICE_WEI),"mixHash":ZERO_HASH,"uncles":[],"transactions":txs}),
     )
 }
 fn entity_nonce(host: &Host, height: u64, a: &[u8; 20]) -> Result<u64> {
@@ -395,15 +395,19 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
     if height == 0 {
         return Ok(vec![]);
     }
-    let b = host.block(height)?;
+    let b = host.shared_block(height)?;
     let mut nonces = BTreeMap::new();
     let mut owners: BTreeMap<Vec<u8>, [u8; 20]> = BTreeMap::new();
     let mut expiries = ExpiryReplay::new(host, height)?;
     let mut logs = Vec::new();
+    // Hashed once per block and per transaction, not per log: a transaction
+    // hash covers its whole body.
+    let block_hash = hex(b.hash().as_slice());
     for (ti, (tx, out)) in b.inputs.txs.iter().zip(&b.outcomes.txs).enumerate() {
         if out.status != TxStatus::Committed {
             continue;
         }
+        let tx_hash = hex(tx.hash().as_slice());
         for op in &tx.tx.ops {
             let TxOp::Arkiv { operation, .. } = op else {
                 continue;
@@ -468,7 +472,7 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
             };
             let mut all = vec![hex(keccak256(signature.as_bytes()).as_slice()), hex(&key)];
             all.extend(topics);
-            logs.push(json!({"address":ADDRESS,"topics":all,"data":data,"blockNumber":quantity(height),"transactionHash":hex(tx.hash().as_slice()),"transactionIndex":quantity(ti as u64),"blockHash":hex(b.hash().as_slice()),"logIndex":quantity(logs.len() as u64),"removed":false}));
+            logs.push(json!({"address":ADDRESS,"topics":all,"data":data,"blockNumber":quantity(height),"transactionHash":tx_hash,"transactionIndex":quantity(ti as u64),"blockHash":block_hash,"logIndex":quantity(logs.len() as u64),"removed":false}));
         }
     }
     Ok(logs)
@@ -498,7 +502,7 @@ fn bloom(logs: &[Value]) -> String {
     hex(&bloom)
 }
 fn receipt(host: &Host, h: u64, i: usize) -> Result<Value> {
-    let b = host.block(h)?;
+    let b = host.shared_block(h)?;
     let tx = &b.inputs.txs[i];
     let out = &b.outcomes.txs[i];
     let logs: Vec<_> = block_logs(host, h)?
@@ -1000,7 +1004,9 @@ fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value)
         }
         "eth_getBlockTransactionCountByNumber" => {
             let h = at(host, a.first())?;
-            Ok(json!(quantity(host.block(h)?.inputs.txs.len() as u64)))
+            Ok(json!(quantity(
+                host.shared_block(h)?.inputs.txs.len() as u64
+            )))
         }
         "eth_getTransactionByHash" | "eth_getTransactionReceipt" => {
             let hash = a
@@ -1011,7 +1017,7 @@ fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value)
                 if method == "eth_getTransactionReceipt" {
                     receipt(host, h, i)
                 } else {
-                    let b = host.block(h)?;
+                    let b = host.shared_block(h)?;
                     transaction(&b.inputs.txs[i], Some((&b.header.header, i)))
                 }
             } else if let Some(t) = host.pool.by_hash(hash) {
@@ -1034,7 +1040,7 @@ fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value)
         "eth_getTransactionByBlockNumberAndIndex" => {
             let h = at(host, a.first())?;
             let i = uint(a.get(1).ok_or(Error("InvalidParams"))?)? as usize;
-            let b = host.block(h)?;
+            let b = host.shared_block(h)?;
             match b.inputs.txs.get(i) {
                 Some(t) => transaction(t, Some((&b.header.header, i))),
                 None => Ok(Value::Null),
@@ -1249,7 +1255,7 @@ fn dispatch(host: &mut Host, state: &mut RpcState, method: &str, params: &Value)
             }
             let mut ratios = Vec::new();
             for h in start..=end {
-                let b = host.block(h)?;
+                let b = host.shared_block(h)?;
                 let used = b.outcomes.spent;
                 ratios.push(used as f64 / host.genesis.genesis.params.block_budget as f64);
             }
