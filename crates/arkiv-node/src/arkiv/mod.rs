@@ -270,6 +270,10 @@ pub struct ArkivExecutionContext<'a> {
     /// rent is never charged past `block_height + cap_blocks`.
     pub rent: crate::gas::RentClock,
     pub expiry_per_block: u32,
+    /// How many heights past a full expiry height an operation may spill to
+    /// ([`crate::exec::EXPIRY_SPILL_WINDOW`] in live blocks). Zero is strict:
+    /// height-zero construction refuses a row whose height is full.
+    pub expiry_spill_window: u64,
     /// The accounts that pay rent: the caller's balance is debited and the
     /// rent burned. `None` quotes rent without debiting it (estimation,
     /// chains without accounts and height-zero construction).
@@ -433,6 +437,8 @@ pub fn execute_operation(
         None
     };
     let old = current.as_ref().map(|p| p.expires_at);
+    // The expiry rent is charged to: the one asked for, before any spill.
+    let paid_until;
     let new = if let Some(exp) = op.expiry() {
         let target = match expiry(exp, c) {
             Ok(t) => t,
@@ -453,17 +459,33 @@ pub fn execute_operation(
             }
             .into());
         }
-        if target != u64::MAX
-            && old != Some(target)
-            && count(branch, &crate::exec::total_key(target))? >= u64::from(c.expiry_per_block)
-        {
-            return Ok(OpOutcome::HostRejected {
-                fault: HostFault::ExpiryCapacityFull,
+        // A full height spills to the next one with room. The entity then
+        // lives up to `expiry_spill_window` blocks longer than asked; rent is
+        // charged for the lifetime asked (`paid_until`), so those blocks are
+        // free. Permanent entities are not scheduled, and an entity keeping
+        // its height keeps its place.
+        paid_until = Some(target);
+        if target != u64::MAX && old != Some(target) {
+            match crate::exec::spill_expiry(
+                target,
+                c.expiry_spill_window,
+                u64::MAX,
+                c.expiry_per_block,
+                |height| count(branch, &crate::exec::total_key(height)),
+            )? {
+                Some(height) => Some(height),
+                None => {
+                    return Ok(OpOutcome::HostRejected {
+                        fault: HostFault::ExpiryCapacityFull,
+                    }
+                    .into());
+                }
             }
-            .into());
+        } else {
+            Some(target)
         }
-        Some(target)
     } else {
+        paid_until = old;
         old
     };
     let mut next_nonce = None;
@@ -570,7 +592,7 @@ pub fn execute_operation(
             before,
             after,
             old,
-            if deleted { None } else { new },
+            if deleted { None } else { paid_until },
             c.block_height,
             c.rent,
         ) {

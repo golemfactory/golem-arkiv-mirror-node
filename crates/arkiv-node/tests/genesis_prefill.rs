@@ -179,10 +179,13 @@ fn invalid_nonces_system_cells_capacity_and_sponsor_fail() {
         Cell::attribute(Value::Addr([1; 20])),
     ));
     assert!(encode_stream(&[system]).is_err());
-    let rows = (0..16).map(|n| row(n, 1)).collect::<Vec<_>>();
+    // Prefill rows are explicit: a row over its height's capacity (128 in
+    // the default genesis) is refused, never moved to a later height.
+    assert_eq!(base().genesis.params.expiry_per_block, 128);
+    let rows = (0..128).map(|n| row(n, 1)).collect::<Vec<_>>();
     assert!(build_genesis(base(), limits(), *signer(2).address().as_bytes(), &rows).is_ok());
     let mut rows = rows;
-    rows.push(row(16, 1));
+    rows.push(row(128, 1));
     assert!(build_genesis(base(), limits(), *signer(2).address().as_bytes(), &rows).is_err());
     let rows = [row(0, 4)];
     let g = build(&rows);
@@ -279,7 +282,7 @@ fn empty_prefill_has_namespace_and_ordinary_block_one() {
     );
     assert_eq!(
         g.hash().to_string(),
-        "0xcd5d7def72351071a258039f4aca37ae98c5f985ddb88a5ab79d8b52bb9fad1a"
+        "0x0b3f7c35c3aa36d3b6da2203b246a6367e09296c75287eae946486d2c374ecaa"
     );
     assert_eq!(
         p.stream_hash.to_string(),
@@ -544,11 +547,11 @@ fn permanent_policy_is_explicit_and_changes_identity_only() {
     let mut relabelled = finite.clone();
     relabelled.prefill.as_mut().unwrap().version = 3;
     assert!(relabelled.validate().is_err());
-    // Rows beyond the 16-per-height capacity are admitted only when permanent.
-    let many: Vec<_> = (0..40).map(permanent_row).collect();
+    // Rows beyond the 128-per-height capacity are admitted only when permanent.
+    let many: Vec<_> = (0..140).map(permanent_row).collect();
     let g = build_permanent(&many);
     assert_eq!(g.prefill.as_ref().unwrap().burned_wei, U256::ZERO);
-    assert!(g.prefill.as_ref().unwrap().storage_units > 40 * 512);
+    assert!(g.prefill.as_ref().unwrap().storage_units > 140 * 512);
     let report = report(&g, &encode_stream_with(&many, true).unwrap());
     assert_eq!(report["permanentPrefill"], true);
     assert_eq!(report["prefillVersion"], 3);

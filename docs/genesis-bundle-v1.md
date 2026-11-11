@@ -14,10 +14,29 @@ layout 2 and codec 1, and
 the `glm-v2` gas profile with rent rule `glm-rent-v3`. A chain without a
 prefill uses the same signed genesis layout with the prefill absent and creates
 its entity namespace in block 1 instead. Prefills require a new chain/run
-directory. The builtin `arkiv-entity-v3/glm-v2@4` expands immutable constants
+directory. The builtin `arkiv-entity-v3/glm-v2@5` expands immutable constants
 (entity rules `arkiv-entity-v3`, 39 cells per record, a one-year rent cap, a
-384 KiB signed transaction cap, a 1,500,000-unit per-block storage cap); no
-dynamic base fees are enabled.
+384 KiB signed transaction cap, a 1,500,000-unit per-block storage cap, 128
+expirations per height); no dynamic base fees are enabled.
+
+A preset version never changes its expansion. `arkiv-entity-v3/glm-v2@4`, the
+previous version, differs only in `expiry_per_block = 16` and is still
+accepted, so a chain authored with it locks and builds the same genesis
+(the compiler keeps its bytes in
+`crates/arkiv-node/src/genesis_presets/`, and a test pins their hash and the
+example's genesis hash under it). Versions 1 to 3 belonged to earlier
+protocols and are refused.
+
+The expiry capacity is `expiry_per_block` in the profile's `[chain_params]`:
+1 to 128, the most entities that may expire at one height (see
+[entity expiration](entity-expiration.md#expiry_per_block) for the budget
+reservation it must fit and measured sweep times). A chain that wants a
+value other than the preset's uses a profile file:
+
+```toml
+[chain_params]
+expiry_per_block = 32 # bounds the worst-case sweep to about 50 ms
+```
 
 The rent cap is set in the profile's `[chain_params]` in seconds and stored in
 the genesis in seconds (`ChainParams::max_rent_lifetime_seconds`), beside the
@@ -149,7 +168,10 @@ the declared creator; created/updated heights are zero. The next namespace is 2
 and the next record is `row_count + 1`.
 
 A finite expiry is any height from 1 (`max_lifetime` no longer bounds
-entities), with at most 16 deletions reserved at one height. For each complete
+entities), with at most `expiry_per_block` rows at one height: prefill rows are
+explicit, so a row over capacity is an error and is never moved to a later
+height as a live write would be (see
+[entity expiration](entity-expiration.md#genesis-prefill)). For each complete
 generated row, with `cap_blocks` the genesis rent cap in blocks and
 `block_period_ms` the genesis block period:
 

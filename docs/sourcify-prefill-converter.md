@@ -261,8 +261,9 @@ The node-side requirements are explicit. The base genesis profile's
 `chain_params.max_lifetime` must be at least `--max-expiry`; the preset's
 6,307,200 rejects the stream with `ExpiryInvalid(TooFar)`. Rent grows linearly
 with expiry, and the sponsor allocation must cover it. The genesis
-`expiry_per_block` must stay at 16, the per-height packing the converter
-assumes.
+`expiry_per_block` must be at least 16, the per-height packing the converter
+uses (the example profile has 128); prefill rows over a height's capacity are
+refused, not moved.
 [`examples/far-future-prefill`](examples/far-future-prefill) pins a profile with
 `max_lifetime = 1000000000000` and a 10^30 wei sponsor. A larger `max_lifetime` also lets live
 transactions buy longer lifetimes, still limited by their gas budget.
@@ -297,7 +298,7 @@ A finite base rejects the stream before any state is built, with an error naming
 `allow_permanent`. Under versions 3 and 4:
 
 - a permanent row is created with `$expiresAt = u64::MAX` and never enters the
-  expiry due/total schedule, so the 16-per-height capacity does not apply and
+  expiry due/total schedule, so the per-height capacity does not apply and
   the expiry sweep never visits it;
 - it prepays **no time-based rent** (a finite fee cannot price unbounded
   retention), so an all-permanent prefill burns 0 and materializes no sponsor or

@@ -285,6 +285,102 @@ fn previous_owner(host: &Host, height: u64, key: &RecordKey) -> Result<[u8; 20]>
         .map_err(|_| Error("StorageCorrupt"))?
         .owner)
 }
+/// The expiry heights the committed operations of one block resolved to,
+/// replayed from the state before the block: a height that is full moves the
+/// operation to the next with room ([`crate::exec::spill_expiry`]), so the
+/// height an event reports is the one the entity was scheduled at, not
+/// necessarily the one its operation asked for. Committed operations all
+/// applied, in order, so the replay only follows the per-height totals.
+struct ExpiryReplay<'a> {
+    host: &'a Host,
+    /// The state before the block.
+    prior: arkiv_db::Snapshot,
+    /// Changes of the per-height totals by the block's operations so far.
+    totals: BTreeMap<u64, i64>,
+    /// Expiries of the entities the block's operations touched so far.
+    expiries: BTreeMap<Vec<u8>, Option<u64>>,
+}
+impl<'a> ExpiryReplay<'a> {
+    fn new(host: &'a Host, height: u64) -> Result<Self> {
+        Ok(Self {
+            host,
+            prior: host.state(height - 1)?,
+            totals: BTreeMap::new(),
+            expiries: BTreeMap::new(),
+        })
+    }
+    fn expiry(&mut self, key: &RecordKey) -> Result<Option<u64>> {
+        if let Some(known) = self.expiries.get(key.as_bytes()) {
+            return Ok(*known);
+        }
+        Ok(self
+            .prior
+            .try_get_record(
+                arkiv::entity_namespace(),
+                key,
+                &Projection::ALL,
+                Budget::limit(25_000_000),
+            )?
+            .map_err(|_| Error("StorageCorrupt"))?
+            .value
+            .map(|r| arkiv::project(&r).map_err(|_| Error("StorageCorrupt")))
+            .transpose()?
+            .map(|p| p.expires_at))
+    }
+    fn shift(&mut self, height: Option<u64>, by: i64) {
+        if let Some(h) = height.filter(|h| *h != u64::MAX) {
+            *self.totals.entry(h).or_default() += by;
+        }
+    }
+    /// Schedules `key` for the expiry `asked` at block `height` and returns
+    /// the height it resolved to.
+    fn set(&mut self, key: &[u8], asked: &crate::Expiry, height: u64) -> Result<u64> {
+        let target = asked.expires_at.max(
+            height
+                .checked_add(asked.min_lifetime)
+                .ok_or(Error("StorageCorrupt"))?,
+        );
+        let old = match RecordKey::new(key) {
+            Some(key) => self.expiry(&key)?,
+            None => None,
+        };
+        let resolved = if target == u64::MAX || old == Some(target) {
+            target
+        } else {
+            let (prior, totals) = (&self.prior, &self.totals);
+            crate::exec::spill_expiry(
+                target,
+                crate::exec::EXPIRY_SPILL_WINDOW,
+                u64::MAX,
+                self.host.genesis.genesis.params.expiry_per_block,
+                |h| -> Result<u64> {
+                    let stored = match prior.try_host_get(&crate::exec::total_key(h))? {
+                        None => 0,
+                        Some(b) => {
+                            u64::from_be_bytes(b.try_into().map_err(|_| Error("StorageCorrupt"))?)
+                        }
+                    };
+                    let change = totals.get(&h).copied().unwrap_or(0);
+                    u64::try_from(i128::from(stored) + i128::from(change))
+                        .map_err(|_| Error("StorageCorrupt"))
+                },
+            )?
+            .ok_or(Error("StorageCorrupt"))?
+        };
+        if old != Some(resolved) {
+            self.shift(old, -1);
+            self.shift(Some(resolved), 1);
+        }
+        self.expiries.insert(key.to_vec(), Some(resolved));
+        Ok(resolved)
+    }
+    fn delete(&mut self, key: &RecordKey) -> Result<()> {
+        let old = self.expiry(key)?;
+        self.shift(old, -1);
+        self.expiries.insert(key.as_bytes().to_vec(), None);
+        Ok(())
+    }
+}
 fn word(n: u64) -> String {
     format!("{n:064x}")
 }
@@ -302,6 +398,7 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
     let b = host.block(height)?;
     let mut nonces = BTreeMap::new();
     let mut owners: BTreeMap<Vec<u8>, [u8; 20]> = BTreeMap::new();
+    let mut expiries = ExpiryReplay::new(host, height)?;
     let mut logs = Vec::new();
     for (ti, (tx, out)) in b.inputs.txs.iter().zip(&b.outcomes.txs).enumerate() {
         if out.status != TxStatus::Committed {
@@ -332,11 +429,7 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
                     .to_vec();
                     nonces.insert(caller, nonce + 1);
                     owners.insert(key.clone(), caller);
-                    let expiry = expiry.expires_at.max(
-                        height
-                            .checked_add(expiry.min_lifetime)
-                            .ok_or(Error("StorageCorrupt"))?,
-                    );
+                    let expiry = expiries.set(&key, expiry, height)?;
                     (
                         key,
                         "EntityCreated(bytes32,address,uint64,uint8)",
@@ -357,16 +450,7 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
                         }
                         ArkivOperation::ExtendExpiry { expiry, .. } => (
                             "ExpiryExtended(bytes32,address,uint64)",
-                            format!(
-                                "0x{}",
-                                word(
-                                    expiry.expires_at.max(
-                                        height
-                                            .checked_add(expiry.min_lifetime)
-                                            .ok_or(Error("StorageCorrupt"))?
-                                    )
-                                )
-                            ),
+                            format!("0x{}", word(expiries.set(key.as_bytes(), expiry, height)?)),
                         ),
                         ArkivOperation::TransferOwnership { owner: new, .. } => {
                             topics.push(topic_address(new));
@@ -374,6 +458,7 @@ pub fn block_logs(host: &Host, height: u64) -> Result<Vec<Value>> {
                             ("OwnershipTransferred(bytes32,address,address)", "0x".into())
                         }
                         ArkivOperation::Delete { .. } => {
+                            expiries.delete(key)?;
                             ("EntityDeleted(bytes32,address)", "0x".into())
                         }
                         _ => unreachable!(),
@@ -534,6 +619,22 @@ fn revert_data(
     let Some(TxOp::Arkiv { operation, .. }) = tx.ops.get(index) else {
         return Ok(None);
     };
+    if matches!(fault, crate::HostFault::ExpiryCapacityFull) {
+        // Not an EntityRegistry error: a plain Solidity `Error(string)`, which
+        // every Ethereum client decodes into a readable revert reason.
+        let Some(e) = operation.expiry() else {
+            return Ok(None);
+        };
+        let target = e.expires_at.max(height.saturating_add(e.min_lifetime));
+        return Ok(Some(error_string(&format!(
+            "Arkiv: operation {index} cannot expire at block {target}: blocks {target} to {} each \
+             already have the {} expiring entities one block may have; choose another expiry",
+            target
+                .saturating_add(crate::exec::EXPIRY_SPILL_WINDOW)
+                .min(u64::MAX - 1),
+            host.genesis.genesis.params.expiry_per_block
+        ))));
+    }
     let Some(key) = operation.key() else {
         return Ok(None);
     };
@@ -655,6 +756,19 @@ fn revert_data(
         hex(&keccak256(signature.as_bytes())[..4]),
         args
     )))
+}
+/// Revert data of a Solidity `revert(reason)`: `Error(string)`.
+fn error_string(reason: &str) -> String {
+    let mut text = reason.as_bytes().to_vec();
+    let len = text.len() as u64;
+    text.resize(text.len().div_ceil(32) * 32, 0);
+    format!(
+        "{}{}{}{}",
+        hex(&keccak256(b"Error(string)")[..4]),
+        word(32),
+        word(len),
+        &hex(&text)[2..]
+    )
 }
 #[derive(Clone, Copy)]
 enum Simulation {
@@ -1378,9 +1492,14 @@ mod tests {
     use arkiv_db_memory::MemoryVersionedStore;
     use std::sync::Arc;
     fn host() -> Host {
+        host_with(crate::signed::protocol::MAX_EXPIRY_PER_BLOCK)
+    }
+    fn host_with(expiry_per_block: u32) -> Host {
         let signer = Signer::from_bytes([2; 32]).unwrap();
+        let mut native = crate::signed::protocol::default_native_genesis(9300, 1000, 1000);
+        native.params.expiry_per_block = expiry_per_block;
         let g = SignedGenesis::new(
-            crate::signed::protocol::default_native_genesis(9300, 1000, 1000),
+            native,
             [7; 16],
             *signer.address().as_bytes(),
             1000,
@@ -1429,6 +1548,56 @@ mod tests {
             &signer,
         )
         .unwrap()
+    }
+    /// A create that finds every height of the spill search full reverts
+    /// with a Solidity `Error(string)` naming the height and the capacity.
+    #[test]
+    fn a_full_expiry_search_reverts_with_a_readable_reason() {
+        let mut h = host_with(1);
+        let create = |salt: u128| ArkivOperation::Create {
+            salt,
+            flags: 0,
+            expiry: crate::Expiry {
+                expires_at: 50,
+                min_lifetime: 0,
+            },
+            attributes: vec![],
+        };
+        // One entity per height: 65 creates fill 50 ..= 114.
+        for nonce in 0..5u64 {
+            let ops = (0..13)
+                .map(|i| create(u128::from(nonce * 13 + i)))
+                .collect();
+            h.submit(native(&h, 1 + nonce, ops)).unwrap();
+        }
+        let refused = native(&h, 6, vec![create(100), create(101)]);
+        h.submit(refused.clone()).unwrap();
+        h.produce().unwrap();
+        let block = h.block(2).unwrap();
+        assert!(
+            block.outcomes.txs[..5]
+                .iter()
+                .all(|tx| tx.status == TxStatus::Committed)
+        );
+        // Events report the heights given: 50, 51, ... in creation order.
+        let logs = block_logs(&h, 2).unwrap();
+        assert_eq!(logs.len(), 65);
+        for (i, log) in logs.iter().enumerate() {
+            assert_eq!(log["data"], format!("0x{}{}", word(50 + i as u64), word(0)));
+        }
+        let out = &block.outcomes.txs[5];
+        assert_eq!(out.status, TxStatus::Failed { op_index: 0 });
+        assert_eq!(receipt(&h, 2, 5).unwrap()["status"], "0x0");
+        let data = revert_data(&h, &refused.tx, out, 2).unwrap().unwrap();
+        assert_eq!(&data[..10], "0x08c379a0");
+        let raw = bytes(&json!(data), None).unwrap();
+        let len = usize::from_be_bytes(raw[60..68].try_into().unwrap());
+        assert_eq!((raw.len() - 4) % 32, 0);
+        assert_eq!(
+            std::str::from_utf8(&raw[68..68 + len]).unwrap(),
+            "Arkiv: operation 0 cannot expire at block 50: blocks 50 to 114 each already have \
+             the 1 expiring entities one block may have; choose another expiry"
+        );
     }
     #[test]
     fn log_owners_follow_operations_and_failed_batches_emit_nothing() {

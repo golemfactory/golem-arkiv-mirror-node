@@ -596,6 +596,11 @@ overflow fails the check):
 - `Limits::validate`: a cell-name limit of 1 to 32 and an indexed-string
   limit of at most 128 (`GenesisError::CellLimits`).
 
+<a id="expiry"></a>
+Expiry as a whole (setting, sweep, capacity, spill, rent) is described in
+[entity expiration](entity-expiration.md); this document is its
+specification.
+
 **Expiry reservation**: `block_budget ≥ user_budget + expiry_per_block ×
 max_expiry_delete_cost`, where `max_expiry_delete_cost` is the model-3
 `DeleteRecord` charge of a record whose `max_cells` cells are all
@@ -621,8 +626,16 @@ page's rows, the look-ahead entry, keys of at most 32 bytes). Under
 1 + 3 + 20 + 32 + 6 + 160 = 222 units and the read bound is
 max(16, 155) = 155.
 
+A signed genesis additionally requires `expiry_per_block ≤ 128`
+(`MAX_EXPIRY_PER_BLOCK`, the most operations of a block; 16 until this
+bound was raised, which chains created then keep). Under the GLM schedule
+with 39 cells a deletion reserves 53,400 units, so 128 reserve 6,835,200 of
+the default 10,000,000 (`block_budget` 100,000,000, `user_budget`
+90,000,000); each further cell adds 1,100, so 128 deletions fit up to 61
+cells.
+
 Why users never meet `ExceedsBlockBudget`: the sweep runs first and
-deletes at most `expiry_per_block` records (the capacity check below), each
+deletes at most `expiry_per_block` records (the capacity rule below), each
 costing at most `max_expiry_delete_cost` under the parent's schedule,
 which the reservation covered when it was committed. Selection keeps the
 declared transaction budgets within `user_budget`, and an operation's
@@ -704,9 +717,18 @@ executor calls only the engine's fallible `try_` API
      `u64::MAX` is a valid entity lifetime, and `max_rent_lifetime_seconds`
      caps only its rent. A patch may only extend: `E` earlier than
      the current lifetime (permanent is latest) is `ExpiryShortened`.
-     Finally the capacity of a finite `E`: `total(E) + 1 − [current ==
-     E] > expiry_per_block` is `ExpiryCapacityFull`. Host faults are
-     decided before the engine sees the operation: no receipt, no charge.
+     Finally the capacity of a finite `E`. A record whose current
+     lifetime is `E` keeps it. Any other is given the first height `E'`
+     in `E ..= E + EXPIRY_SPILL_WINDOW` (64) with `total(E') <
+     expiry_per_block` (the *spill*: one read of `total` per height, in
+     ascending order), where the search also ends at `h + max_lifetime`
+     for a generic record and never reaches `u64::MAX`; `E'` is the
+     lifetime stored and scheduled. When no such height exists the
+     operation is `ExpiryCapacityFull`. An Arkiv entity's rent is charged
+     for `E`, not `E'`. Height-zero construction (genesis prefill) searches
+     no further than `E`: a row over capacity is an error. Host faults are
+     decided before the engine sees the operation: no receipt, no charge;
+     the spill's reads are not charged either.
    - *Engine operation*: `try_execute(actor, op, budget)`, where a resolved
      expiry is injected as `$expiresAt = Attribute(U64(E))` into the
      creation's cells or the patch's set; its charges fall on the user's
@@ -841,11 +863,18 @@ Choices the brief left open, taken as the simplest that meets it:
   overflows.
 - Permanence is `E = u64::MAX`, which includes `expires_at = u64::MAX`.
 - The expiry pre-step of a creation with an expiry reads the key's current
-  lifetime too, so the capacity check of a creation that will fail with
-  `AlreadyExists` uses the same `[current == E]` term as a patch.
+  lifetime too, so the capacity rule of a creation that will fail with
+  `AlreadyExists` treats a record already at `E` as a patch does.
+- A full height does not refuse an operation: it moves its expiry to the
+  next height with room, at most 64 heights on (`EXPIRY_SPILL_WINDOW`, a
+  constant: the chain parameters' encoding is fixed). The stored
+  `$expiresAt` is the height given. Before this rule a full height was
+  `ExpiryCapacityFull` at once; a chain whose history holds such a
+  rejection cannot be re-executed by this version.
 - Host expiry checks come before the engine's own checks: a creation with
-  an expiry at a full height in a namespace the actor does not own is
-  `HostRejected(ExpiryCapacityFull)`, not `Rejected(Unauthorized)`.
+  an expiry with no free height in its spill window, in a namespace the
+  actor does not own, is `HostRejected(ExpiryCapacityFull)`, not
+  `Rejected(Unauthorized)`.
 - A sweep halt is its own error, `ExecError::ExpiryHalted`.
 - `max_cells ≥ 1`, `max_page ≥ 1`, `max_groups ≥ 1` and `max_literals ≥
   1` are genesis invariants.
@@ -863,7 +892,7 @@ test's comments.
 | `failing_transaction_rolls_back` | An `AlreadyExists` in the middle: `RolledBack`, `Rejected` (4 units) and `NotExecuted`, 138 units kept; the record id is released and minted again; an exact budget (74) commits, one unit less stops at 64 with `OutOfBudget` |
 | `same_block_ownership_transfer` | After a transfer the old owner is `Unauthorized` and the new owner writes in the same block; a stale revision is refused; request ids are scoped by actor |
 | `expiry_at_the_boundary` | Records due at 3 (one through `min_lifetime`) are live at 2 and deleted in block 3, 78 units each in id order, before its transactions: a patch of one is `NotFound` (4 units) and a creation under the other's key commits as a new record (64 units, id 4); a record due at 4 survives block 3; the schedule empties |
-| `expiry_at_capacity` | Four 8-cell, all-attribute records with 32-byte keys in three namespaces expire at one height under an exact reservation (block budget = user budget + 4 × 222); a fifth is `ExpiryCapacityFull`, a patch keeping its height is admitted; one-row sweep pages; the sweep spends 888 and a transaction with the whole user budget still runs; a schedule one unit dearer per deletion is `ReservationViolated` |
+| `expiry_at_capacity` | Four 8-cell, all-attribute records with 32-byte keys in three namespaces expire at one height under an exact reservation (block budget = user budget + 4 × 222); a fifth asking for that height spills to the next (670 units) and is deleted there, a patch keeping its height is admitted; four records at the last height within `max_lifetime` make a fifth `ExpiryCapacityFull`; one-row sweep pages; the sweep spends 888 and a transaction with the whole user budget still runs; a schedule one unit dearer per deletion is `ReservationViolated` |
 | `set_pricing_raises_read_weights` | Every read weight ×100 applies from the next block; expiry completes under it (474 units per deletion); a stale schedule id is refused |
 | `permanent_expiry` | Permanent records store `U64(u64::MAX)` and schedule nothing; extending a finite record to permanent removes its entry; a record without `$expiresAt` cannot get a finite expiry |
 | `expiry_extends_only` | An earlier height is `ExpiryShortened` (and rolls back its transaction); the same height is admitted without moving the schedule (64 units); a later height moves it (114 units) and the record expires there |

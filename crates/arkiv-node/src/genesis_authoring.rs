@@ -31,7 +31,12 @@ const DOCUMENT_CAP: usize = 1024 * 1024;
 const INPUT_CAP: usize = 8 * DOCUMENT_CAP;
 const ROW_CAP: usize = 256;
 const LOCK_FILE: &str = "genesis.lock.toml";
-const PRESET_ID: &str = "arkiv-entity-v3/glm-v2@4";
+/// The current builtin preset: at most 128 expirations per height.
+const PRESET_ID: &str = "arkiv-entity-v3/glm-v2@5";
+/// The previous preset (16 expirations per height), kept so that chains
+/// authored with it rebuild the same genesis. A released expansion never
+/// changes; a new value is a new version.
+const PRESET_4_ID: &str = "arkiv-entity-v3/glm-v2@4";
 /// The rent rule of the profile: capped GLM rent per second, debited outside
 /// gas ([`crate::gas::rent`]).
 const RENT_RULE: &str = "glm-rent-v3";
@@ -42,6 +47,7 @@ const TOML_DATASET: &str = "arkiv-entities-toml-v2";
 const JSONL_DATASET: &str = "arkiv-entities-jsonl-v2";
 const PRESET: &str =
     include_str!("../../../docs/examples/genesis-bundle/profiles/fixed-glm-v2.toml");
+const PRESET_4: &str = include_str!("genesis_presets/arkiv-entity-v3-glm-v2-4.toml");
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
@@ -856,10 +862,15 @@ fn compile(path: &Path) -> Result<Compiled> {
     }
     let p = manifest.profile;
     let profile: Profile = match (p.preset, p.path, p.bytes, p.sha256) {
-        (Some(preset), None, None, None) => {
-            expect(&preset, PRESET_ID, "preset")?;
-            parse_toml(PRESET.as_bytes(), PRESET_ID)?
-        }
+        (Some(preset), None, None, None) => match preset.as_str() {
+            PRESET_ID => parse_toml(PRESET.as_bytes(), PRESET_ID)?,
+            PRESET_4_ID => parse_toml(PRESET_4.as_bytes(), PRESET_4_ID)?,
+            _ => {
+                return Err(format!(
+                    "unsupported preset: expected {PRESET_ID} or {PRESET_4_ID}"
+                ));
+            }
+        },
         (None, Some(path), bytes, hash) => {
             parse_toml(&inputs.read(&path, bytes, hash.as_deref())?, &path)?
         }
@@ -1307,8 +1318,56 @@ mod tests {
     fn compiled_preset_expansion_is_frozen() {
         assert_eq!(
             sha256(PRESET.as_bytes()),
+            "1fc368aaa5e9c54a1675fdefe7472a2b2f28b0dfea3cee84c2f03e47d961e2f7"
+        );
+        // Version 4 keeps the bytes it was released with.
+        assert_eq!(
+            sha256(PRESET_4.as_bytes()),
             "1cd8e56e98b9a1345f35887087a18f54b9981db7d34522ebf0b464d3f50b02ec"
         );
+        // The two versions differ only in the expiry capacity.
+        assert_eq!(
+            PRESET_4.replace("expiry_per_block = 16", "expiry_per_block = 128"),
+            PRESET
+        );
+    }
+
+    #[test]
+    fn earlier_preset_versions_rebuild_their_genesis() {
+        let fixture = Fixture::new();
+        let current = compile(&fixture.inline()).unwrap();
+        assert_eq!(current.genesis.genesis.params.expiry_per_block, 128);
+        fixture.change(
+            &fixture.inline(),
+            "profile = { preset = \"arkiv-entity-v3/glm-v2@5\" }",
+            "profile = { preset = \"arkiv-entity-v3/glm-v2@4\" }",
+        );
+        let earlier = compile(&fixture.inline()).unwrap();
+        assert_eq!(earlier.genesis.genesis.params.expiry_per_block, 16);
+        // The genesis hash this example had when version 4 was the preset.
+        assert_eq!(
+            crate::simulator::wire::hex(earlier.genesis.hash().as_slice()),
+            "0xc00c9c3ace005de2c79cf7389b9eba7857b24a28071edcb5eb8b8bc2111447a4"
+        );
+        assert_ne!(earlier.genesis.hash(), current.genesis.hash());
+        // A chain authored with version 4 still locks, builds and verifies.
+        lock(&fixture.inline(), false).unwrap();
+        build(&fixture.inline(), &fixture.bundle(), true).unwrap();
+        verify(&fixture.bundle()).unwrap();
+        // Unknown or unversioned presets are refused.
+        for preset in ["arkiv-entity-v3/glm-v2@6", "arkiv-entity-v3/glm-v2"] {
+            fixture.change(
+                &fixture.inline(),
+                "profile = { preset = \"arkiv-entity-v3/glm-v2@4\" }",
+                &format!("profile = {{ preset = \"{preset}\" }}"),
+            );
+            assert!(compile(&fixture.inline()).is_err());
+            fixture.change(
+                &fixture.inline(),
+                &format!("profile = {{ preset = \"{preset}\" }}"),
+                "profile = { preset = \"arkiv-entity-v3/glm-v2@4\" }",
+            );
+        }
     }
 
     #[test]
@@ -1479,7 +1538,7 @@ mod tests {
         stdfs::write(fixture.0.join("profiles/custom.toml"), custom).unwrap();
         fixture.change(
             &fixture.inline(),
-            "profile = { preset = \"arkiv-entity-v3/glm-v2@4\" }",
+            "profile = { preset = \"arkiv-entity-v3/glm-v2@5\" }",
             "profile = { path = \"profiles/custom.toml\" }",
         );
         let custom = compile(&fixture.inline()).unwrap();

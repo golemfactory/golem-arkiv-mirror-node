@@ -26,7 +26,7 @@ max_literals = 8
 [chain_params]
 block_budget = "100000000"
 user_budget = "90000000"
-expiry_per_block = 16
+expiry_per_block = 128
 max_admin_per_block = 0
 max_txs_per_block = 16
 max_ops_per_tx = 16

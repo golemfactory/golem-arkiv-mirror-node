@@ -88,6 +88,9 @@ const LIMITS: Limits = Limits {
 /// `reads_x100`, `DirectoryLookup 100 + PointRead 300 + RecordDelete 20 +
 /// 5 × CellRemove 4 + 3 × RootUpdate 2 + 10 × (IndexRemove 6 + 2 ×
 /// RootUpdate 2)` = 546, so 50,000 + 3 × 546 = 51,638.
+/// The model's own copy of the executor's spill search bound.
+const SPILL_WINDOW: u64 = 64;
+
 const PARAMS: ChainParams = ChainParams {
     block_budget: 51_638,
     user_budget: 50_000,
@@ -509,6 +512,8 @@ struct Model {
     pending: Weights,
     due: BTreeMap<(u64, u64), u64>,
     totals: BTreeMap<u64, u64>,
+    /// Operations whose expiry moved past a full height.
+    spilled: u64,
 }
 
 impl Model {
@@ -520,6 +525,7 @@ impl Model {
             pending: FIXTURE,
             due: BTreeMap::new(),
             totals: BTreeMap::new(),
+            spilled: 0,
         }
     }
 
@@ -692,16 +698,30 @@ impl Model {
                         fault: HostFault::ExpiryShortened,
                     };
                 }
-                if let Life::Until(e) = life {
-                    let total = self.totals.get(&e).copied().unwrap_or(0);
-                    let after = total + 1 - u64::from(old == Some(life));
-                    if after > u64::from(PARAMS.expiry_per_block) {
-                        return OpOutcome::HostRejected {
-                            fault: HostFault::ExpiryCapacityFull,
-                        };
+                // A record keeping its height stays; any other takes the
+                // first height from the one asked that has room, at most
+                // SPILL_WINDOW heights on and within the maximum lifetime.
+                match life {
+                    Life::Until(e) if old != Some(life) => {
+                        let last = (e + SPILL_WINDOW).min(height + PARAMS.max_lifetime);
+                        let free = (e..=last).find(|h| {
+                            self.totals.get(h).copied().unwrap_or(0)
+                                < u64::from(PARAMS.expiry_per_block)
+                        });
+                        match free {
+                            Some(h) => {
+                                self.spilled += u64::from(h != e);
+                                Some(Life::Until(h))
+                            }
+                            None => {
+                                return OpOutcome::HostRejected {
+                                    fault: HostFault::ExpiryCapacityFull,
+                                };
+                            }
+                        }
                     }
+                    _ => Some(life),
                 }
-                Some(life)
             }
             _ => None,
         };
@@ -1833,7 +1853,17 @@ fn generate(
         }
     }
     if height.is_multiple_of(3) {
-        // Four creations due at the next height: one over capacity.
+        // Four creations asking for one height, which holds three. Due at
+        // the next height, the fourth spills to the one after; due at the
+        // maximum lifetime, it has nowhere to spill and is refused.
+        let expiry = if height.is_multiple_of(6) {
+            Expiry {
+                expires_at: 0,
+                min_lifetime: PARAMS.max_lifetime,
+            }
+        } else {
+            until(height + 1)
+        };
         let actor = *generator.rng.pick(&ACTORS);
         if let Some((&id, _)) = work
             .namespaces
@@ -1848,7 +1878,7 @@ fn generate(
                         namespace: ns(id),
                         key: RecordKey::new(&[b'c', tens, b'0' + index]).unwrap(),
                         cells: Vec::new(),
-                        expiry: Some(until(height + 1)),
+                        expiry: Some(expiry),
                     }],
                 ));
             }
@@ -1861,7 +1891,7 @@ fn generate(
                     key: RecordKey::new(&[b'c', tens, b'0']).unwrap(),
                     set: Vec::new(),
                     remove: Vec::new(),
-                    expiry: Some(until(height + 1)),
+                    expiry: Some(expiry),
                 }],
             ));
         }
@@ -1954,6 +1984,9 @@ fn run_seed(seed: u64, coverage: &mut Coverage) -> (MemoryChain, Vec<Block>, Vec
         history.push(model.clone());
         blocks.push(block);
     }
+    for _ in 0..model.spilled {
+        coverage.note("expiry spilled");
+    }
     (chain, blocks, history)
 }
 
@@ -1979,6 +2012,7 @@ fn generated_blocks_match_the_oracle() {
         "admin Rejected(ReservationOverflow)",
         "expiry deletions",
         "expiry at capacity",
+        "expiry spilled",
         "failed mid-transaction",
         "exact budget committed",
         "expiry-only patch",

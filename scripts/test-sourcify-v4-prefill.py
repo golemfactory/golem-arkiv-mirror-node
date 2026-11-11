@@ -736,7 +736,7 @@ class V4PrefillTest(unittest.TestCase):
 protocol = "arkiv-launch-prefill-v1"
 name = "v4 converter test"
 [profile]
-preset = "arkiv-entity-v3/glm-v2@4"
+preset = "arkiv-entity-v3/glm-v2@5"
 [chain]
 id = "{CHAIN}"
 run_id = "0x000000000000000000000000000000aa"

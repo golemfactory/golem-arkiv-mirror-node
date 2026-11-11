@@ -312,6 +312,38 @@ impl From<StorageError> for ExecError {
     }
 }
 
+/// How many heights after a full expiry height an operation's expiry may
+/// spill to: an operation whose resolved height already holds
+/// `expiry_per_block` records takes the first of the next
+/// `EXPIRY_SPILL_WINDOW` heights with room, and is `ExpiryCapacityFull` only
+/// when all of them are full too. It also bounds the host reads of the search:
+/// one count per probed height, at most `EXPIRY_SPILL_WINDOW + 1`.
+pub const EXPIRY_SPILL_WINDOW: u64 = 64;
+
+/// The height a record that asked to expire at `target` is scheduled at: the
+/// first height in `target ..= min(target + window, limit)` whose total (as
+/// `total` reads it from state) is below `capacity`. `None` when every probed
+/// height is full. The permanent sentinel `u64::MAX` is never a spill height.
+/// The result depends only on committed state and the operations before this
+/// one, so every node resolves the same height.
+pub(crate) fn spill_expiry<E>(
+    target: u64,
+    window: u64,
+    limit: u64,
+    capacity: u32,
+    mut total: impl FnMut(u64) -> Result<u64, E>,
+) -> Result<Option<u64>, E> {
+    let last = target.saturating_add(window).min(limit).min(u64::MAX - 1);
+    let mut height = target;
+    while height <= last {
+        if total(height)? < u64::from(capacity) {
+            return Ok(Some(height));
+        }
+        height += 1;
+    }
+    Ok(None)
+}
+
 /// A record's lifetime. `Until(E)` expires (is deleted) in block `E`.
 /// Ordered with every finite height before `Permanent`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -904,6 +936,7 @@ impl<'s> Executor<'s> {
             rent: crate::gas::RentClock::of(self.spec.params())
                 .ok_or(ExecError::Invariant(Invariant::RentClock))?,
             expiry_per_block: self.spec.params().expiry_per_block,
+            expiry_spill_window: EXPIRY_SPILL_WINDOW,
             payer,
             // Live permanent creates pay the capped rent.
             allow_permanent_create: false,
@@ -1203,7 +1236,11 @@ impl<'s> Executor<'s> {
     /// Resolves and admits an operation's expiry against the record's
     /// current lifetime `old`: resolution (overflow, dead on arrival, too
     /// far), extend-only for patches, then the capacity of the resolved
-    /// height, `total(E) + 1 − [old == E] ≤ expiry_per_block`.
+    /// height. A record keeping its height `E` is admitted as it is; any
+    /// other takes the first height from `E` on with `total <
+    /// expiry_per_block` ([`spill_expiry`]), searching at most
+    /// [`EXPIRY_SPILL_WINDOW`] heights past `E` and never past `height +
+    /// max_lifetime`; `ExpiryCapacityFull` when none has room.
     fn admit_expiry(
         &self,
         op: &TxOp,
@@ -1217,16 +1254,22 @@ impl<'s> Executor<'s> {
         if matches!(op, TxOp::PatchRecord { .. }) && old.is_some_and(|old| lifetime < old) {
             return Ok(Err(HostFault::ExpiryShortened));
         }
-        if let Lifetime::Until(height) = lifetime {
-            let unchanged = u64::from(old == Some(lifetime));
-            let after = self
-                .read_count(&total_key(height))?
-                .checked_add(1)
-                .ok_or(ExecError::ScheduleInconsistent(ScheduleFault::Overflow))?
-                - unchanged;
-            if after > u64::from(self.spec.params().expiry_per_block) {
-                return Ok(Err(HostFault::ExpiryCapacityFull));
-            }
+        if let Lifetime::Until(target) = lifetime
+            && old != Some(lifetime)
+        {
+            let params = self.spec.params();
+            return Ok(
+                match spill_expiry(
+                    target,
+                    EXPIRY_SPILL_WINDOW,
+                    self.height.saturating_add(params.max_lifetime),
+                    params.expiry_per_block,
+                    |height| self.read_count(&total_key(height)),
+                )? {
+                    Some(height) => Ok(Lifetime::Until(height)),
+                    None => Err(HostFault::ExpiryCapacityFull),
+                },
+            );
         }
         Ok(Ok(lifetime))
     }

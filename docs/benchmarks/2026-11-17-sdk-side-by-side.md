@@ -51,7 +51,7 @@ reference and takes two to three blocks here. Why was not investigated.
 These are differences an application sees, found while making the workload
 run; the reference accepted every one of them.
 
-1. **At most 16 entities may expire at one block** (`expiry_per_block`,
+1. *(Fixed the same day; see the addendum.)* **At most 16 entities may expire at one block** (`expiry_per_block`,
    bounded at 16 by `signed/protocol.rs`). Creates sharing a lifetime
    (`ExpirationTime.fromHours(2)`) in one block fail after the first 16: of 8
    concurrent 16-create transactions, one succeeded and seven reverted at
@@ -74,3 +74,48 @@ run; the reference accepted every one of them.
   trial runs), the reference's 2,512; every read filters on the run's tag.
 - Rent, fees and gas schedules differ, so gas per entity is not a cost
   comparison.
+
+## Addendum: creates sharing one lifetime (same day)
+
+Limit 1 is gone. A block now holds up to 128 expiring entities
+(`expiry_per_block`, a genesis parameter of 1 to 128; the preset
+`arkiv-entity-v3/glm-v2@5` and the default use 128, the most operations a
+block holds), and a write aiming at a full block is recorded at the next
+block with room, up to 64 later, instead of failing
+([entity expiration](../entity-expiration.md)).
+
+The write half was run again on this node only (working tree of the fixing
+commit, release build, 250 ms blocks, same machine and client), with
+`SAME_LIFETIME=1`: every entity is created with
+`ExpirationTime.fromHours(2)`, as an application would.
+
+| Writes, 2,000 entities, one shared lifetime | This node |
+| --- | --- |
+| Creates committed | 2,000 of 2,000 (125 transactions, none reverted) |
+| Wall time | 12.1 s |
+| Entities per second | 166 |
+| Entities per block | 41 |
+| Transaction latency p50 / p95 | 627 / 859 ms |
+| Gas per entity | 41,816 |
+
+The numbers match the first run's (170 entities per second with distinct
+expiries): the fix removes the failures, not the write gap to the reference,
+which is still not investigated. Reads on the fresh 2,000-entity state were
+in the same range as above (`count` 0.2 ms; equality, range, sort and offset
+pages 3.2 to 3.6 ms p50).
+
+Sweep cost of a full block, measured separately on durable redb stores
+(`produce` including the commit; an empty block takes 5 to 8 ms):
+
+| Entities expiring in the block | This workload's entity | Worst case (31 indexed strings, 128 KiB value) |
+| --- | --- | --- |
+| 16 | 14 ms | 26 ms |
+| 32 | 13 ms | 50 ms |
+| 64 | 13 ms | 134 ms |
+| 128 | 19 ms | 260 ms |
+
+128 of this workload's entities cost about 12 ms more than an empty block.
+128 worst-case entities take longer than a 250 ms block (and a quarter of a
+1 s block), so a 250 ms chain that must bound the worst case should set
+`expiry_per_block` to about 32; the default of 128 is sized for blocks of 1 s
+and more.

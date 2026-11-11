@@ -50,7 +50,10 @@ const out: Record<string, unknown> = { label, entities: N, batch: BATCH }
 
 // ---- writes: N entities in batches of BATCH, WAVE transactions in flight at a time ----
 const WAVE = Number(process.env.WAVE ?? 1)
-// Each entity gets its own expiry height: our node admits at most 16 entities expiring at one block.
+// SAME_LIFETIME=1 gives every entity ExpirationTime.fromHours(2), as applications do. Without it each
+// entity gets its own expiry height, which is what the first run needed: the node then admitted
+// at most 16 entities expiring at one block and failed the rest.
+const SAME_LIFETIME = process.env.SAME_LIFETIME === "1"
 const LIFETIME_BLOCKS = Number(process.env.LIFETIME_BLOCKS ?? 30000)
 const keys: Hex[] = []
 const txMs: number[] = []
@@ -80,7 +83,7 @@ for (let done = 0; done < N; ) {
                   title: `item ${String(n).padStart(6, "0")}`,
                   body,
                 },
-                expiration: ExpirationTime.fromBlocks(LIFETIME_BLOCKS + n),
+                expiration: SAME_LIFETIME ? ExpirationTime.fromHours(2) : ExpirationTime.fromBlocks(LIFETIME_BLOCKS + n),
               }
             }),
           },

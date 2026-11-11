@@ -10,8 +10,8 @@ name = "Sourcify far-future prefill"
 
 [profile]
 path = "far-future-glm-v2.toml"
-bytes = 1753
-sha256 = "848ad2aadaab9727fdc0c52988f24f81c1754aa7344b768a9f3416175006417a"
+bytes = 1754
+sha256 = "9088300c1aeaf11fb7ca7b6ff26fcd3cc22db80343c516b0db128df53aa4bf09"
 
 [chain]
 id = "7706815"

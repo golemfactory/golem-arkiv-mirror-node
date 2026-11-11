@@ -147,13 +147,18 @@ stay, expiries that stay, grow, cross an 8-block cap and become permanent),
 and over 16,000 seeded random schedules of up to eight operations under four
 caps.
 
-**Expiry capacity.** At most `expiry_per_block` (16 on signed chains) records
-may expire at one height. A finite expiry, however far away, counts against its
-height's capacity (`ExpiryCapacityFull`), and lifetimes are unbounded while
-rent is capped at a year, so filling a far-future height costs 16 entities'
-worth of one year of rent each. That squatting only denies that exact height:
-another expiry one block away, or a permanent one, which never counts against
-any height and is never swept, is still free. It is cheap but low impact.
+**Expiry capacity.** At most `expiry_per_block` (1 to 128 on signed chains,
+128 by default) records may expire at one height. A finite expiry, however far
+away, counts against its height's capacity, and lifetimes are unbounded while
+rent is capped at a year, so filling a far-future height costs
+`expiry_per_block` entities' worth of one year of rent each. A write aiming at
+a full height is not refused: its expiry moves to the next height with room,
+at most 64 heights later, and only a run of 65 full heights is
+`ExpiryCapacityFull`. Rent is charged for the height asked for, so the spilled
+blocks are free; a later extension pays from the recorded height, and there
+are no refunds, so they cannot be cashed. A permanent expiry never counts
+against any height and is never swept. See
+[entity expiration](entity-expiration.md).
 
 **Overflow.** `h + cap_blocks` saturates at `u64::MAX`; unit-block and wei
 products use 128-bit intermediates, which the genesis bounds keep from

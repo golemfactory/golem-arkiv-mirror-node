@@ -460,6 +460,9 @@ use the stable ID and name-registration policy stays in the host.
 
 ### Host path and expiry
 
+The chain-level rules (capacity per height, the spill to a later height,
+rent) are in [entity expiration](entity-expiration.md).
+
 `Branch::execute_host` and `estimate_host` run `CreateRecord`, `PatchRecord`
 and `DeleteRecord` with the host's own authority: the namespace owner check
 is skipped and everything else (validation, admission, charges, rollback,

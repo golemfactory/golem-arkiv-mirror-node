@@ -32,10 +32,16 @@ pub const NATIVE_TX_CAP: u32 = 256 * 1024;
 pub const INPUT_CAP: u32 = 768 * 1024;
 pub const BODY_CAP: u32 = 1024 * 1024;
 /// Native outcomes contain only bounded scalar effects/rejections/receipts.
-/// Reserve well over their maximum at 128 operations and 16 expiry deletions,
-/// in addition to the certificate and body framing, even for tightened profiles.
+/// Reserve well over their maximum at 128 operations and
+/// [`MAX_EXPIRY_PER_BLOCK`] expiry deletions, in addition to the certificate
+/// and body framing, even for tightened profiles.
 pub const OUTCOME_RESERVE: u32 = 64 * 1024;
 pub const MAX_TXS: u32 = 16;
+/// The most records a signed chain may let expire at one height
+/// (`ChainParams::expiry_per_block`). It equals the most operations of a
+/// block, so the creates of one block can share one lifetime without ever
+/// filling a height by themselves.
+pub const MAX_EXPIRY_PER_BLOCK: u32 = 128;
 pub const GENESIS_DOMAIN: &str = "arkiv/signed-genesis/v1";
 pub const TX_INTENT_DOMAIN: &str = "arkiv/signed-tx-intent/v1";
 pub const TX_DOMAIN: &str = "arkiv/signed-tx/v1";
@@ -135,6 +141,7 @@ pub fn default_native_genesis(chain_id: u64, timestamp_ms: u64, block_period_ms:
     native.params.block_budget = crate::gas::DEFAULT_BLOCK_GAS_LIMIT;
     native.params.user_budget = 90_000_000;
     native.params.max_lifetime = 6_307_200;
+    native.params.expiry_per_block = MAX_EXPIRY_PER_BLOCK;
     native
 }
 impl SignedGenesis {
@@ -182,7 +189,7 @@ impl SignedGenesis {
             || p.max_txs_per_block > MAX_TXS
             || p.max_ops_per_tx > 16
             || p.max_ops_per_block > 128
-            || p.expiry_per_block > 16
+            || p.expiry_per_block > MAX_EXPIRY_PER_BLOCK
             || self.genesis.limits.namespace_cap > 1024
             || !(MIN_CELLS..=MAX_CELLS).contains(&self.genesis.limits.max_cells)
             || self.genesis.limits.max_payload_len() > 128 * 1024

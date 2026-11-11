@@ -525,10 +525,11 @@ fn max_cell_record(namespace: u64, index: u8, expiry: Expiry) -> TxOp {
 /// The expiry capacity: four max-cell records with 32-byte keys across
 /// three namespaces expire at one height, under a schedule whose
 /// reservation is exact (the block budget is `user_budget + 4 × 222`); a
-/// fifth record at that height is refused, a patch keeping its record's
-/// height is not; the sweep reads one-row pages; the block of the sweep
-/// still gives a transaction the whole user budget. A schedule one unit
-/// more expensive per deletion is refused.
+/// fifth record asking for that height spills to the next and expires there,
+/// a patch keeping its record's height stays; a height with nowhere to spill
+/// (the last within `max_lifetime`) refuses a fifth record; the sweep reads
+/// one-row pages; the block of the sweep still gives a transaction the whole
+/// user budget. A schedule one unit more expensive per deletion is refused.
 #[test]
 fn expiry_at_capacity() {
     let limits = arkiv_db::Limits {
@@ -583,10 +584,34 @@ fn expiry_at_capacity() {
                 Some(until(4)),
             )],
         ),
+        // Height 102 is the last one a record may have at height 2
+        // (`max_lifetime` 100): its fifth record has no later height to take.
+        tx(
+            ALICE,
+            5,
+            10_000,
+            (0..4u8)
+                .map(|n| create(2, &[b'm', n], vec![], Some(until(102))))
+                .collect(),
+        ),
+        tx(
+            ALICE,
+            6,
+            10_000,
+            vec![create(2, b"m4", vec![], Some(until(102)))],
+        ),
     ]));
     assert!(matches!(block.outcomes.txs[0].status, TxStatus::Committed));
+    // The fifth record commits (670 units) and is stored with the height it
+    // was given, 5.
     assert_eq!(
         block.outcomes.txs[1],
+        committed(670, vec![applied(Effect::RecordCreated { id: id(2) }, 670)])
+    );
+    assert!(matches!(block.outcomes.txs[2].status, TxStatus::Committed));
+    assert!(matches!(block.outcomes.txs[3].status, TxStatus::Committed));
+    assert_eq!(
+        block.outcomes.txs[4],
         failed(
             0,
             0,
@@ -595,14 +620,23 @@ fn expiry_at_capacity() {
             }]
         )
     );
-    assert!(matches!(block.outcomes.txs[2].status, TxStatus::Committed));
-    let four = u64::to_be_bytes(4).to_vec();
-    assert_eq!(host(&fixture.snapshot(2), &total_key(4)), Some(four));
+    let snapshot = fixture.snapshot(2);
+    let count = |n: u64| Some(n.to_be_bytes().to_vec());
+    assert_eq!(host(&snapshot, &total_key(4)), count(4));
+    assert_eq!(host(&snapshot, &total_key(5)), count(1));
+    assert_eq!(host(&snapshot, &total_key(102)), count(4));
+    assert_eq!(host(&snapshot, &total_key(103)), None);
+    assert!(
+        record(&snapshot, 4, &[5; 32])
+            .unwrap()
+            .cells
+            .contains(&(name("$expiresAt"), attr(Value::U64(5))))
+    );
     fixture.empty();
     // The sweep block also carries a transaction with the whole user budget.
     let block = fixture.produce(txs(vec![tx(
         ALICE,
-        5,
+        7,
         100_000,
         vec![create(2, b"after", vec![], None)],
     )]));
@@ -622,27 +656,38 @@ fn expiry_at_capacity() {
         block.outcomes.txs,
         vec![committed(
             35,
-            vec![applied(Effect::RecordCreated { id: id(3) }, 35)]
+            vec![applied(Effect::RecordCreated { id: id(7) }, 35)]
         )]
     );
     assert_eq!(block.outcomes.spent, 888 + 35);
     let snapshot = fixture.snapshot(4);
-    for (namespace, index) in [(1, 1), (1, 2), (2, 3), (3, 4)] {
+    for (namespace, index) in [(2, 1), (2, 2), (3, 3)] {
         assert!(record(&snapshot, namespace, &[index; 32]).is_none());
     }
-    assert!(host_entries(&snapshot).is_empty());
+    assert!(record(&snapshot, 4, &[4; 32]).is_none());
+    // The spilled record is live through block 4 and deleted in block 5.
+    assert!(record(&snapshot, 4, &[5; 32]).is_some());
+    let block = fixture.empty().clone();
+    assert_eq!(block.outcomes.expiry, vec![deletion(4, 2, 1, 222)]);
+    let snapshot = fixture.snapshot(5);
+    assert!(record(&snapshot, 4, &[5; 32]).is_none());
+    // Only the four records due at 102 remain scheduled.
+    assert_eq!(host_entries(&snapshot).len(), 2);
+    assert_eq!(host(&snapshot, &total_key(102)), count(4));
     fixture.finish(&[
         GOLDEN_CAPACITY_1,
         GOLDEN_CAPACITY_2,
         GOLDEN_CAPACITY_3,
         GOLDEN_CAPACITY_4,
+        GOLDEN_CAPACITY_5,
     ]);
 }
 
 const GOLDEN_CAPACITY_1: &str = "79425683d4d71d4136de4439501180bba9719d6213790b6378bd97715abb83ff";
-const GOLDEN_CAPACITY_2: &str = "e1014c4c60aef7190a3f88a04505283607070b0e3089a83bc2b0bec0ecbdf8bc";
-const GOLDEN_CAPACITY_3: &str = "372070494c5b089f91e5d3028dc5f4a156210e9d93396f280a73a45e82ac236a";
-const GOLDEN_CAPACITY_4: &str = "7d0144fcd8a2071101b572c64dd2bb5009a49d7355ea5d90f2879f2907c65718";
+const GOLDEN_CAPACITY_2: &str = "12d741fa831d646c5bfa6798b4101e0b8081e3c11d336f46f0c0ab057da26406";
+const GOLDEN_CAPACITY_3: &str = "4de1fbb2b57f276d446652bad6ccce1a86668761899344ccfdb306e2ebf3f55b";
+const GOLDEN_CAPACITY_4: &str = "22698a154b0b830fc253d67b6814418f2a839415b0075802827f2f901b18587d";
+const GOLDEN_CAPACITY_5: &str = "14002de9381b3a79d36b42977d42605308e61d0b74952bf324ed948bcc85d876";
 
 /// Every read weight ×100 (DirectoryLookup, PointRead, ScanSeek, ScanEntry,
 /// ReadByte, QueryGroup, TermSeek, TermVisit, PostingEntry, RowVisit,

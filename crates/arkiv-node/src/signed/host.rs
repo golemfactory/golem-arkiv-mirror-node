@@ -739,6 +739,7 @@ impl Host {
             chain_id: spec.chain_id(),
             rent: crate::gas::RentClock::of(spec.params()).ok_or(Error("InvalidSignedGenesis"))?,
             expiry_per_block: spec.params().expiry_per_block,
+            expiry_spill_window: crate::exec::EXPIRY_SPILL_WINDOW,
             payer: None,
             allow_permanent_create: false,
         };

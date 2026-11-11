@@ -344,6 +344,10 @@ override, rather than add to, defaults.
 
 ### Expiry is a real launch constraint
 
+(The capacity is now a genesis parameter of 1 to 128, 128 in the current
+preset, and live writes spill past a full height; prefill rows stay strict.
+See [entity expiration](entity-expiration.md).)
+
 Require `1 <= expiry_height <= max_lifetime`, rejecting `u64::MAX` in this
 profile. Validate both per-namespace and total counters before committing any
 launch state. In the current signed limits, one million entities at the same

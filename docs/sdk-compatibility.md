@@ -78,7 +78,11 @@ SDK's ABI does not name yet). A transaction that alone adds more storage units
 than a block may is refused at submission, and one dropped from the pool
 answers `eth_getTransactionReceipt` with `transaction dropped: ...`, so
 `waitForTransactionReceipt` fails instead of waiting. Existing native limits still apply,
-including operation, attribute, namespace, lifetime and expiry bucket limits.
+including operation, attribute and namespace limits. At most `expiry_per_block`
+entities (128 by default) expire at one block; a write aiming at a full block
+gets the next block with room, up to 64 later, so the `expiresAt` an event or
+a read reports can be later than the one asked for (see
+[entity expiration](entity-expiration.md)).
 
 ## Reads and subscriptions
 

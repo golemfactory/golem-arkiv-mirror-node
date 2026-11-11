@@ -82,7 +82,7 @@ def main():
                 'max_new_storage_units_per_block = "200000"',
             )
         )
-        preset = 'profile = { preset = "arkiv-entity-v3/glm-v2@4" }'
+        preset = 'profile = { preset = "arkiv-entity-v3/glm-v2@5" }'
         assert preset in source
         source = source.replace(preset, 'profile = { path = "profile.toml" }')
         (work / "chain.toml").write_text(source)

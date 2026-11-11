@@ -231,6 +231,7 @@ pub(crate) fn build_file(
             chain_id: base.genesis.chain_id,
             rent: clock,
             expiry_per_block: base.genesis.params.expiry_per_block,
+            expiry_spill_window: 0,
             // Only used for expiry resolution; no operation executes here.
             payer: None,
             allow_permanent_create: false,

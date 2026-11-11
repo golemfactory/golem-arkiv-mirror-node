@@ -33,6 +33,7 @@ fn setup() -> (Engine, Branch, ArkivExecutionContext<'static>) {
         chain_id: 1337,
         rent: CLOCK,
         expiry_per_block: 100,
+        expiry_spill_window: crate::exec::EXPIRY_SPILL_WINDOW,
         payer: None,
         allow_permanent_create: false,
     };
@@ -880,6 +881,7 @@ fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey
         chain_id: 1337,
         rent: CLOCK,
         expiry_per_block: 1,
+        expiry_spill_window: 0,
         payer: None,
         allow_permanent_create: true,
     };
@@ -1772,4 +1774,97 @@ fn str_values_take_any_utf8_within_the_length_cap() {
         validate_value(&Value::str(&"\n".repeat(MAX_STR_BYTES + 1))),
         Err(ArkivFault::Value)
     );
+}
+
+/// A full expiry height moves an operation to the next height with room, in
+/// execution order; rent is charged for the height asked. One record per
+/// height here; height 10 already holds the fixture's finite row.
+#[test]
+fn a_full_expiry_height_spills_to_the_next_with_room() {
+    let (_engine, mut b, mut live, _) = glm_permanent();
+    let (chain, caller, h) = (live.chain_id, live.caller, live.block_height);
+    let k = |nonce: u64, salt: u128| {
+        RecordKey::new(&derive_entity_key(chain, &caller, nonce, salt)).unwrap()
+    };
+    let total = |b: &Branch, height| count(b, &crate::exec::total_key(height)).unwrap();
+    let full = OpOutcome::HostRejected {
+        fault: HostFault::ExpiryCapacityFull,
+    };
+    // Strict (height-zero construction passes no window): a full height fails.
+    assert_eq!(live.expiry_spill_window, 0);
+    assert_eq!(run(&mut b, &live, &create_until(30, at(10))), full);
+    // Live blocks search the heights after it.
+    live.expiry_spill_window = 3;
+    let first = run_rent(&mut b, &live, &create_until(30, at(10)));
+    let second = run_rent(&mut b, &live, &create_until(31, at(10)));
+    let (a, c) = (k(2, 30), k(3, 31));
+    assert_eq!((read(&b, &a).expires_at, read(&b, &c).expires_at), (11, 12));
+    assert_eq!((total(&b, 10), total(&b, 11), total(&b, 12)), (1, 1, 1));
+    // Rent is that of the lifetime asked: the spilled blocks are free.
+    let units = units_of(&b, &a);
+    let asked = crate::gas::rent(0, units, None, Some(10), h, CLOCK)
+        .unwrap()
+        .wei;
+    assert!(asked > 0);
+    assert_eq!((rent_of(&first), rent_of(&second)), (asked, asked));
+    let extend = |key: &RecordKey, expiry| ArkivOperation::ExtendExpiry {
+        key: key.clone(),
+        expiry,
+    };
+    // The recorded height is the entity's expiry: an extension below it
+    // shortens, and one to it changes nothing and pays nothing.
+    assert_eq!(
+        run(&mut b, &live, &extend(&c, at(11))),
+        OpOutcome::HostRejected {
+            fault: HostFault::ExpiryShortened
+        }
+    );
+    assert_eq!(rent_of(&run_rent(&mut b, &live, &extend(&c, at(12)))), 0);
+    assert_eq!(read(&b, &c).expires_at, 12);
+    // An extension onto a full height spills too, and frees its old height.
+    // It pays from the recorded height (11) to the height asked (12).
+    let extended = run_rent(&mut b, &live, &extend(&a, at(12)));
+    assert_eq!(read(&b, &a).expires_at, 13);
+    assert_eq!(
+        rent_of(&extended),
+        crate::gas::rent(units, units, Some(11), Some(12), h, CLOCK)
+            .unwrap()
+            .wei
+    );
+    assert_eq!(
+        (total(&b, 10), total(&b, 11), total(&b, 12), total(&b, 13)),
+        (1, 0, 1, 1)
+    );
+    // The freed height is taken first again.
+    applied(run(&mut b, &live, &create_until(32, at(10))));
+    assert_eq!(read(&b, &k(4, 32)).expires_at, 11);
+    // Heights 10..=13 are full: a window of 3 is exhausted, nothing is
+    // written, and a wider window finds 14.
+    let nonce = count(&b, &nonce_key(&caller)).unwrap();
+    assert_eq!(run(&mut b, &live, &create_until(33, at(10))), full);
+    assert_eq!(
+        run(&mut b, &live, &extend(&c, at(10 + 1))),
+        OpOutcome::HostRejected {
+            fault: HostFault::ExpiryShortened
+        }
+    );
+    live.expiry_spill_window = 0;
+    assert_eq!(run(&mut b, &live, &extend(&c, at(13))), full);
+    live.expiry_spill_window = 3;
+    assert_eq!(count(&b, &nonce_key(&caller)).unwrap(), nonce);
+    assert_eq!((read(&b, &c).expires_at, total(&b, 14)), (12, 0));
+    live.expiry_spill_window = 4;
+    applied(run(&mut b, &live, &create_until(33, at(10))));
+    assert_eq!(read(&b, &k(5, 33)).expires_at, 14);
+    // Permanent entities are not scheduled, so they never spill, and no
+    // finite expiry spills into the permanent sentinel.
+    applied(run(&mut b, &live, &create_until(34, Expiry::PERMANENT)));
+    assert_eq!(read(&b, &k(6, 34)).expires_at, u64::MAX);
+    applied(run(&mut b, &live, &create_until(35, at(u64::MAX - 1))));
+    assert_eq!(read(&b, &k(7, 35)).expires_at, u64::MAX - 1);
+    assert_eq!(
+        run(&mut b, &live, &create_until(36, at(u64::MAX - 1))),
+        full
+    );
+    assert_eq!(total(&b, u64::MAX), 0);
 }

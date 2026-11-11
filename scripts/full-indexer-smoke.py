@@ -133,7 +133,7 @@ def main():
         assert 'max_new_storage_units_per_block = "1500000"' in profile
         (work / 'profile.toml').write_text(profile.replace('max_new_storage_units_per_block = "1500000"',
                                                            'max_new_storage_units_per_block = "200000"'))
-        preset = 'profile = { preset = "arkiv-entity-v3/glm-v2@4" }'
+        preset = 'profile = { preset = "arkiv-entity-v3/glm-v2@5" }'
         assert preset in source
         (work / 'chain.toml').write_text(source.replace(preset, 'profile = { path = "profile.toml" }'))
         (work / 'proposer.key').write_text('0x' + '01' * 32)

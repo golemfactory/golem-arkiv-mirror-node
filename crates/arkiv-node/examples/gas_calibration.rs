@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_id: 1337,
             rent: clock,
             expiry_per_block: 16,
+            expiry_spill_window: arkiv_node::exec::EXPIRY_SPILL_WINDOW,
             // Quoted, not debited: the calibration has no balances.
             payer: None,
             allow_permanent_create: false,

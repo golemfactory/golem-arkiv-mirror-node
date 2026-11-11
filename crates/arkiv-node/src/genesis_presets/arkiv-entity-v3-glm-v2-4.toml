@@ -1,0 +1,51 @@
+# Complete values; the compiler must not resolve a mutable named preset.
+schema = "arkiv-genesis-profile-v1"
+entity_rules = "arkiv-entity-v3"
+account_rules = "glm-v2"
+state_layout = 2
+codec_version = 1
+admins = []
+
+[pricing]
+schedule_id = 1196182785 # 0x474c4d01
+weights = [100, 20000, 10000, 10000, 10000, 4, 4, 100, 100, 10, 1, 20000, 12000, 10000, 250, 4, 100, 500, 0, 300, 100, 100, 10, 10, 10, 10, 10, 100, 2, 10, 1]
+gas_price_wei = "1000000000"
+rent_rule = "glm-rent-v3"
+
+[engine_limits]
+namespace_cap = 1024
+max_cells = 39
+max_cell_name_len = 32
+max_str_len = 131072
+max_bytes_len = 131072
+max_indexed_len = 128
+max_page = 64
+max_groups = 8
+max_literals = 8
+
+[chain_params]
+block_budget = "100000000"
+user_budget = "90000000"
+expiry_per_block = 16
+max_admin_per_block = 0
+max_txs_per_block = 16
+max_ops_per_tx = 16
+max_ops_per_block = 128
+max_tx_bytes = 262035
+max_block_input_bytes = 786432
+max_lifetime = "6307200"
+# Rent cap: any lifetime at or beyond it, permanent included, costs the same.
+# Consensus keeps seconds; the cap applies in whole blocks (rounded up) at the
+# chain's block period, and rent is priced per second, outside gas.
+max_rent_lifetime_seconds = "31536000" # 365 days; 1 to 3153600000 (100 years)
+# The most storage units one block's transactions may add (creates and growth).
+# 1,500,000 binds no block the 786,432-byte input cap admits; lower it to
+# throttle storage growth. The producer defers what does not fit.
+max_new_storage_units_per_block = "1500000"
+
+[signed_limits]
+# An Ethereum transaction carries its raw bytes beside the native envelope:
+# 384 KiB fits a full 128 KiB entity sent through eth_sendRawTransaction.
+max_tx_bytes = 393216
+max_input_bytes = 786432
+max_body_bytes = 1048576

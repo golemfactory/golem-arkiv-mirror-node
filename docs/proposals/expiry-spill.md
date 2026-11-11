@@ -1,8 +1,10 @@
 # Proposal: exact expiry with a per-block cap and spill
 
-Status: draft, 2026-11-17. The rule is being implemented in this repository
-(issue #9); sweep timings and the SDK check are pending and will be added
-here. Written for the people designing Arkiv's expiry and purge.
+Status: implemented in this repository on 2026-11-17 (issue #9, commit
+"Raise the expiry capacity to 128 and spill past a full height"; behaviour in
+[entity expiration](../entity-expiration.md), specification in the
+[block format](../block-format.md#expiry)). Written for the people designing
+Arkiv's expiry and purge.
 
 ## Summary
 
@@ -42,11 +44,15 @@ of 8 concurrent 16-create transactions, 7 reverted.
 
 ## The rule
 
-Parameters, fixed in the chain's genesis:
+Parameters:
 
-- `C` = `expiry_per_block`: the most entities that may expire at one block
-  (1 to 128; proposed default 128, the most operations a block can hold).
-- `W`: the spill window, in blocks (proposed 64).
+- `C` = `expiry_per_block`: the most entities that may expire at one block.
+  A genesis parameter, 1 to 128; the default and the preset use 128, the most
+  operations a block can hold.
+- `W` = `EXPIRY_SPILL_WINDOW`: the spill window, 64 blocks. In this
+  implementation it is a protocol constant, not a genesis parameter, because
+  the chain parameters' encoding is fixed; a design from scratch would put it
+  in the genesis beside `C`.
 
 For an operation that sets an entity's expiry (create, extend) and resolves,
 by the existing rules, to block `E`:
@@ -55,13 +61,20 @@ by the existing rules, to block `E`:
    entities expire at. Record `expiresAt = E'`.
 2. If every block in the window is full, the operation fails with
    `ExpiryCapacityFull`.
-3. A permanent entity has no expiry block and never spills.
+3. A permanent entity has no expiry block and never spills, and no finite
+   expiry spills into the permanent sentinel.
+4. An extension to the block the entity is already recorded at changes
+   nothing; an extension onto a full block spills like a create and frees the
+   old block. "May not shorten" is checked on `E`, and `E' >= E`.
+5. Genesis prefill rows do not spill: a row over capacity is an error.
 
 The sweep is unchanged: block `h` deletes exactly the entities recorded at
 `h`, at most `C` of them, before any user transaction.
 
 Rent is charged for the requested block `E`; the blocks up to `E'` are free.
-The event, the receipt and every read report `E'`.
+A later extension is charged from `E'`, and deletes refund nothing, so the
+free blocks are never paid twice and never paid out. The events
+(`EntityCreated`, `ExpiryExtended`) and every read report `E'`.
 
 ## Properties
 
@@ -88,18 +101,50 @@ The event, the receipt and every read report `E'`.
   cover that.
 - Spilled blocks are stored without rent.
 - Each probed block is a state read, so a spilling write costs up to `W`
-  extra reads; these are metered.
+  extra reads. The implementation bounds them (at most `W + 1` per operation)
+  but does not charge them yet.
 - The expiry schedule (entities per block) is consensus state. This node
   already keeps it; Arkiv's executor does not.
 
 ## Open questions
 
-1. The values of `C` and `W`. `C = 128` needs the sweep of 128 worst-case
-   entities to fit the block time; measurement pending.
-2. Whether spilled blocks should be charged.
-3. Whether the SDK or any application compares the requested expiry with the
-   reported one; check against SDK 1.0.1 pending.
+1. The values of `C` and `W`. See the measurements below: `C = 128` fits a
+   1 s block in the worst case and a 250 ms block only for ordinary entities;
+   a 250 ms chain that must bound the worst case needs about 32.
+2. Whether spilled blocks, and the probes, should be charged.
+3. Whether any application (not the SDK, see below) compares the requested
+   expiry with the reported one.
 4. Whether to offer the "fail instead of spill" flag from the start.
 5. For Arkiv itself: adopting this means exact deletion in the executor and
    an expiry schedule in state, replacing `purgeExpired` and the producer's
    pruning database.
+
+## Measurements
+
+Sweep time: `produce` for the block that deletes a full expiry block, commit
+included, on durable redb stores, release build, Ryzen 5 3600 with NVMe. An
+empty block takes 5 to 8 ms. "Typical" is 4 indexed attributes and a 256-byte
+body; "worst case" is the largest entity admitted, 31 indexed 128-byte
+strings and a 128 KiB value.
+
+| `C` (entities deleted) | Typical | Worst case | Worst case, share of 250 ms | of 1 s |
+| --- | --- | --- | --- | --- |
+| 16 | 14 ms | 26 ms | 10% | 3% |
+| 32 | 13 ms | 50 ms | 20% | 5% |
+| 64 | 13 ms | 134 ms | 54% | 13% |
+| 128 | 19 ms | 260 ms | 104% | 26% |
+
+Time is linear in `C`: about 0.1 ms per typical entity, 2 ms per worst-case
+one. 128 typical entities fit any block period; 128 worst-case ones do not
+fit a 250 ms block. Filling a block that way takes 16 MiB of entities written
+over at least 26 blocks.
+
+SDK 1.0.1: `createEntity` and `extendEntity` return the `expiresAt` of the
+`EntityCreated`/`ExpiryExtended` event, and the SDK's health suite compares
+that with the stored `$expiresAt`. Nothing compares either with the lifetime
+requested, so a spilled expiry is accepted; the SDK's component and health
+suites pass against the implementation.
+
+With `C = 128`, a benchmark of 2,000 creates in batches of 16, eight
+transactions at a time, all with `ExpirationTime.fromHours(2)`, commits every
+create ([results](../benchmarks/2026-11-17-sdk-side-by-side.md)).

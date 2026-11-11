@@ -119,3 +119,20 @@ SDK 1.0 removed `ExpirationTime.permanent()` and refuses lifetimes past its
 permanent entities and caps rent at a year (63,072,000 blocks at 500 ms), so
 the SDK smoke no longer covers permanence or `PermanenceOwnerOnly`; the Rust
 tests do. Whether chains should advertise the SDK's lifetime cap is open.
+
+Creates sharing a lifetime no longer fail (issue #9): a height holds 128
+expiring entities by default, and a write aiming at a full height is recorded
+at the next height with room, up to 64 later
+([entity expiration](entity-expiration.md), [proposal](proposals/expiry-spill.md)).
+SDK 1.0.1 takes `expiresAt` from the `EntityCreated`/`ExpiryExtended` event
+and its health suite compares it with the stored `$expiresAt`; it never
+compares either with the lifetime it asked for, so a spilled expiry passes.
+Open:
+
+- An application that computes the expiry instead of reading it back can be
+  up to 64 blocks early. No "fail instead of spill" flag exists.
+- When every height of the window is full the transaction reverts; a replay
+  through `eth_call` then carries an `Error(string)` reason, but if the state
+  has moved on and the replay succeeds the SDK still reports "No reason
+  provided by backend": a receipt has no reason field.
+- The spill's reads are bounded (65) but not charged.

@@ -514,6 +514,9 @@ fn construct(
             chain_id: g.genesis.chain_id,
             rent: clock,
             expiry_per_block: g.genesis.params.expiry_per_block,
+            // Prefill rows are explicit: a row over a height's capacity is an
+            // error, never moved.
+            expiry_spill_window: 0,
             // The sponsor, not the creator, pays the prefill burn below.
             payer: None,
             allow_permanent_create: permanent,

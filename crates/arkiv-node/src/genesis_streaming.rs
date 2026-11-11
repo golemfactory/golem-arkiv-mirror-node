@@ -947,7 +947,7 @@ mod tests {
                 report["storageUnits"].as_str()
             ),
             (
-                Some("0x29de1b651e42c177f447290733a92b647e00c229e2a2a9fe82c535c02e9dcf51"),
+                Some("0x73d5dc082568a24dae5a00a8e3f52e5beeb894037116b61e39036bda4d052df5"),
                 Some("0xd756e0f565373d8f779f872c74dab72df31fb9608b41cbbf707a1c3fb23cb326"),
                 Some("298333333336"),
                 Some("12888")

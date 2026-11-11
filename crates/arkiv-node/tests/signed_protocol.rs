@@ -55,9 +55,13 @@ fn signed_genesis_bounds_native_state_and_reserves_complete_outcomes() {
     let mut g = genesis();
     g.limits.max_body_bytes = g.limits.max_input_bytes + OUTCOME_RESERVE - 1;
     assert!(g.validate().is_err());
-    let mut g = genesis();
-    g.genesis.params.expiry_per_block = 17;
-    assert!(g.validate().is_err());
+    // At most 128 records may expire at one height: the most operations of a
+    // block. Chains created with the earlier bound of 16 remain valid.
+    for (expiry_per_block, valid) in [(1, true), (16, true), (128, true), (129, false)] {
+        let mut g = genesis();
+        g.genesis.params.expiry_per_block = expiry_per_block;
+        assert_eq!(g.validate().is_ok(), valid, "{expiry_per_block} per block");
+    }
     let mut g = genesis();
     g.genesis.limits.max_bytes_len = 128 * 1024 + 1;
     assert!(g.validate().is_err());
@@ -72,8 +76,32 @@ fn signed_genesis_bounds_native_state_and_reserves_complete_outcomes() {
     ] {
         let mut g = genesis();
         g.genesis.limits.max_cells = cells;
+        // The expiry reservation grows with both: 128 deletions of 64-cell
+        // records (80,900 units each) do not fit the default 10,000,000
+        // units, 64 do. 128 deletions fit up to 61 cells.
+        g.genesis.params.expiry_per_block = 64;
         assert_eq!(g.validate().is_ok(), valid, "{cells} cells");
     }
+    let mut g = genesis();
+    g.genesis.limits.max_cells = 64;
+    assert!(g.validate().is_err());
+    assert_eq!(
+        arkiv_node::params::check_reservation(
+            &g.genesis.params,
+            &g.genesis.limits,
+            &g.genesis.pricing
+        ),
+        Err(arkiv_node::ReservationFault::Violated {
+            required: 90_000_000 + 128 * 80_900,
+            block_budget: 100_000_000,
+        })
+    );
+    // The default genesis reserves 128 × 53,400 of its 10,000,000 units.
+    let g = genesis();
+    assert_eq!(
+        arkiv_node::params::max_expiry_delete_cost(&g.genesis.pricing, &g.genesis.limits),
+        Some(53_400)
+    );
     assert_eq!(
         arkiv_node::arkiv::MIN_ENTITY_CELLS,
         arkiv_node::arkiv::SYSTEM_CELLS + arkiv_node::arkiv::MAX_ATTRIBUTES
@@ -186,31 +214,31 @@ fn preimages_are_explicit_and_golden() {
     // Explicit byte-layout vectors pinned across dependency changes.
     assert_eq!(
         hex(g.hash().as_slice()),
-        "045099e0a4480cf0ad61d72ff0da0f1b521a081430d82b76c2f7583e710b6608"
+        "abcd7ff7bbffb39ba38c7425b7e1bc62067f43b91337f932fa5c1b30f56aa1e4"
     );
     assert_eq!(
         hex(tx.intent_digest().as_slice()),
-        "bfb441c334eda62af70d495c12538f5efbf521290e179d472f06332cc5a0f6de"
+        "86593c2439e228a69b2d932d0aabb10993bd645c8a094860c2c126504a5a243c"
     );
     assert_eq!(
         hex(tx.hash().as_slice()),
-        "57f2ae17b0456541ba318b1e708d237a3479ae85636674ce9840b806c1215be3"
+        "df0b6f89a7f62cf57c39d80b5b02ef229eb5cb8332a82daeda288499ac097077"
     );
     assert_eq!(
         hex(inputs.digest().as_slice()),
-        "1f8f2deda950664f66448a035f21d73f8a1abc664a0d58b2765da5a01cbfcd32"
+        "8d65882c69b36e646014d841631a1487f9cc1f37d35da8f13cde0a4e59e2973b"
     );
     assert_eq!(
         hex(header.intent_digest().as_slice()),
-        "b1c017c8d7d172fdf08021af64b0490f19f298dece4e1bcda2892dcfc05d0565"
+        "9dbada0df4eadbed5c827cbb4b20403b8dcecce9c0123b1296398af79d2f1dfe"
     );
     assert_eq!(
         hex(&tx.signature),
-        "86acdbce5e8426fe288fe0b6d6af0b233685fd93c59ef7556b57fa14776e0d552a9a80a328c5da7f7e022f2fa588bcb42df146025fe496b3717135b3d1c703f800"
+        "8d0dd98ccc63db4657452f56570bda52b59f5cb93a102f7b6d17761c4a1a157c5711e6a10ad898e6afee151858a2e3f27255694f1fa658787b46066f66c527ef01"
     );
     assert_eq!(
         hex(&header.signature),
-        "73e24fb8775fe3428a03cc0d1ad3d6e5eeebc8397d55ff3acfbc1948eec657343b8eed1a5858fe364eb3b7e149d7adea5730f0f57f33ec964aa4bee5ab17cac301"
+        "fbeae3e8d997fc820d9e423c6129586b50b90ee5bb84ff745d7a33f0caae65d3132235c22dd3a0b3d7d549a0a1c50322d69b1c5bcdc4e89335c15abd451e200d01"
     );
 }
 

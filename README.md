@@ -409,7 +409,9 @@ Every native signed chain runs the `glm-v2` gas profile: GLM pricing with
 from `--allocations-file allocations.json` or from a genesis `--bundle`.
 
 The signed proposer accepts the existing Arkiv SDK over JSON-RPC at `/`; see
-[compatibility, limits and validation](docs/sdk-compatibility.md). New chains can
+[compatibility, limits and validation](docs/sdk-compatibility.md), and
+[entity expiration](docs/entity-expiration.md) for when entities are removed
+and how many may expire in one block. New chains can
 use a [TOML genesis bundle with prefills](docs/examples/genesis-bundle/README.md).
 For larger datasets, the [streaming genesis v2 path](docs/streaming-genesis-v2.md)
 uses [bulk index construction](docs/bulk-prefill.md) with bounded external

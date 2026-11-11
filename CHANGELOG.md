@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Expiry: 128 per block, and a full block spills to the next
+
+- **A height holds up to 128 expiring entities** (was 16). A signed genesis
+  accepts `expiry_per_block` from 1 to 128 (`MAX_EXPIRY_PER_BLOCK`, the most
+  operations a block holds); a producer started without a bundle and the new
+  preset `arkiv-entity-v3/glm-v2@5` use 128. Creates sharing one lifetime in
+  one block (8 transactions of 16) therefore all commit; before, 7 of 8
+  reverted with `ExpiryCapacityFull` (issue #9). Purge stays exact: block `E`
+  deletes every entity recorded at `E`.
+- **This is a genesis parameter.** An existing chain keeps the value in its
+  genesis (16) and opens unchanged; to get 128 an operator creates a new
+  chain from a new genesis (bundle profile `[chain_params] expiry_per_block`,
+  or the `@5` preset). The value must fit the expiry reservation: 128
+  deletions reserve 6,835,200 of the default 10,000,000 units at 39 cells per
+  record and fit up to 61 cells; a 64-cell profile needs 123 or fewer.
+- **Preset versions.** `arkiv-entity-v3/glm-v2@4` is still accepted and
+  expands to the same bytes (now kept in
+  `crates/arkiv-node/src/genesis_presets/`), so chains authored with it lock,
+  build and verify the same genesis. Changed on purpose, with new hashes:
+  `docs/examples/genesis-bundle/profiles/fixed-glm-v2.toml` (the `@5`
+  expansion) and `docs/examples/far-future-prefill/far-future-glm-v2.toml`
+  (both `expiry_per_block = 128`, so the `sha256`/`bytes` pins in the two
+  `chain.toml` files), the examples and smoke scripts that named `@4` (now
+  `@5`), and the golden hashes of tests built on the default native genesis.
+  A bundle rebuilt from these examples is a different chain than one built
+  from the old files.
+- **Spill (consensus).** An operation that sets an expiry (create,
+  `extendExpiry`, a generic record's create or patch) and resolves to a full
+  height is recorded at the first of the next 64 heights with room
+  (`EXPIRY_SPILL_WINDOW`), in execution order, and fails with
+  `ExpiryCapacityFull` only when all 65 are full. Permanent entities never
+  spill; generic records never spill past `max_lifetime`; genesis prefill
+  rows stay strict. Rent is charged for the height asked for, so the extra
+  blocks are free. Events (`EntityCreated`, `ExpiryExtended`) and reads report
+  the recorded height. Upgrade every node of a chain together; a chain whose
+  history contains an `ExpiryCapacityFull` rejection cannot be re-executed
+  from genesis by this version (the rejected write would now succeed).
+- When the whole window is full, `eth_call`/`eth_estimateGas` answer with an
+  `Error(string)` revert reason naming the blocks and the capacity instead of
+  empty revert data.
+- Measured sweep of a full height on durable redb (commit included, empty
+  block 5 to 8 ms): 128 typical entities 19 ms; 128 worst-case entities (31
+  indexed strings and a 128 KiB value) 260 ms, 64 take 134 ms, 32 take 50 ms.
+  128 suits block periods of 1 s and more; a 250 ms chain that must bound the
+  worst case should set 32. See `docs/entity-expiration.md`, the new page on
+  the whole expiry lifecycle.
+- The simulator/demo genesis (`demo::workload::genesis`) keeps 16: simulator
+  stores check their parameters against it.
+
 ### `str` values take any UTF-8
 
 - A `str` value may hold control characters (C0 and DEL were refused): only

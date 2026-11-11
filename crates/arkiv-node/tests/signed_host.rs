@@ -879,3 +879,520 @@ fn observed_engine_commit_stays_unacknowledged_until_a_fresh_restart() {
         assert_eq!(producer.submit(pending).unwrap()["status"], "included");
     }
 }
+
+/// A create that asks to expire at exactly `height`.
+fn create_until(salt: u128, height: u64) -> ArkivOperation {
+    ArkivOperation::Create {
+        salt,
+        flags: 0,
+        expiry: Expiry {
+            expires_at: height,
+            min_lifetime: 0,
+        },
+        attributes: vec![(
+            CellName::new("group").unwrap(),
+            Cell::attribute(Value::U64(1)),
+        )],
+    }
+}
+fn chain(genesis: &SignedGenesis, producer: bool) -> Host {
+    let certificate = SignedHeader::sign(genesis, genesis.header(), &signer(1)).unwrap();
+    Host::create(
+        Arc::new(MemoryVersionedStore::new()),
+        History::create(Arc::new(MemoryVersionedStore::new()), genesis.hash()).unwrap(),
+        genesis.clone(),
+        [3; 16],
+        certificate,
+        producer.then(|| signer(1)),
+        Options::default(),
+    )
+    .unwrap()
+}
+fn tx_on(
+    genesis: &SignedGenesis,
+    key: u8,
+    nonce: u64,
+    operations: Vec<ArkivOperation>,
+) -> SignedTx {
+    let signer = signer(key);
+    let mut request_id = [key; 32];
+    request_id[..8].copy_from_slice(&nonce.to_be_bytes());
+    SignedTx::sign(
+        genesis,
+        nonce,
+        TxEnvelope {
+            chain_id: genesis.genesis.chain_id,
+            actor: signer.address(),
+            request_id,
+            tx_budget: 10_000_000,
+            ops: operations
+                .into_iter()
+                .map(|operation| TxOp::Arkiv {
+                    namespace: arkiv::entity_namespace(),
+                    operation,
+                })
+                .collect(),
+        },
+        &signer,
+    )
+    .unwrap()
+}
+fn expiry_total(host: &Host, height: u64) -> u64 {
+    host.engine
+        .head_snapshot()
+        .try_host_get(&arkiv_node::exec::total_key(height))
+        .unwrap()
+        .map_or(0, |bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+}
+/// The expiry height each `EntityCreated`/`ExpiryExtended` event of a block
+/// reports, by entity key.
+fn logged_expiries(host: &Host, height: u64) -> Vec<(String, String, u64)> {
+    let created = arkiv_node::signed::rpc::hex(
+        alloy_primitives::keccak256(b"EntityCreated(bytes32,address,uint64,uint8)").as_slice(),
+    );
+    arkiv_node::signed::rpc::block_logs(host, height)
+        .unwrap()
+        .iter()
+        .filter(|log| log["data"].as_str().unwrap().len() >= 66)
+        .map(|log| {
+            let data = log["data"].as_str().unwrap();
+            (
+                if log["topics"][0] == created.as_str() {
+                    "created".to_owned()
+                } else {
+                    "extended".to_owned()
+                },
+                log["topics"][1].as_str().unwrap().to_owned(),
+                u64::from_str_radix(&data[2 + 48..66], 16).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A block holds at most 128 operations and a height at most 128 expiring
+/// entities (the default): 8 transactions of 16 creates sharing one lifetime
+/// all commit. Further creates and an extension aimed at the full height
+/// take the following heights in execution order, events report the height
+/// each entity was given, a full follower re-executes the same heights, a
+/// light node verifies them by proof, and the sweep purges every entity in
+/// the block of its recorded height.
+#[test]
+fn creates_sharing_a_lifetime_fill_a_height_and_spill_to_the_next() {
+    const E: u64 = 12;
+    let genesis = genesis();
+    assert_eq!(genesis.genesis.params.expiry_per_block, 128);
+    assert_eq!(genesis.genesis.params.max_ops_per_block, 128);
+    let mut producer = memory(true);
+    let mut full = memory(false);
+    let mut light = Light::create(
+        Arc::new(MemoryVersionedStore::new()),
+        genesis.clone(),
+        producer.certificate(0).unwrap(),
+    )
+    .unwrap();
+    producer.produce().unwrap();
+    relay(&producer, &mut full, &mut light);
+    // Blocks 2 and 3: 8 transactions of 16 creates each, all asking for E.
+    let mut keys = Vec::new();
+    for block in 0..2u64 {
+        for t in 0..8u64 {
+            let ops = (0..16u64)
+                .map(|i| create_until(u128::from(i), E))
+                .collect::<Vec<_>>();
+            producer
+                .submit(tx_on(&genesis, 2, block * 8 + t, ops))
+                .unwrap();
+            for i in 0..16u64 {
+                let nonce = block * 128 + t * 16 + i;
+                keys.push(entity_key(2, nonce, u128::from(i)));
+            }
+        }
+        producer.produce().unwrap();
+        relay(&producer, &mut full, &mut light);
+        let produced = producer.block(2 + block).unwrap();
+        assert_eq!(produced.inputs.txs.len(), 8);
+        assert!(
+            produced
+                .outcomes
+                .txs
+                .iter()
+                .all(|tx| tx.status == TxStatus::Committed && tx.ops.len() == 16)
+        );
+    }
+    // The first 128 got the height they asked for, the next 128 the one after.
+    for (index, key) in keys.iter().enumerate() {
+        let expected = if index < 128 { E } else { E + 1 };
+        assert_eq!(entity(&producer, key).unwrap().expires_at, expected);
+        assert_eq!(entity(&full, key).unwrap().expires_at, expected);
+    }
+    assert_eq!(
+        (expiry_total(&producer, E), expiry_total(&producer, E + 1)),
+        (128, 128)
+    );
+    // Rent is for the lifetime asked: block 3's creates asked for one block
+    // less than block 2's and pay less, although they live as long.
+    let rent = |height: u64| producer.block(height).unwrap().outcomes.txs[0].rent_wei;
+    assert!(rent(3) < rent(2) && !rent(3).is_zero());
+    // Block 4: a 257th create goes two heights on, and so does an extension
+    // of an entity created in the same transaction onto the full height.
+    producer
+        .submit(tx_on(&genesis, 2, 16, vec![create_until(500, E)]))
+        .unwrap();
+    producer
+        .submit(tx_on(
+            &genesis,
+            3,
+            0,
+            vec![
+                create_until(501, E - 1),
+                ArkivOperation::ExtendExpiry {
+                    key: entity_key(3, 0, 501),
+                    expiry: Expiry {
+                        expires_at: E,
+                        min_lifetime: 0,
+                    },
+                },
+            ],
+        ))
+        .unwrap();
+    producer.produce().unwrap();
+    relay(&producer, &mut full, &mut light);
+    let (late, extended) = (entity_key(2, 256, 500), entity_key(3, 0, 501));
+    for key in [&late, &extended] {
+        assert_eq!(entity(&producer, key).unwrap().expires_at, E + 2);
+        assert_eq!(entity(&full, key).unwrap().expires_at, E + 2);
+    }
+    assert_eq!(
+        (
+            expiry_total(&producer, E - 1),
+            expiry_total(&producer, E + 2)
+        ),
+        (0, 2)
+    );
+    // Events report the recorded heights, on the producer and the follower.
+    for host in [&producer, &full] {
+        for (height, expected) in [(2, E), (3, E + 1)] {
+            let logs = logged_expiries(host, height);
+            assert_eq!(logs.len(), 128);
+            assert!(logs.iter().all(|(_, _, expiry)| *expiry == expected));
+        }
+        let key_hex = |key: &RecordKey| arkiv_node::signed::rpc::hex(key.as_bytes());
+        assert_eq!(
+            logged_expiries(host, 4),
+            vec![
+                ("created".to_owned(), key_hex(&late), E + 2),
+                ("created".to_owned(), key_hex(&extended), E - 1),
+                ("extended".to_owned(), key_hex(&extended), E + 2),
+            ]
+        );
+    }
+    // A light node verifies the spilled height by proof against the header.
+    let request = EqRequest {
+        snapshot: SnapshotRef {
+            genesis_hash: genesis.hash(),
+            height: producer.head.height,
+            block_hash: producer.head.hash(),
+            state_root: producer.head.state_root,
+        },
+        query: EqQuery {
+            namespace: arkiv::entity_namespace(),
+            attribute: CellName::new("$expiresAt").unwrap(),
+            value: Value::U64(E + 2),
+        },
+        limit: 16,
+        continuation: None,
+    };
+    let proof = producer.proof(&request).unwrap();
+    assert_eq!(full.proof(&request).unwrap(), proof);
+    let VerifiedEq::Page(page) = light.verify(&request, None, &proof).unwrap() else {
+        panic!("namespace missing")
+    };
+    let mut proven: Vec<_> = page
+        .rows
+        .iter()
+        .map(|row| arkiv::project(row).unwrap().key)
+        .collect();
+    proven.sort();
+    let mut expected = [late.as_bytes().to_vec(), extended.as_bytes().to_vec()];
+    expected.sort();
+    assert_eq!(
+        proven.iter().map(|k| k.to_vec()).collect::<Vec<_>>(),
+        expected
+    );
+    // Each entity is purged in the block of its recorded height. Block E is
+    // the largest a chain produces: 128 deletions beside 128 operations.
+    while producer.head.height < E + 2 {
+        let next = producer.head.height + 1;
+        if next == E {
+            for t in 0..8u64 {
+                let ops = (0..16u64)
+                    .map(|i| create_until(1_000 + u128::from(i), E + 100))
+                    .collect::<Vec<_>>();
+                producer.submit(tx_on(&genesis, 2, 17 + t, ops)).unwrap();
+            }
+        }
+        producer.produce().unwrap();
+        relay(&producer, &mut full, &mut light);
+        let block = producer.block(next).unwrap();
+        let expected = match next {
+            E => 128,
+            n if n == E + 1 => 128,
+            n if n == E + 2 => 2,
+            _ => 0,
+        };
+        assert_eq!(block.outcomes.expiry.len(), expected, "block {next}");
+        if next == E {
+            assert_eq!(block.outcomes.txs.len(), 8);
+            assert!(
+                block
+                    .outcomes
+                    .txs
+                    .iter()
+                    .all(|tx| tx.status == TxStatus::Committed)
+            );
+            // The outcomes of the largest block stay far below the 64 KiB
+            // the body cap reserves for them.
+            let outcomes = encode(&block.outcomes).len();
+            assert!(outcomes < 16 * 1024, "{outcomes} outcome bytes");
+        }
+        assert_eq!(expiry_total(&producer, next), 0);
+    }
+    for key in keys.iter().chain([&late, &extended]) {
+        assert!(entity(&producer, key).is_none());
+        assert!(entity(&full, key).is_none());
+    }
+}
+
+/// The search for a free height is bounded: with one expiry per height, a
+/// create takes the height asked or one of the 64 after it, and the next one
+/// fails with `ExpiryCapacityFull`, rolling its transaction back.
+#[test]
+fn a_spill_stops_after_the_search_window() {
+    const E: u64 = 100;
+    let window = arkiv_node::exec::EXPIRY_SPILL_WINDOW;
+    assert_eq!(window, 64);
+    let mut native = arkiv_node::signed::protocol::default_native_genesis(9100, 1000, 100);
+    native.params.expiry_per_block = 1;
+    let genesis = signed_support::genesis_from(native, [7; 16], 1, 100, &[1, 2, 3]);
+    let mut producer = chain(&genesis, true);
+    let mut full = chain(&genesis, false);
+    producer.produce().unwrap();
+    full.import(producer.block(1).unwrap()).unwrap();
+    // 65 creates fill E ..= E + 64; the 66th finds no room.
+    let mut salt = 0u128;
+    let mut batch = |n: usize| {
+        (0..n)
+            .map(|_| {
+                salt += 1;
+                create_until(salt, E)
+            })
+            .collect::<Vec<_>>()
+    };
+    for nonce in 0..4 {
+        producer
+            .submit(tx_on(&genesis, 2, nonce, batch(16)))
+            .unwrap();
+    }
+    producer.submit(tx_on(&genesis, 2, 4, batch(1))).unwrap();
+    producer.submit(tx_on(&genesis, 2, 5, batch(2))).unwrap();
+    producer.produce().unwrap();
+    full.import(producer.block(2).unwrap()).unwrap();
+    assert_eq!(full.head, producer.head);
+    let block = producer.block(2).unwrap();
+    assert!(
+        block.outcomes.txs[..5]
+            .iter()
+            .all(|tx| tx.status == TxStatus::Committed)
+    );
+    for offset in 0..=window {
+        assert_eq!(expiry_total(&producer, E + offset), 1);
+        let key = RecordKey::new(&arkiv::derive_entity_key(
+            9100,
+            signer(2).address().as_bytes(),
+            offset,
+            u128::from(offset) + 1,
+        ))
+        .unwrap();
+        assert_eq!(entity(&producer, &key).unwrap().expires_at, E + offset);
+    }
+    let failed = &block.outcomes.txs[5];
+    assert_eq!(failed.status, TxStatus::Failed { op_index: 0 });
+    assert_eq!(
+        failed.ops[0],
+        OpOutcome::HostRejected {
+            fault: HostFault::ExpiryCapacityFull
+        }
+    );
+    assert!(failed.rent_wei.is_zero());
+    assert_eq!(expiry_total(&producer, E + window + 1), 0);
+    assert_eq!(creation_nonce(&producer, signer(2).address()), 65);
+}
+
+/// Measures the expiry sweep: the time `produce` takes for the block in
+/// which a full height of entities expires, on durable redb stores, commit
+/// included, beside the same chain's empty blocks. Opt-in:
+///
+/// ```text
+/// ARKIV_BENCH_DIR=/path/on/a/real/disk cargo test --release -p arkiv-node \
+///     --test signed_host expiry_sweep_timing -- --ignored --nocapture
+/// ```
+///
+/// "typical" is the SDK benchmark's entity (4 indexed attributes and a
+/// 256-byte body); "worst" has 31 indexed 128-byte strings and one 128 KiB
+/// `bytes` value, the most an entity may hold; "indexed" is the worst entity
+/// with a 256-byte body, to tell the index work from the value's.
+#[test]
+#[ignore = "timing experiment: see the doc comment"]
+fn expiry_sweep_timing() {
+    use arkiv_db_redb::{RedbConfig, RedbStore};
+    use std::time::Instant;
+    const E: u64 = 60;
+    let root = std::env::var_os("ARKIV_BENCH_DIR")
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+        .join(format!("arkiv-expiry-sweep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let entity = |kind: &str, n: u64| {
+        let text = |i: u64, len: usize| {
+            let mut s = format!("{n:08}-{i:02}-");
+            while s.len() < len {
+                s.push('x');
+            }
+            Value::Str(s.into())
+        };
+        let mut attributes = Vec::new();
+        let (strings, len, body) = match kind {
+            "worst" => (31, 128, 128 * 1024),
+            "indexed" => (31, 128, 256),
+            _ => (4, 24, 256),
+        };
+        for i in 0..strings {
+            attributes.push((
+                CellName::new(&format!("attr{i:02}")).unwrap(),
+                Cell::attribute(text(i, len)),
+            ));
+        }
+        attributes.push((
+            CellName::new("body").unwrap(),
+            Cell::field(Value::bytes(&vec![n as u8; body])),
+        ));
+        ArkivOperation::Create {
+            salt: u128::from(n),
+            flags: 0,
+            expiry: Expiry {
+                expires_at: E,
+                min_lifetime: 0,
+            },
+            attributes,
+        }
+    };
+    println!("kind     expiring  sweep block ms  empty block ms  sweep units  body bytes");
+    for kind in ["typical", "indexed", "worst"] {
+        for capacity in [16u32, 32, 64, 128] {
+            let dir = root.join(format!("{kind}-{capacity}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut native = arkiv_node::signed::protocol::default_native_genesis(9100, 1000, 250);
+            native.params.expiry_per_block = capacity;
+            let genesis = signed_support::genesis_from(native, [7; 16], 1, 250, &[1, 2]);
+            let store = |name: &str| -> Arc<dyn VersionedStore> {
+                Arc::new(RedbStore::create(dir.join(name), RedbConfig::default()).unwrap())
+            };
+            let certificate = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
+            let mut producer = Host::create(
+                store("node.redb"),
+                History::create(store("history.redb"), genesis.hash()).unwrap(),
+                genesis.clone(),
+                [3; 16],
+                certificate,
+                Some(signer(1)),
+                Options::default(),
+            )
+            .unwrap();
+            producer.produce().unwrap();
+            // Creation: 16 typical entities per transaction, or one worst
+            // entity per transaction and four per block (the input cap).
+            let (per_tx, per_block) = match kind {
+                "worst" => (1, 4),
+                "indexed" => (4, 16),
+                _ => (16, 128),
+            };
+            let (mut made, mut nonce) = (0u64, 0u64);
+            while made < u64::from(capacity) {
+                let mut in_block = 0;
+                while in_block < per_block && made < u64::from(capacity) {
+                    let count = per_tx.min(u64::from(capacity) - made);
+                    let ops = (made..made + count).map(|n| entity(kind, n)).collect();
+                    let signer = signer(2);
+                    let mut request_id = [9; 32];
+                    request_id[..8].copy_from_slice(&nonce.to_be_bytes());
+                    let tx = SignedTx::sign(
+                        &genesis,
+                        nonce,
+                        TxEnvelope {
+                            chain_id: genesis.genesis.chain_id,
+                            actor: signer.address(),
+                            request_id,
+                            tx_budget: if kind == "typical" {
+                                10_000_000
+                            } else {
+                                20_000_000
+                            },
+                            ops: ops_of(ops),
+                        },
+                        &signer,
+                    )
+                    .unwrap();
+                    producer.submit(tx).unwrap();
+                    nonce += 1;
+                    made += count;
+                    in_block += count;
+                }
+                producer.produce().unwrap();
+                let block = producer.block(producer.head.height).unwrap();
+                assert!(!block.inputs.txs.is_empty() && producer.pool.is_empty());
+                assert!(
+                    block
+                        .outcomes
+                        .txs
+                        .iter()
+                        .all(|tx| tx.status == TxStatus::Committed),
+                    "{:?}",
+                    block.outcomes.txs
+                );
+            }
+            assert_eq!(expiry_total(&producer, E), u64::from(capacity));
+            assert!(producer.head.height < E - 12, "{}", producer.head.height);
+            let mut empty = Vec::new();
+            while producer.head.height < E - 1 {
+                let start = Instant::now();
+                producer.produce().unwrap();
+                empty.push(start.elapsed());
+            }
+            let start = Instant::now();
+            producer.produce().unwrap();
+            let sweep = start.elapsed();
+            let block = producer.block(E).unwrap();
+            assert_eq!(block.outcomes.expiry.len(), capacity as usize);
+            assert_eq!(expiry_total(&producer, E), 0);
+            empty.sort();
+            println!(
+                "{:8} {:8}  {:14.2}  {:14.2}  {:11}  {:10}",
+                kind,
+                capacity,
+                sweep.as_secs_f64() * 1e3,
+                empty[empty.len() / 2].as_secs_f64() * 1e3,
+                block.outcomes.spent,
+                encode(&block).len()
+            );
+        }
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+fn ops_of(operations: Vec<ArkivOperation>) -> Vec<TxOp> {
+    operations
+        .into_iter()
+        .map(|operation| TxOp::Arkiv {
+            namespace: arkiv::entity_namespace(),
+            operation,
+        })
+        .collect()
+}
