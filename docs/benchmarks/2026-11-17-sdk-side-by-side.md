@@ -84,8 +84,7 @@ block holds), and a write aiming at a full block is recorded at the next
 block with room, up to 64 later, instead of failing
 ([entity expiration](../entity-expiration.md)).
 
-The write half was run again on this node only (working tree of the fixing
-commit, release build, 250 ms blocks, same machine and client), with
+The write half was run again on this node only (`310ebc2`, release build, 250 ms blocks, same machine and client), with
 `SAME_LIFETIME=1`: every entity is created with
 `ExpirationTime.fromHours(2)`, as an application would.
 

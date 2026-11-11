@@ -1,7 +1,7 @@
 # Proposal: exact expiry with a per-block cap and spill
 
 Status: implemented in this repository on 2026-11-17 (issue #9, commit
-"Raise the expiry capacity to 128 and spill past a full height"; behaviour in
+`310ebc2`; behaviour in
 [entity expiration](../entity-expiration.md), specification in the
 [block format](../block-format.md#expiry)). Written for the people designing
 Arkiv's expiry and purge.
