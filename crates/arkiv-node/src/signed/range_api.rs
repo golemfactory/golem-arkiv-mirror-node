@@ -1,8 +1,9 @@
 //! Small, unpaged range-proof transport.
 
-use super::{Node, Shared, fetch, parse, snapshot, with_node};
+use super::{Node, Shared, fetch, snapshot, with_node};
+use crate::http::json_body;
 use crate::{
-    signed::{Error, Result},
+    signed::{ErrorCode, Result},
     simulator::{
         light::{VerifiedRequest, resolve as resolve_eq},
         wire::{Identity, REQUEST_CAP, RESPONSE_CAP, hex, number, pack, unhex, unpack},
@@ -46,7 +47,7 @@ fn resolve(identity: &Identity, header: &crate::Header, query: &Query) -> Result
         .lower
         .as_ref()
         .or(query.upper.as_ref())
-        .ok_or(Error("InvalidRequest"))?;
+        .ok_or(ErrorCode::InvalidRequest)?;
     let value_request = |bound: &RangeBound| VerifiedRequest {
         height: query.height.clone(),
         namespace: query.namespace.clone(),
@@ -58,7 +59,7 @@ fn resolve(identity: &Identity, header: &crate::Header, query: &Query) -> Result
     };
     let selected = resolve_eq(identity, header, &value_request(anchor))?;
     if !selected.query.value.tag().is_ordered() {
-        return Err(Error("UnsupportedProof"));
+        return Err(ErrorCode::UnsupportedProof.into());
     }
     let bound = |value: &Option<RangeBound>| -> Result<Bound<arkiv_db::Value>> {
         match value {
@@ -90,7 +91,7 @@ fn resolve(identity: &Identity, header: &crate::Header, query: &Query) -> Result
 /// [`super::super::reads`]): the proof is generated from the pinned state
 /// after the node lock is released.
 pub(super) async fn proof(rt: Shared, body: Body, admission: OwnedSemaphorePermit) -> Result<Json> {
-    let raw: CanonicalRequest = parse(body, REQUEST_CAP).await?;
+    let raw: CanonicalRequest = json_body(body, REQUEST_CAP).await?;
     let request: RangeRequest = unpack(&raw.request, 4096)?;
     let admitted = rt.reads.admit()?;
     drop(admission);
@@ -99,9 +100,9 @@ pub(super) async fn proof(rt: Shared, body: Body, admission: OwnedSemaphorePermi
             let state = {
                 let node = rt.read_node()?;
                 let Node::Full(host) = &*node else {
-                    return Err(Error("UnsupportedNodeRole"));
+                    return Err(ErrorCode::UnsupportedNodeRole.into());
                 };
-                host.proof_state(&request.snapshot, "InvalidRequest")?
+                host.proof_state(&request.snapshot, ErrorCode::InvalidRequest)?
             };
             Ok(json!({"proof":hex(&crate::signed::host::range_proof_bytes(&state, &request)?)}))
         })
@@ -116,12 +117,12 @@ pub(super) async fn handle(
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<Json> {
     let inspect = path == "query/range/inspect";
-    let query: Query = parse(body, REQUEST_CAP).await?;
+    let query: Query = json_body(body, REQUEST_CAP).await?;
     let (selection, verifying) = (query.clone(), path == "query/range/verified" || inspect);
     let (request, certificate, identity, genesis) = with_node(&rt, &permit, move |node| {
         let certificate = node.certificate(number(&selection.height)?)?;
         if verifying && !matches!(node, Node::Light { .. }) {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         }
         Ok((
             resolve(node.identity(), &certificate.header, &selection)?,
@@ -137,7 +138,7 @@ pub(super) async fn handle(
     }
     let response: Json = fetch(
         &rt.client,
-        rt.peer.as_deref().ok_or(Error("InvalidRequest"))?,
+        rt.peer.as_deref().ok_or(ErrorCode::InvalidRequest)?,
         "/signed/v1/query/range",
         Some(json!({"request":pack(&request)})),
         None,
@@ -145,7 +146,7 @@ pub(super) async fn handle(
     )
     .await?;
     let bytes = unhex(
-        response["proof"].as_str().ok_or(Error("InvalidProof"))?,
+        response["proof"].as_str().ok_or(ErrorCode::InvalidProof)?,
         if inspect {
             crate::simulator::inspection::INSPECT_PROOF_CAP
         } else {
@@ -158,10 +159,10 @@ pub(super) async fn handle(
         // the catalog must still hold afterwards.
         let verified = crate::signed::light::verify_range_at(&genesis, &header, &request, &bytes)?;
         if rt.read_node()?.certificate(header.height)?.header != header {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let VerifiedRange::Complete(verified) = verified else {
-            return Err(Error("NamespaceNotFound"));
+            return Err(ErrorCode::NamespaceNotFound.into());
         };
         let inspection = if inspect {
             let mut caps = crate::simulator::wire::range_proof_limits()?;
@@ -202,5 +203,5 @@ pub(super) async fn handle(
         Ok(result)
     })
     .await
-    .map_err(|_| Error("StorageUnavailable"))?
+    .map_err(|_| ErrorCode::StorageUnavailable)?
 }

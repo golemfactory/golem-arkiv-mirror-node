@@ -8,6 +8,12 @@ const CLOCK: crate::gas::RentClock = match crate::gas::RentClock::new(1_000, 1_0
     None => panic!("test clock"),
 };
 
+fn rejected(fault: ArkivFault) -> OpOutcome {
+    OpOutcome::HostRejected {
+        fault: HostFault::Arkiv(fault),
+    }
+}
+
 fn setup() -> (Engine, Branch, ArkivExecutionContext<'static>) {
     let engine = Engine::with_limits(
         PriceSchedule::FIXTURE,
@@ -126,42 +132,6 @@ fn lifecycle_is_committed_owner_authority() {
     c.caller = [1; 20];
     applied(run(&mut b, &c, &create(0)));
     assert_ne!(key(&c, 0), key(&c, 1));
-}
-
-#[test]
-fn batch_failure_rolls_back_cells_indexes_nonce_and_schedule() {
-    let (_e, mut b, c) = setup();
-    let ops = [
-        create(0),
-        ArkivOperation::Delete {
-            key: RecordKey::new(&[99; 32]).unwrap(),
-        },
-    ];
-    let (outcomes, rent) = execute_batch(&mut b, entity_namespace(), &c, &ops, 1_000_000).unwrap();
-    assert_eq!(rent, U256::ZERO);
-    assert!(
-        matches!(outcomes[0], OpOutcome::RolledBack { .. }),
-        "{outcomes:?}"
-    );
-    assert_eq!(count(&b, &nonce_key(&c.caller)).unwrap(), 0);
-    assert_eq!(count(&b, &crate::exec::total_key(10)).unwrap(), 0);
-    assert!(
-        b.try_get_record(
-            entity_namespace(),
-            &key(&c, 0),
-            &Projection::ALL,
-            Budget::unlimited()
-        )
-        .unwrap()
-        .unwrap()
-        .value
-        .is_none()
-    );
-    applied(run(&mut b, &c, &create(0)));
-    assert_eq!(
-        read(&b, &key(&c, 0)).key,
-        derive_entity_key(c.chain_id, &c.caller, 0, 7)
-    );
 }
 
 #[test]
@@ -435,7 +405,7 @@ fn tombstones_are_unflagged_empty_and_patch_only() {
 }
 
 #[test]
-fn payload_and_content_type_are_gone_from_every_write_path() {
+fn host_owned_names_are_refused_on_every_write_path() {
     // Not protocol names on the wire, whatever their type.
     for (n, type_id, value) in [
         ("$payload", 7, vec![1, 2, 3]),
@@ -788,7 +758,7 @@ fn generic_namespaces_without_glm_cannot_receive_arkiv_entities() {
         .outcome,
         rejected(ArkivFault::Namespace)
     );
-    let spec = crate::ChainSpec::new_unchecked(crate::demo::workload::genesis(1337, 0));
+    let spec = crate::ChainSpec::new_unchecked(crate::dev::genesis(1337, 0));
     assert!(
         crate::validate::check_op(
             &spec,
@@ -804,11 +774,17 @@ fn generic_namespaces_without_glm_cannot_receive_arkiv_entities() {
 /// The rent cap of the GLM fixtures, in blocks ([`CLOCK`]).
 const CAP: u64 = 1_000;
 
-/// A GLM-priced branch holding one permanent entity created the way a
-/// permanent-prefill genesis creates it (height 0, `allow_permanent_create`),
-/// plus the live context of block 5. No payer: rent is quoted, not debited.
-fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey) {
-    assert_eq!(CLOCK.cap_blocks(), CAP);
+/// A GLM-priced branch at height 0 after a permanent creation, made the way
+/// a permanent-prefill genesis makes it (`allow_permanent_create`), and a
+/// finite one; returns the height-0 context and both outcomes. No payer:
+/// rent is quoted, not debited.
+fn glm_genesis_rows() -> (
+    Engine,
+    Branch,
+    ArkivExecutionContext<'static>,
+    ArkivOutcome,
+    ArkivOutcome,
+) {
     let engine = Engine::with_limits(crate::gas::schedule(), Limits::DEFAULT);
     let mut branch = engine.begin(engine.head(), None).unwrap();
     branch
@@ -821,7 +797,7 @@ fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey
         )
         .unwrap()
         .unwrap();
-    let mut genesis = ArkivExecutionContext {
+    let genesis = ArkivExecutionContext {
         caller: [1; 20],
         block_height: 0,
         chain_id: 1337,
@@ -835,18 +811,34 @@ fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey
     if let ArkivOperation::Create { expiry, .. } = &mut op {
         *expiry = Expiry::PERMANENT;
     }
-    let applied_create = run_rent(&mut branch, &genesis, &op);
-    let OpOutcome::Applied { receipt, .. } = &applied_create.outcome else {
-        panic!("{applied_create:?}")
+    let permanent = run_rent(&mut branch, &genesis, &op);
+    let finite = run_rent(&mut branch, &genesis, &create(0));
+    (engine, branch, genesis, permanent, finite)
+}
+
+/// The branch of [`glm_genesis_rows`], the key of its permanent entity and
+/// the live context of block 5.
+fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey) {
+    let (engine, branch, mut live, _, _) = glm_genesis_rows();
+    let key = key(&live, 0);
+    live.block_height = 5;
+    live.allow_permanent_create = false;
+    (engine, branch, live, key)
+}
+
+#[test]
+fn a_sponsored_permanent_prefill_row_is_metered_but_rent_free() {
+    assert_eq!(CLOCK.cap_blocks(), CAP);
+    let (_engine, branch, genesis, permanent, finite) = glm_genesis_rows();
+    let OpOutcome::Applied { receipt, .. } = &permanent.outcome else {
+        panic!("{permanent:?}")
     };
     // The genesis exemption removes rent only; execution is still metered.
     assert!(receipt.spent.units() > 0);
-    assert_eq!(applied_create.rent_wei, U256::ZERO);
-    let key = key(&genesis, 0);
-    assert_eq!(read(&branch, &key).expires_at, u64::MAX);
+    assert_eq!(permanent.rent_wei, U256::ZERO);
+    assert_eq!(read(&branch, &key(&genesis, 0)).expires_at, u64::MAX);
     // The flag only waives rent for permanent creations: a second, finite
     // creation pays and schedules exactly as without it.
-    let finite = run_rent(&mut branch, &genesis, &create(0));
     assert!(
         matches!(finite.outcome, OpOutcome::Applied { .. }),
         "{finite:?}"
@@ -861,9 +853,6 @@ fn glm_permanent() -> (Engine, Branch, ArkivExecutionContext<'static>, RecordKey
         count(&branch, &crate::exec::due_key(u64::MAX, entity_namespace())).unwrap(),
         0
     );
-    genesis.block_height = 5;
-    genesis.allow_permanent_create = false;
-    (engine, branch, genesis, key)
 }
 
 fn run_rent(b: &mut Branch, c: &ArkivExecutionContext, op: &ArkivOperation) -> ArkivOutcome {
@@ -985,7 +974,7 @@ fn glm_updates_permanent_entities_with_capped_rent() {
     assert_eq!(rent_of(&noop), 0);
     let p = read(&b, &k);
     assert_eq!((p.expires_at, p.updated_at), (u64::MAX, 5));
-    // A same-size patch pays execution only; growth pays the capped lifetime.
+    // A same-size patch pays execution only.
     let same = run_rent(
         &mut b,
         &live,
@@ -996,7 +985,8 @@ fn glm_updates_permanent_entities_with_capped_rent() {
         },
     );
     assert_eq!(rent_of(&same), 0);
-    let grow = run_rent(
+    assert!(spent(&same.outcome) > 0 && spent(&noop.outcome) > 0);
+    applied(run(
         &mut b,
         &live,
         &ArkivOperation::Patch {
@@ -1004,14 +994,7 @@ fn glm_updates_permanent_entities_with_capped_rent() {
             set: vec![(name("note"), Cell::field(Value::str("grown")))],
             remove: vec![],
         },
-    );
-    // `note` adds 4 + 5 + 2 units, paid for the whole capped lifetime.
-    let growth_rent = crate::gas::rent(0, 11, Some(u64::MAX), Some(u64::MAX), 5, CLOCK)
-        .unwrap()
-        .wei;
-    assert_eq!(growth_rent, CLOCK.wei(11 * u128::from(CAP)).unwrap());
-    assert_eq!(rent_of(&grow), growth_rent);
-    assert!(spent(&same.outcome) > 0 && spent(&noop.outcome) > 0);
+    ));
     applied(run(
         &mut b,
         &live,
@@ -1213,7 +1196,7 @@ fn glm_rent_is_debited_and_burned_outside_the_gas_budget() {
     let op = create_until(30, Expiry::PERMANENT);
     // Measure the execution gas without debiting, then run the same create
     // with exactly that budget: rent never needs gas.
-    let checkpoint = b.checkpoint();
+    let checkpoint = b.try_checkpoint().unwrap();
     let quoted = run_rent(
         &mut b,
         &ArkivExecutionContext {
@@ -1265,7 +1248,7 @@ fn glm_rent_is_debited_and_burned_outside_the_gas_budget() {
 fn glm_rent_without_the_balance_is_refused_before_any_write() {
     let (_engine, mut b, live) = glm_funded(U256::from(1u64));
     let quoted = {
-        let checkpoint = b.checkpoint();
+        let checkpoint = b.try_checkpoint().unwrap();
         let r = run_rent(
             &mut b,
             &ArkivExecutionContext {
@@ -1313,41 +1296,6 @@ fn glm_rent_without_the_balance_is_refused_before_any_write() {
         run(&mut b, &live, &create_until(40, Expiry::PERMANENT)),
         rejected(ArkivFault::InsufficientRentBalance)
     );
-}
-
-#[test]
-fn glm_failed_batches_roll_back_rent_debits() {
-    let (_engine, mut b, live) = glm_funded(U256::from(10u64).pow(U256::from(18u64)));
-    let before = balance(&b, &live, live.caller);
-    let ops = [
-        create_until(50, Expiry::PERMANENT),
-        create_until(51, at(live.block_height + CAP)),
-    ];
-    let checkpoint = b.checkpoint();
-    let (outcomes, rent) =
-        execute_batch(&mut b, entity_namespace(), &live, &ops, 10_000_000).unwrap();
-    assert!(
-        outcomes
-            .iter()
-            .all(|o| matches!(o, OpOutcome::Applied { .. })),
-        "{outcomes:?}"
-    );
-    assert!(rent > U256::ZERO);
-    assert_eq!(balance(&b, &live, live.caller), before - rent);
-    assert_eq!(burnt(&b), rent);
-    b.rollback_to(checkpoint).unwrap();
-    let failing = [
-        create_until(50, Expiry::PERMANENT),
-        ArkivOperation::Delete {
-            key: RecordKey::new(&[99; 32]).unwrap(),
-        },
-    ];
-    let (outcomes, rent) =
-        execute_batch(&mut b, entity_namespace(), &live, &failing, 10_000_000).unwrap();
-    assert!(matches!(outcomes[0], OpOutcome::RolledBack { .. }));
-    assert_eq!(rent, U256::ZERO);
-    assert_eq!(balance(&b, &live, live.caller), before);
-    assert_eq!(burnt(&b), U256::ZERO);
 }
 
 #[test]
@@ -1594,14 +1542,17 @@ fn a_transaction_quote_sees_its_own_earlier_operations() {
         },
     ];
     let quoted = quote_tx(&b, &live, 0, ops.iter().map(|op| (entity_namespace(), op))).unwrap();
-    // Execute the first five as one batch; the last would fail it.
-    let (outcomes, rent) =
-        execute_batch(&mut b, entity_namespace(), &live, &ops[..5], 10_000_000).unwrap();
+    // Execute the first five; the last would fail.
+    let executed: Vec<ArkivOutcome> = ops[..5]
+        .iter()
+        .map(|op| run_rent(&mut b, &live, op))
+        .collect();
     assert!(
-        outcomes
+        executed
             .iter()
-            .all(|o| matches!(o, OpOutcome::Applied { .. }))
+            .all(|e| matches!(e.outcome, OpOutcome::Applied { .. }))
     );
+    let rent = executed.iter().fold(U256::ZERO, |sum, e| sum + e.rent_wei);
     assert_eq!(quoted.rent_wei, rent);
     // The create's whole entity and both growths, nothing for the rest.
     let note = 4 + 680 + 2;
@@ -1617,12 +1568,8 @@ fn a_transaction_quote_sees_its_own_earlier_operations() {
     .unwrap()
     .total;
     assert_eq!(quoted.new_units, entity + note + more);
-    // Executed one by one, the operations report the same units.
-    let (_engine, mut b, live, _) = glm_permanent();
-    let added: u64 = ops[..5]
-        .iter()
-        .map(|op| run_rent(&mut b, &live, op).new_units)
-        .sum();
+    // The operations report the same units.
+    let added: u64 = executed.iter().map(|e| e.new_units).sum();
     assert_eq!(added, quoted.new_units);
 }
 

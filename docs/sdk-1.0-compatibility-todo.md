@@ -98,7 +98,7 @@ network; whether to keep, flag or drop each is open. SDK 1.0.1 maps only codes
 
 ## Language and parser
 
-- **Two parsers.** `signed/rpc_reads.rs` has its own Boolean parser (to DNF,
+- **Two parsers.** `signed/rpc_reads/syntax.rs` has its own Boolean parser (to DNF,
   with `ORDER BY`), which hands each predicate to the adapted GPL copy of the
   upstream grammar in `simulator/query_language` (revision `0fd58ce5`). That
   copy gained `BETWEEN` and ranges on every type, modelled on upstream's

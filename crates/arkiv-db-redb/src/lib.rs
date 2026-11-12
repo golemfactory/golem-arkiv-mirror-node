@@ -61,14 +61,15 @@
 //!
 //! Every store reads and writes through a [`CountingBackend`], so
 //! [`StoreStats::backend`](arkiv_db_storage::versioned::StoreStats) reports
-//! the actual backend I/O. [`testing::CrashDisk`] is a simulated device with
-//! a power-loss and torn-write model, fault injection and a space quota, for
-//! [`RedbStore::with_backend`].
+//! the actual backend I/O. With the `testing` feature, `testing::CrashDisk`
+//! is a simulated device with a power-loss and torn-write model, fault
+//! injection and a space quota, for [`RedbStore::with_backend`].
 
 mod counting;
 mod error;
 mod metrics;
 mod store;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use counting::{CountingBackend, IoProbe};

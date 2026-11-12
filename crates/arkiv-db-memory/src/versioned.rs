@@ -7,8 +7,8 @@ use std::{
 
 use arkiv_db_storage::versioned::{
     CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, Relabel, SpaceId,
-    StatsRecorder, StorageError, StorageErrorKind, StoreStats, Table, VersionedStore,
-    head_mismatch, object_conflict, record_conflict, relabel_mismatch,
+    StatsRecorder, StorageError, StoreStats, Table, VersionedStore, Written, copy_bounded,
+    head_mismatch, object_conflict, record_conflict, relabel_mismatch, validate_objects,
 };
 
 /// A [`VersionedStore`] held entirely in process memory.
@@ -67,10 +67,6 @@ impl Default for MemoryVersionedStore {
 }
 
 impl ObjectReader for MemoryVersionedStore {
-    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-        self.read_object_bounded(space, id, usize::MAX)
-    }
-
     fn read_object_bounded(
         &self,
         space: SpaceId,
@@ -100,10 +96,6 @@ impl VersionedStore for MemoryVersionedStore {
         Ok(head)
     }
 
-    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.read_record_bounded(table, key, usize::MAX)
-    }
-
     fn read_record_bounded(
         &self,
         table: Table,
@@ -121,48 +113,23 @@ impl VersionedStore for MemoryVersionedStore {
     }
 
     fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
-        let outcome = self.apply(batch, false);
-        match outcome {
-            Ok((new_objects, new_records)) => {
-                let outcome = CommitOutcome::Committed;
-                self.stats.commit(&outcome, &new_objects, new_records);
-                outcome
-            }
-            Err(error) => {
-                let outcome = CommitOutcome::NotCommitted(error);
-                self.stats.commit(&outcome, &[], 0);
-                outcome
-            }
-        }
+        self.stats
+            .write(self.apply(batch).map_err(CommitOutcome::NotCommitted))
     }
 
     fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
-        let mut batch = CommitBatch::new(None, Head::default());
-        batch.objects = objects.to_vec();
-        match self.apply(&batch, true) {
-            Ok((objects, records)) => {
-                self.stats
-                    .commit(&CommitOutcome::Committed, &objects, records);
-                CommitOutcome::Committed
-            }
+        // A refused staging is not counted.
+        match self.apply_objects(objects) {
+            Ok(written) => self.stats.write(Ok(written)),
             Err(error) => CommitOutcome::NotCommitted(error),
         }
     }
 
     fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
-        let outcome = self.apply_relabel(relabel);
-        match outcome {
-            Ok((new_objects, new_records)) => {
-                let outcome = CommitOutcome::Committed;
-                self.stats.commit(&outcome, &new_objects, new_records);
-                outcome
-            }
-            Err(error) => {
-                let outcome = CommitOutcome::NotCommitted(error);
-                self.stats.commit(&outcome, &[], 0);
-                outcome
-            }
-        }
+        self.stats.write(
+            self.apply_relabel(relabel)
+                .map_err(CommitOutcome::NotCommitted),
+        )
     }
 
     fn health(&self) -> Health {
@@ -180,38 +147,30 @@ impl VersionedStore for MemoryVersionedStore {
     }
 }
 
-/// Checks the borrowed stored value before allocating its returned copy.
-fn copy_bounded(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, StorageError> {
-    if bytes.len() > max_bytes {
-        return Err(StorageError::new(
-            StorageErrorKind::Corrupt,
-            format!(
-                "stored value has {} bytes, exceeds read limit {max_bytes}",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(bytes.to_vec())
-}
-
 impl MemoryVersionedStore {
     /// Checks the whole batch against the current state, then applies it.
-    /// Returns the objects and the number of records newly stored.
-    fn apply(
-        &self,
-        batch: &CommitBatch,
-        headless: bool,
-    ) -> Result<(Vec<(SpaceId, usize)>, u64), StorageError> {
+    fn apply(&self, batch: &CommitBatch) -> Result<Written, StorageError> {
         batch.validate()?;
-        Self::apply_locked(&mut self.write(), batch, headless)
+        self.write().put(
+            batch.expected_head,
+            &batch.objects,
+            &batch.records,
+            Some(batch.new_head),
+        )
+    }
+
+    /// Puts objects into a store that has no head, leaving it headless.
+    fn apply_objects(
+        &self,
+        objects: &[(SpaceId, ObjectId, Vec<u8>)],
+    ) -> Result<Written, StorageError> {
+        validate_objects(objects)?;
+        self.write().put(None, objects, &[], None)
     }
 
     /// Checks the retired records and the head, then replaces them with the
     /// batch under one lock (see [`Relabel`]).
-    fn apply_relabel(
-        &self,
-        relabel: &Relabel,
-    ) -> Result<(Vec<(SpaceId, usize)>, u64), StorageError> {
+    fn apply_relabel(&self, relabel: &Relabel) -> Result<Written, StorageError> {
         relabel.validate()?;
         let mut state = self.write();
         if state.head != Some(relabel.expected_head) {
@@ -236,7 +195,8 @@ impl MemoryVersionedStore {
             objects: std::mem::take(&mut state.objects),
             records: BTreeMap::new(),
         };
-        let result = Self::apply_locked(&mut relabelled, &relabel.batch, false);
+        let batch = &relabel.batch;
+        let result = relabelled.put(None, &batch.objects, &batch.records, Some(batch.new_head));
         if result.is_err() {
             state.objects = relabelled.objects;
         } else {
@@ -244,50 +204,55 @@ impl MemoryVersionedStore {
         }
         result
     }
+}
 
-    fn apply_locked(
-        state: &mut MemoryState,
-        batch: &CommitBatch,
-        headless: bool,
-    ) -> Result<(Vec<(SpaceId, usize)>, u64), StorageError> {
-        if state.head != batch.expected_head {
-            return Err(head_mismatch(batch.expected_head, state.head));
+impl MemoryState {
+    /// Checks the entries against `expected_head` and the stored values,
+    /// then stores the new ones and sets `new_head` if there is one.
+    fn put(
+        &mut self,
+        expected_head: Option<Head>,
+        objects: &[(SpaceId, ObjectId, Vec<u8>)],
+        records: &[(Table, Vec<u8>, Vec<u8>)],
+        new_head: Option<Head>,
+    ) -> Result<Written, StorageError> {
+        if self.head != expected_head {
+            return Err(head_mismatch(expected_head, self.head));
         }
-        for (space, id, bytes) in &batch.objects {
-            if let Some(existing) = state.objects.get(space).and_then(|objects| objects.get(id))
+        for (space, id, bytes) in objects {
+            if let Some(existing) = self.objects.get(space).and_then(|objects| objects.get(id))
                 && **existing != **bytes
             {
                 return Err(object_conflict(*space, id));
             }
         }
-        for (table, key, value) in &batch.records {
-            if let Some(existing) = state.records.get(&(*table, key.clone()))
+        for (table, key, value) in records {
+            if let Some(existing) = self.records.get(&(*table, key.clone()))
                 && existing != value
             {
                 return Err(record_conflict(*table, key));
             }
         }
-        // Nothing below can fail: the batch applies completely.
-        let mut new_objects = Vec::new();
-        for (space, id, bytes) in &batch.objects {
-            let objects = state.objects.entry(*space).or_default();
-            if let std::collections::hash_map::Entry::Vacant(slot) = objects.entry(*id) {
-                new_objects.push((*space, bytes.len()));
+        // Nothing below can fail: the entries apply completely.
+        let mut written = Written::default();
+        for (space, id, bytes) in objects {
+            let stored = self.objects.entry(*space).or_default();
+            if let std::collections::hash_map::Entry::Vacant(slot) = stored.entry(*id) {
+                written.objects.push((*space, bytes.len()));
                 slot.insert(bytes.as_slice().into());
             }
         }
-        let mut new_records = 0;
-        for (table, key, value) in &batch.records {
+        for (table, key, value) in records {
             if let std::collections::btree_map::Entry::Vacant(slot) =
-                state.records.entry((*table, key.clone()))
+                self.records.entry((*table, key.clone()))
             {
-                new_records += 1;
+                written.records += 1;
                 slot.insert(value.clone());
             }
         }
-        if !headless {
-            state.head = Some(batch.new_head);
+        if new_head.is_some() {
+            self.head = new_head;
         }
-        Ok((new_objects, new_records))
+        Ok(written)
     }
 }

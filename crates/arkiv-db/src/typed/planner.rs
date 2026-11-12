@@ -86,11 +86,19 @@
 //! existence term). Every other group is enumerated with no row loaded
 //! unless a row probe needs it.
 
-use std::{cmp::Reverse, collections::BinaryHeap, ops::Bound, sync::Arc};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    ops::Bound,
+    sync::Arc,
+};
 
 use arkiv_db_trie::Probe;
 
-use super::{Evaluation, GroupStream, PostingRange, Source, TypedState, enumerate, range_tag};
+use super::{
+    Evaluation, GroupStream, PostingRange, Source, TypedState, ValueRun, enumerate, lookup, prime,
+    range_tag,
+};
 use crate::{
     layout::{Member, PostingMap, TermKey},
     meter::{Meter, OperationClass},
@@ -430,47 +438,17 @@ impl Plan<'_> {
     }
 }
 
-/// Reads one term leaf (`TermSeek` 1): its posting, if the term exists.
-fn lookup(
-    state: &TypedState,
-    loaders: &NamespaceLoaders<'_>,
-    term: &TermKey,
-    meter: &mut Meter<'_>,
-) -> Result<Option<PostingMap>, Fault> {
-    meter.charge(OperationClass::TermSeek, 1)?;
-    let mut probe = Probe::new();
-    let posting = state.terms.get(term, &loaders.terms, &mut probe);
-    meter.note_index_nodes(probe.nodes);
-    Ok(posting?.map(|posting| posting.0))
-}
-
-/// The tighter of two lower bounds of one ordered type.
-fn tighter_lower(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
-    use std::cmp::Ordering::{Greater, Less};
+/// The tighter of two bounds of one ordered type: the one whose value
+/// compares `tighter` to the other's (`Greater` for lower bounds, `Less`
+/// for upper), and the excluded one of two equal values.
+fn tighter(left: Bound<Value>, right: Bound<Value>, tighter: Ordering) -> Bound<Value> {
     match (&left, &right) {
         (Bound::Unbounded, _) => right,
         (_, Bound::Unbounded) => left,
         (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
             match a.cmp_ordered(b) {
-                Some(Greater) => left,
-                Some(Less) => right,
-                _ if matches!(left, Bound::Excluded(_)) => left,
-                _ => right,
-            }
-        }
-    }
-}
-
-/// The tighter of two upper bounds of one ordered type.
-fn tighter_upper(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
-    use std::cmp::Ordering::{Greater, Less};
-    match (&left, &right) {
-        (Bound::Unbounded, _) => right,
-        (_, Bound::Unbounded) => left,
-        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
-            match a.cmp_ordered(b) {
-                Some(Less) => left,
-                Some(Greater) => right,
+                Some(order) if order == tighter => left,
+                Some(order) if order == tighter.reverse() => right,
                 _ if matches!(left, Bound::Excluded(_)) => left,
                 _ => right,
             }
@@ -494,8 +472,8 @@ fn add_run<'q>(runs: &mut Vec<RunSpec<'q>>, order: usize, literal: &'q Literal) 
                         upper: run_upper,
                     } = &mut run.shape
                     {
-                        *run_lower = tighter_lower(run_lower.clone(), lower.clone());
-                        *run_upper = tighter_upper(run_upper.clone(), upper.clone());
+                        *run_lower = tighter(run_lower.clone(), lower.clone(), Ordering::Greater);
+                        *run_upper = tighter(run_upper.clone(), upper.clone(), Ordering::Less);
                     }
                     run.literals.push((order, literal));
                 }
@@ -532,77 +510,45 @@ fn walk_run(
     cap: u64,
     meter: &mut Meter<'_>,
 ) -> Result<Option<Walked>, Fault> {
-    meter.charge(OperationClass::TermSeek, 1)?;
-    let (start, skip_start) = match &run.shape {
-        Shape::Range { lower, .. } => match lower {
-            Bound::Unbounded => (TermKey::run_start(&run.name, run.tag, &[]), false),
-            Bound::Included(bound) => (
-                TermKey::run_start(&run.name, run.tag, &bound.term_bytes().expect("ordered")),
-                false,
-            ),
-            Bound::Excluded(bound) => (
-                TermKey::run_start(&run.name, run.tag, &bound.term_bytes().expect("ordered")),
-                true,
-            ),
-        },
-        Shape::Prefix(prefix) => (
-            TermKey::run_start(&run.name, TypeTag::Str, prefix.as_bytes()),
-            false,
-        ),
+    let name = &run.name;
+    let mut terms = match &run.shape {
+        Shape::Range { lower, upper } => {
+            ValueRun::range(state, loaders, name, run.tag, lower, upper, meter)?
+        }
+        Shape::Prefix(prefix) => ValueRun::prefix(state, loaders, name, prefix, meter)?,
     };
-    let end = match &run.shape {
-        Shape::Range { upper, .. } => match upper {
-            Bound::Unbounded => None,
-            Bound::Included(bound) => Some((bound.term_bytes().expect("ordered"), true)),
-            Bound::Excluded(bound) => Some((bound.term_bytes().expect("ordered"), false)),
-        },
-        Shape::Prefix(_) => None,
-    };
-    let mut terms_run = state.terms.range_from(&start, &loaders.terms);
     let mut walked = Walked {
         postings: Vec::new(),
         matches: 0,
         terms: 0,
     };
-    let outcome = loop {
-        let (term, posting) = match terms_run.next() {
-            None => break Ok(true),
-            Some(Err(error)) => break Err(Fault::from(error)),
-            Some(Ok(entry)) => entry,
-        };
-        if term.name != run.name || term.tag != run.tag {
-            break Ok(true);
+    let mut walk = || -> Result<bool, Fault> {
+        while let Some((_, posting)) = terms.next()? {
+            if walked.terms == cap {
+                return Ok(false);
+            }
+            meter.charge(OperationClass::TermVisit, 1)?;
+            walked.terms += 1;
+            walked.matches += posting.len();
+            walked.postings.push(posting);
+            if walked.matches.saturating_add(walked.terms) >= limit {
+                return Ok(false);
+            }
         }
-        let Some(value) = &term.value else {
-            break Ok(true);
-        };
-        if skip_start && term == start {
-            continue;
-        }
-        let inside = match (&run.shape, &end) {
-            (Shape::Prefix(prefix), _) => value.starts_with(prefix.as_bytes()),
-            (Shape::Range { .. }, None) => true,
-            (Shape::Range { .. }, Some((bound, true))) => value.as_ref() <= bound.as_slice(),
-            (Shape::Range { .. }, Some((bound, false))) => value.as_ref() < bound.as_slice(),
-        };
-        if !inside {
-            break Ok(true);
-        }
-        if walked.terms == cap {
-            break Ok(false);
-        }
-        if let Err(reason) = meter.charge(OperationClass::TermVisit, 1) {
-            break Err(reason.into());
-        }
-        walked.terms += 1;
-        walked.matches += posting.0.len();
-        walked.postings.push(posting.0);
-        if walked.matches.saturating_add(walked.terms) >= limit {
-            break Ok(false);
-        }
+        Ok(true)
     };
-    meter.note_index_nodes(terms_run.probe().nodes);
-    Ok(outcome?.then_some(walked))
+    let complete = walk();
+    meter.note_index_nodes(terms.nodes());
+    Ok(complete?.then_some(walked))
+}
+
+/// Keeps the first posting of each term not already in `seen`.
+fn dedup_terms(found: &mut Vec<Found>, seen: &mut Vec<TermKey>) {
+    found.retain(|found| {
+        let fresh = !seen.contains(&found.term);
+        seen.push(found.term.clone());
+        fresh
+    });
 }
 
 /// Plans one group (after its `QueryGroup` charge); see the module docs.
@@ -624,67 +570,39 @@ fn plan<'q>(
     let mut runs: Vec<RunSpec<'q>> = Vec::new();
     let mut probes: Vec<(usize, &'q Literal)> = Vec::new();
     for (order, literal) in group.iter().enumerate() {
+        let mut find = |term: TermKey| -> Result<Option<Found>, Fault> {
+            let posting = lookup(state, loaders, &term, meter)?;
+            Ok(posting.map(|posting| Found {
+                term,
+                posting,
+                order,
+            }))
+        };
         match (&literal.term, literal.negated) {
             (Term::Eq { name, value }, false) => {
-                let term = TermKey::value(name, value);
-                let Some(posting) = lookup(state, loaders, &term, meter)? else {
+                let Some(found) = find(TermKey::value(name, value))? else {
                     return Ok(Plan::empty());
                 };
-                positives.push(Found {
-                    term,
-                    posting,
-                    order,
-                });
+                positives.push(found);
             }
             (Term::Exists { name, tag }, false) => {
-                let term = TermKey::existence(name, *tag);
-                let Some(posting) = lookup(state, loaders, &term, meter)? else {
+                let Some(found) = find(TermKey::existence(name, *tag))? else {
                     return Ok(Plan::empty());
                 };
-                positives.push(Found {
-                    term,
-                    posting,
-                    order,
-                });
+                positives.push(found);
             }
             (Term::NotEq { name, value }, false) => {
-                let term = TermKey::existence(name, value.tag());
-                let Some(posting) = lookup(state, loaders, &term, meter)? else {
+                let Some(found) = find(TermKey::existence(name, value.tag()))? else {
                     return Ok(Plan::empty());
                 };
-                domains.push(Found {
-                    term,
-                    posting,
-                    order,
-                });
-                let term = TermKey::value(name, value);
-                if let Some(posting) = lookup(state, loaders, &term, meter)? {
-                    absent.push(Found {
-                        term,
-                        posting,
-                        order,
-                    });
-                }
+                domains.push(found);
+                absent.extend(find(TermKey::value(name, value))?);
             }
             (Term::Eq { name, value }, true) => {
-                let term = TermKey::value(name, value);
-                if let Some(posting) = lookup(state, loaders, &term, meter)? {
-                    absent.push(Found {
-                        term,
-                        posting,
-                        order,
-                    });
-                }
+                absent.extend(find(TermKey::value(name, value))?);
             }
             (Term::Exists { name, tag }, true) => {
-                let term = TermKey::existence(name, *tag);
-                if let Some(posting) = lookup(state, loaders, &term, meter)? {
-                    absent.push(Found {
-                        term,
-                        posting,
-                        order,
-                    });
-                }
+                absent.extend(find(TermKey::existence(name, *tag))?);
             }
             (Term::Range { .. } | Term::StartsWith { .. }, false) => {
                 add_run(&mut runs, order, literal);
@@ -733,16 +651,8 @@ fn plan<'q>(
     let probes = probes.into_iter().map(|(_, literal)| literal).collect();
     // Each positive term once, then the driver.
     let mut seen: Vec<TermKey> = Vec::new();
-    positives.retain(|found| {
-        let fresh = !seen.contains(&found.term);
-        seen.push(found.term.clone());
-        fresh
-    });
-    domains.retain(|found| {
-        let fresh = !seen.contains(&found.term);
-        seen.push(found.term.clone());
-        fresh
-    });
+    dedup_terms(&mut positives, &mut seen);
+    dedup_terms(&mut domains, &mut seen);
     let take_smallest = |found: &mut Vec<Found>| {
         let index = found
             .iter()
@@ -766,12 +676,7 @@ fn plan<'q>(
         .filter(|found| found.len() != live)
         .collect();
     followers.sort_by_key(|found| (found.len(), found.order));
-    let mut seen: Vec<TermKey> = Vec::new();
-    absent.retain(|found| {
-        let fresh = !seen.contains(&found.term);
-        seen.push(found.term.clone());
-        fresh
-    });
+    dedup_terms(&mut absent, &mut Vec::new());
     absent.sort_by_key(|found| (Reverse(found.len()), found.order));
     Ok(Plan {
         driver,
@@ -833,17 +738,10 @@ fn position_run<'a>(
     let mut postings = Vec::with_capacity(walked.postings.len());
     let mut heads = BinaryHeap::new();
     for posting in walked.postings {
-        let mut entries = posting.range_from(&from, &loaders.postings);
-        let first = entries.next();
-        let index = postings.len();
-        postings.push(entries);
-        match first {
-            None => {}
-            Some(Ok((id, Member))) => heads.push(Reverse((id, index))),
-            Some(Err(error)) => {
-                Source::Run { heads, postings }.note_physical(meter);
-                return Err(error.into());
-            }
+        let entries = posting.range_from(&from, &loaders.postings);
+        if let Err(error) = prime(&mut heads, &mut postings, entries) {
+            Source::Run { heads, postings }.note_physical(meter);
+            return Err(error);
         }
     }
     Ok(Source::Run { heads, postings })
@@ -910,14 +808,7 @@ pub(crate) fn open_group<'a, 'q>(
 ) -> Result<GroupStream<'a, 'q>, Fault> {
     meter.charge(OperationClass::QueryGroup, 1)?;
     let Some(from) = from else {
-        return Ok(GroupStream {
-            source: Source::Empty,
-            followers: Vec::new(),
-            absent: Vec::new(),
-            probes: Vec::new(),
-            head: None,
-            head_row: None,
-        });
+        return Ok(GroupStream::written(Source::Empty, Vec::new()));
     };
     let plan = plan(state, loaders, group, Purpose::Page, meter)?;
     stream(state, loaders, plan, from, meter)

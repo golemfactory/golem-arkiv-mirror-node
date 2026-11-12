@@ -2,7 +2,7 @@
 //! `reconciliation.rs` and the experiment example.
 
 use arkiv_db_redb::{
-    RedbConfig, RedbStore,
+    RedbStore,
     testing::{CrashDisk, CrashMode},
 };
 use arkiv_db_storage::versioned::{
@@ -10,7 +10,7 @@ use arkiv_db_storage::versioned::{
     VersionedStore, reconcile,
 };
 
-use super::{assert_applied, block, commit, crash_store};
+use super::{assert_applied, block, config, crash_store, durable_image};
 
 /// A genesis block and a candidate on it.
 pub fn chain() -> (CommitBatch, CommitBatch) {
@@ -33,18 +33,9 @@ pub fn chain() -> (CommitBatch, CommitBatch) {
 /// checks that reconciliation reads it back as committed, then cuts the
 /// power and reopens: returns the head the reopen finds, or its error.
 pub fn lost_final_sync(quick_repair: bool) -> Result<Option<Head>, StorageError> {
-    let config = RedbConfig {
-        quick_repair,
-        ..RedbConfig::with_cache_size(1 << 20)
-    };
+    let config = config(quick_repair);
     let (genesis, candidate) = chain();
-    let image = {
-        let disk = CrashDisk::new();
-        let store = crash_store(&disk, config);
-        commit(&store, genesis);
-        disk.crash(store, CrashMode::DurableOnly)
-    };
-    let disk = CrashDisk::from_image(image);
+    let disk = CrashDisk::from_image(durable_image(config, &[genesis]));
     let store = crash_store(&disk, config);
     // Two syncs per commit with quick repair, one without: fail the last.
     disk.fail_sync_losing_unsynced(u64::from(quick_repair));

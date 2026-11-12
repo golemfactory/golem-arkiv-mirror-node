@@ -4,7 +4,7 @@ use alloy_primitives::{Address, B256, Signature};
 use arkiv_db::OwnerId;
 use k256::ecdsa::{Signature as ScalarSignature, SigningKey};
 
-use super::{Error, Result};
+use super::{Error, ErrorCode, Result};
 
 /// A local signing key. Debug output deliberately contains only its address.
 pub struct Signer(SigningKey);
@@ -21,7 +21,7 @@ impl Signer {
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self> {
         SigningKey::from_slice(&bytes)
             .map(Self)
-            .map_err(|_| Error("InvalidSigningKey"))
+            .map_err(|_| Error::from(ErrorCode::InvalidSigningKey))
     }
 
     pub fn address(&self) -> OwnerId {
@@ -33,14 +33,14 @@ impl Signer {
         let (signature, recovery) = self
             .0
             .sign_prehash_recoverable(digest.as_slice())
-            .map_err(|_| Error("SigningFailed"))?;
+            .map_err(|_| ErrorCode::SigningFailed)?;
         // The wire format has only y parity; an x-reduced recovery id is not representable.
         if recovery.is_x_reduced() {
-            return Err(Error("SigningFailed"));
+            return Err(ErrorCode::SigningFailed.into());
         }
         let bytes = Signature::from_signature_and_parity(signature, recovery.is_y_odd()).as_rsy();
         if recover(digest, &bytes)? != self.address() {
-            return Err(Error("SigningFailed"));
+            return Err(ErrorCode::SigningFailed.into());
         }
         Ok(bytes)
     }
@@ -50,12 +50,12 @@ impl Signer {
 /// Alloy recovery normalizes high-S internally, so recovery alone is insufficient.
 pub fn validate_signature(bytes: &[u8; 65]) -> Result<Signature> {
     if bytes[64] > 1 {
-        return Err(Error("InvalidSignature"));
+        return Err(ErrorCode::InvalidSignature.into());
     }
-    ScalarSignature::from_slice(&bytes[..64]).map_err(|_| Error("InvalidSignature"))?;
+    ScalarSignature::from_slice(&bytes[..64]).map_err(|_| ErrorCode::InvalidSignature)?;
     let signature = Signature::from_bytes_and_parity(&bytes[..64], bytes[64] == 1);
     if signature.normalize_s().is_some() {
-        return Err(Error("InvalidSignature"));
+        return Err(ErrorCode::InvalidSignature.into());
     }
     Ok(signature)
 }
@@ -64,5 +64,5 @@ pub fn recover(digest: B256, bytes: &[u8; 65]) -> Result<OwnerId> {
     validate_signature(bytes)?
         .recover_address_from_prehash(&digest)
         .map(|address| OwnerId::new(address.into_array()))
-        .map_err(|_| Error("InvalidSignature"))
+        .map_err(|_| Error::from(ErrorCode::InvalidSignature))
 }

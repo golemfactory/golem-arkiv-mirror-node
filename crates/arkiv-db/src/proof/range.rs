@@ -2,7 +2,10 @@
 //! term-byte order. This profile has no pagination: every matching term, its
 //! entire posting set and every matching row must fit.
 
-use std::{collections::BTreeMap, ops::Bound};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound,
+};
 
 use super::*;
 use crate::TypeTag;
@@ -479,13 +482,10 @@ fn verify_range_inner(
     if let Some(i) = inspection.as_deref_mut() {
         i.points.state_header = Some(header.clone());
     }
-    let path = read_path(&mut d, 17, META_NODE_BYTES, &mut meter)?;
-    let namespace = proven(
-        header.catalog_root,
-        &request.query.namespace.to_bytes(),
-        &path,
-        crate::MapKind::Catalog,
-        None,
+    let namespace = proven_namespace(
+        &mut d,
+        &header,
+        request.query.namespace,
         &mut inspection.as_deref_mut().map(|i| &mut i.points),
         &mut meter,
     )?;
@@ -493,22 +493,6 @@ fn verify_range_inner(
         d.finish()?;
         return Ok(VerifiedRange::NamespaceAbsent);
     };
-    let namespace = NamespaceState::decode(&namespace).map_err(|_| ProofError::InvalidProof)?;
-    if namespace.descriptor.id != request.query.namespace {
-        return Err(ProofError::InvalidProof);
-    }
-    if let Some(i) = inspection.as_deref_mut() {
-        i.points.namespace = Some(crate::NamespaceRoots {
-            next_record: namespace.typed.next_record,
-            records: (namespace.records.root_hash(), namespace.records.len()),
-            keys: (namespace.typed.keys.root_hash(), namespace.typed.keys.len()),
-            rows: (namespace.typed.rows.root_hash(), namespace.typed.rows.len()),
-            terms: (
-                namespace.typed.terms.root_hash(),
-                namespace.typed.terms.len(),
-            ),
-        });
-    }
     let witness = read_path(
         &mut d,
         caps.max_nodes.min(bytes.len() / 4),
@@ -543,26 +527,17 @@ fn verify_range_inner(
             meter.allocate(count * size_of::<RecordId>() * 2)?;
             ids.reserve(count);
         }
-        let mut rebuilt = PostingMap::new();
-        let mut last = None;
-        for _ in 0..count {
-            let id: RecordId = d.get()?;
-            if last.is_some_and(|prior| prior >= id) || selected.contains_key(&id) {
+        let collect_ids = inspection.is_some();
+        let rebuilt_root = rebuilt_posting_root(&mut d, count, &mut meter, |id| {
+            if selected.insert(id, value.clone()).is_some() {
                 return Err(ProofError::InvalidProof);
             }
-            meter.work(17 * 1024)?;
-            meter.allocate(17 * 1024)?;
-            rebuilt = rebuilt
-                .insert(&id, Member, &MemoryOnly, &mut Probe::new())
-                .map_err(|_| ProofError::InvalidProof)?
-                .0;
-            selected.insert(id, value.clone());
-            if inspection.is_some() {
+            if collect_ids {
                 ids.push(id);
             }
-            last = Some(id);
-        }
-        if rebuilt.root_hash() != posting.0.root_hash() {
+            Ok(())
+        })?;
+        if rebuilt_root != posting.0.root_hash() {
             return Err(ProofError::InvalidProof);
         }
         if let Some(i) = inspection.as_deref_mut() {
@@ -580,7 +555,7 @@ fn verify_range_inner(
                 value: value.clone(),
                 posting: InspectedPostingSet {
                     authenticated_root: Some(posting.0.root_hash()),
-                    reconstructed_root: rebuilt.root_hash(),
+                    reconstructed_root: rebuilt_root,
                     selected_ids: ids.clone(),
                     ids,
                 },
@@ -593,44 +568,16 @@ fn verify_range_inner(
     }
     meter.allocate(count * size_of::<Row>())?;
     let mut rows = Vec::with_capacity(count);
-    for (expected, value) in selected {
-        let id: RecordId = d.get()?;
-        if id != expected {
-            return Err(ProofError::InvalidProof);
-        }
-        let path = read_path(&mut d, 17, row_node_bound(limits)?, &mut meter)?;
-        let leaf = proven(
-            namespace.typed.rows.root_hash(),
-            &id.ordinal().to_be_bytes(),
-            &path,
-            crate::MapKind::Rows,
-            Some(id),
+    for (id, value) in &selected {
+        rows.push(verified_row(
+            &mut d,
+            &namespace,
+            *id,
+            (&request.query.attribute, value),
+            limits,
             &mut inspection.as_deref_mut().map(|i| &mut i.points),
             &mut meter,
-        )?
-        .ok_or(ProofError::InvalidProof)?;
-        let eq = EqQuery {
-            namespace: request.query.namespace,
-            attribute: request.query.attribute.clone(),
-            value,
-        };
-        let row = decode_row(&leaf, id, &eq, limits, &mut meter)?;
-        let key = row.key.as_ref().ok_or(ProofError::InvalidProof)?;
-        let path = read_path(&mut d, 67, META_NODE_BYTES, &mut meter)?;
-        let binding = proven(
-            namespace.typed.keys.root_hash(),
-            &TrieKey::encode(key),
-            &path,
-            crate::MapKind::Keys,
-            Some(id),
-            &mut inspection.as_deref_mut().map(|i| &mut i.points),
-            &mut meter,
-        )?
-        .ok_or(ProofError::InvalidProof)?;
-        if crate::decode_exact::<RecordId>(&binding)? != id {
-            return Err(ProofError::InvalidProof);
-        }
-        rows.push(row);
+        )?);
     }
     d.finish()?;
     Ok(VerifiedRange::Complete(VerifiedRangeRows {
@@ -663,19 +610,8 @@ pub(crate) fn generate_range(
             .checked_mul(4)
             .ok_or(ProofError::ProofLimitExceeded)?,
     )?;
-    let mut serving = Serving {
-        caps: caps.common(),
-        meter: Meter::new(&header.pricing, budget, None),
-        bytes: 0,
-        nodes: 0,
-    };
-    serving.append(4 + 1 + SnapshotRef::MIN_ENCODED_LEN + 32 + StateHeader::MIN_ENCODED_LEN)?;
-    serving.meter.charge(Op::DirectoryLookup, 1)?;
-    let loader = nodes.catalog();
-    let namespace = catalog
-        .get(&request.query.namespace, &loader, &mut Probe::new())
-        .map_err(|_| ProofError::StorageUnavailable)?;
-    let path = serving.path(catalog, &request.query.namespace, &loader, META_NODE_BYTES)?;
+    let mut serving = Serving::new(caps.common(), &header, budget)?;
+    let (namespace, path) = serving.namespace(catalog, nodes, request.query.namespace)?;
     let mut e = Encoder::new();
     e.u32(RANGE_PROOF_VERSION);
     e.u8(3);
@@ -731,7 +667,7 @@ pub(crate) fn generate_range(
             &limits,
             &mut guard,
         )?;
-        let mut selected = BTreeMap::new();
+        let mut selected = BTreeSet::new();
         for (value, expected_posting) in terms {
             serving
                 .meter
@@ -769,7 +705,7 @@ pub(crate) fn generate_range(
                     .next()
                     .ok_or(ProofError::InvalidProof)?
                     .map_err(|_| ProofError::StorageUnavailable)?;
-                if selected.insert(id, ()).is_some() {
+                if !selected.insert(id) {
                     return Err(ProofError::InvalidProof);
                 }
                 e.put(&id);
@@ -777,7 +713,7 @@ pub(crate) fn generate_range(
         }
         serving.append(4)?;
         e.length(selected.len());
-        for id in selected.keys() {
+        for id in &selected {
             let row_bound = row_node_bound(limits)?;
             // Admit the maximum temporary row allocation/read before loading
             // it, then account actual bytes after decoding. Reserving it as
@@ -802,66 +738,19 @@ pub(crate) fn generate_range(
                 (Op::ResultRow, 1),
                 (Op::ReadByte, row_bound as u64),
             ])?;
-            serving.meter.charge(Op::RecordProbe, 1)?;
-            let row: StoredRecord = namespace
-                .typed
-                .rows
-                .get(id, &loaders.rows, &mut Probe::new())
-                .map_err(|_| ProofError::StorageUnavailable)?
-                .ok_or(ProofError::InvalidProof)?;
-            if row.cells.len() > limits.max_cells.min(64)
-                || row
-                    .cells
-                    .iter()
-                    .any(|(_, cell)| cell.value.encoded_len() > limits.max_payload_len().max(32))
-            {
-                return Err(ProofError::ProofLimitExceeded);
-            }
-            let read_bytes = row.key.as_bytes().len()
-                + row
-                    .cells
-                    .iter()
-                    .map(|(name, cell)| name.len() + cell.value.encoded_len())
-                    .sum::<usize>();
+            let (row, read_bytes) = serving.probe_row(&namespace, &loaders, id, limits)?;
             guard.allocate(
                 read_bytes
                     .checked_mul(4)
                     .ok_or(ProofError::ProofLimitExceeded)?,
             )?;
             guard.work(read_bytes)?;
-            serving
-                .meter
-                .charge_group(&[(Op::ResultRow, 1), (Op::ReadByte, read_bytes as u64)])?;
-            serving.append(8)?;
-            e.put(id);
-            let bound = read_bytes
-                .checked_add(128 + row.cells.len() * 10)
-                .ok_or(ProofError::ProofLimitExceeded)?
-                .max(META_NODE_BYTES);
-            let path = serving.path(&namespace.typed.rows, id, &loaders.rows, bound)?;
-            write_path(&mut e, &path);
-            let path = serving.path(
-                &namespace.typed.keys,
-                &row.key,
-                &loaders.keys,
-                META_NODE_BYTES,
-            )?;
-            write_path(&mut e, &path);
+            serving.emit_row(&mut e, &namespace, &loaders, id, &row, read_bytes)?;
         }
     }
-    let bytes = e.into_bytes();
-    if bytes.len() != serving.bytes {
-        return Err(ProofError::InvalidProof);
-    }
+    let proof = serving.finish(e.into_bytes(), posting_count)?;
     // Generation must never return an artifact that the same local policy
     // cannot verify, including cumulative verification work/allocation limits.
-    verify_range(request, &bytes, caps, limits)?;
-    let (mut receipt, _) = serving.meter.finish(ReceiptKind::Read, Outcome::Applied);
-    receipt.model_version = PROOF_READ_MODEL;
-    Ok(GeneratedProof {
-        bytes,
-        receipt,
-        posting_count,
-        supplied_nodes: serving.nodes,
-    })
+    verify_range(request, &proof.bytes, caps, limits)?;
+    Ok(proof)
 }

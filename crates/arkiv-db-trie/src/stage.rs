@@ -220,6 +220,39 @@ pub(crate) fn try_stage_link<V: TrieValue, S: TryObjectSink + ?Sized>(
     Ok(())
 }
 
+/// An [`ObjectSink`] as the sink of the fallible walk.
+struct Infallible<'a>(&'a mut dyn ObjectSink);
+
+impl TryObjectSink for Infallible<'_> {
+    type Error = StageError;
+
+    fn record(&mut self, id: ObjectId, encoding: &[u8]) -> Result<(), StageError> {
+        self.0.record(id, encoding);
+        Ok(())
+    }
+}
+
+/// The staging walk without a visit allowance; see
+/// [`MerkleMap::stage`](crate::MerkleMap::stage).
+pub(crate) fn stage_link<V: TrieValue>(
+    root: &Link<V>,
+    sink: &mut dyn ObjectSink,
+    nested: &mut dyn FnMut(&V, &mut dyn ObjectSink),
+) {
+    try_stage_link(
+        root,
+        true,
+        &mut Infallible(sink),
+        &mut StageBudget::new(u64::MAX),
+        &mut |value, sink: &mut Infallible<'_>, _| {
+            nested(value, sink.0);
+            Ok(())
+        },
+        &mut Vec::new(),
+    )
+    .expect("an unbounded allowance and an infallible sink cannot fail");
+}
+
 /// The destination of a staging walk, one per object space.
 pub trait ObjectSink {
     /// Records the new object `id` with its node encoding.

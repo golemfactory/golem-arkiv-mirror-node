@@ -3,7 +3,9 @@
 //!
 //! - [`FaultyStore`] wraps any store and injects read failures, write
 //!   outcomes, disk-full conditions, lost acknowledgements and failed
-//!   recoveries, optionally latching by `RedbStore`'s rule.
+//!   recoveries, optionally latching by `RedbStore`'s rule; it can also
+//!   replace what single reads answer, observe (or delay) object reads and
+//!   count staging and recovery calls.
 //! - [`contract`] is the behavioural suite every store implementation runs,
 //!   generated as one `#[test]` per case by
 //!   [`versioned_store_contract!`](crate::versioned_store_contract).
@@ -13,4 +15,4 @@
 pub mod contract;
 mod faulty;
 
-pub use faulty::{CommitFault, DiskFull, FaultCounters, FaultyStore, ReadScope};
+pub use faulty::{CommitFault, DiskFull, FaultCounters, FaultyStore, ObjectReadHook, ReadScope};

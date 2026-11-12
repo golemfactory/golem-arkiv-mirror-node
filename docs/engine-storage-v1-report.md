@@ -118,10 +118,10 @@ RSS includes redb allocator/table metadata, Rust allocator retention and active 
 Run:
 
 ```sh
-cargo test --offline -p arkiv-db-redb --test engine_crashes --test engine_process -- --nocapture
+cargo test --offline -p arkiv-db-redb --test it -- engine_crashes:: engine_process:: --nocapture
 ```
 
-[engine_crashes.rs](../crates/arkiv-db-redb/tests/engine_crashes.rs) commits real catalog, namespace, raw-record, key, row, term, posting and host objects. Each reopened image must have exactly the memory reference's complete parent or candidate state. Checks include old snapshots, all typed rows, index consistency, every new raw value, host values, byte-identical equality proofs, and independent proof verification. No object batch is mocked.
+[engine_crashes.rs](../crates/arkiv-db-redb/tests/it/engine_crashes.rs) commits real catalog, namespace, raw-record, key, row, term, posting and host objects. Each reopened image must have exactly the memory reference's complete parent or candidate state. Checks include old snapshots, all typed rows, index consistency, every new raw value, host values, byte-identical equality proofs, and independent proof verification. No object batch is mocked.
 
 | Scenario | Evidence |
 | --- | --- |
@@ -171,7 +171,7 @@ RSS grows in this run and is not presented as constant. The redb page cache, all
 
 ## Shared differential history
 
-[engine_history.rs](../crates/arkiv-db-redb/tests/engine_history.rs) invokes the
+[engine_history.rs](../crates/arkiv-db-redb/tests/it/engine_history.rs) invokes the
 [same seeded runner](../crates/arkiv-db/tests/support/durable_history.rs)
 as the durable-memory tests. It compares ordinary `Engine` with actual
 redb-backed `DurableEngine` for seeds 1 and 27, each with 65 publications.

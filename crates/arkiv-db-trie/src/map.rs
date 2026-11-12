@@ -13,7 +13,7 @@ use crate::{
     range::Range,
     stage::{
         NestedStageVisitor, ObjectSink, StageBudget, StageError, TryObjectSink, preflight_link,
-        try_stage_link,
+        stage_link, try_stage_link,
     },
 };
 
@@ -506,8 +506,9 @@ impl<K: TrieKey, V: TrieValue> MerkleMap<K, V> {
     /// deduplicates what it keeps). Hashes whatever is not hashed yet;
     /// reads nothing.
     pub fn stage(&self, sink: &mut dyn ObjectSink) {
-        let mut visit = |value: &V, sink: &mut dyn ObjectSink| value.stage_nested(sink);
-        stage_link(&self.root, true, sink, &mut visit, &mut Vec::new());
+        stage_link(&self.root, sink, &mut |value, sink| {
+            value.stage_nested(sink)
+        });
     }
 
     /// Stages like [`stage`](Self::stage), but hands every leaf value of a
@@ -516,8 +517,7 @@ impl<K: TrieKey, V: TrieValue> MerkleMap<K, V> {
     /// For values whose nested maps belong to another object space: the
     /// caller stages them into that space's sink.
     pub fn stage_with(&self, sink: &mut dyn ObjectSink, nested: &mut dyn FnMut(&V)) {
-        let mut visit = |value: &V, _: &mut dyn ObjectSink| nested(value);
-        stage_link(&self.root, true, sink, &mut visit, &mut Vec::new());
+        stage_link(&self.root, sink, &mut |value, _| nested(value));
     }
 
     /// Checks new nodes' full encoded-size bounds without encoding, hashing or
@@ -843,42 +843,6 @@ fn prefixed<V: Clone>(prefix: &[u8], link: &Link<V>, node: &NodeBox<V>) -> Arc<N
             path: prefix.into(),
             child: link.clone(),
         }),
-    }
-}
-
-/// The staging walk over one map; see [`MerkleMap::stage`].
-fn stage_link<V: TrieValue>(
-    link: &Link<V>,
-    root: bool,
-    sink: &mut dyn ObjectSink,
-    visit: &mut dyn FnMut(&V, &mut dyn ObjectSink),
-    buffer: &mut Vec<u8>,
-) {
-    let Link::Mem(node) = link else {
-        return;
-    };
-    if node.from_store() {
-        return;
-    }
-    let reference = node.reference();
-    if root || reference.is_hash() {
-        buffer.clear();
-        node.encode(buffer);
-        let id = reference
-            .as_hash()
-            .unwrap_or_else(|| keccak256(buffer.as_slice()));
-        // Keep walking: an equal id in the sink does not prove the nested
-        // maps below were staged (see the `stage` module).
-        sink.record(id, buffer);
-    }
-    match &node.node {
-        Node::Leaf { value, .. } => visit(value, sink),
-        Node::Extension { child, .. } => stage_link(child, false, sink, visit, buffer),
-        Node::Branch { children } => {
-            for child in children.iter() {
-                stage_link(child, false, sink, visit, buffer);
-            }
-        }
     }
 }
 

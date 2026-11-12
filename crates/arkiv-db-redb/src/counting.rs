@@ -71,7 +71,7 @@ impl IoProbe {
     /// and stays visible to the next open, exactly as after `SIGKILL`; nothing
     /// redb would write on a clean close reaches the file. This is not a
     /// power-loss model (unsynced data survives); see
-    /// [`CrashDisk`](crate::testing::CrashDisk) for that.
+    /// `testing::CrashDisk` for that.
     pub fn kill(&self) {
         self.killed.store(true, Ordering::SeqCst);
     }

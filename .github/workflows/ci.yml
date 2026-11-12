@@ -18,7 +18,7 @@ env:
   # excluded from formatting and Clippy (see README.md "Development").
   PACKAGES: >-
     -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb
-    -p arkiv-db-trie -p arkiv-node -p reth-trie
+    -p arkiv-db-trie -p arkiv-node
 
 jobs:
   check:

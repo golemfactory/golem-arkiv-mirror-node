@@ -8,7 +8,8 @@
 //! expiries at the next height, at capacity, permanent, dead on arrival,
 //! too far and shortened — and produces them on a `MemoryChain`.
 //!
-//! The oracle never calls the engine's pricing or execution. It has:
+//! The oracle never calls the engine's pricing or execution; of the node it
+//! calls only `params::check_reservation`, to classify admin inputs. It has:
 //!
 //! - its own weight table per schedule (`Weights`, named fields; the
 //!   engine's `PriceSchedule` is built from it, never read back), and the
@@ -19,9 +20,11 @@
 //!   derived from the live records;
 //! - its own due schedule (`(height, namespace) → count`, `height →
 //!   total`), updated by the rules of `docs/block-format.md`, and its own expiry
-//!   resolution, extend-only and capacity checks;
-//! - the reservation and sweep-bound arithmetic for admin inputs, and the
-//!   pricing in force.
+//!   resolution, extend-only and capacity checks. These follow the executor's
+//!   rules step for step, so they predict outcomes rather than check the
+//!   rules; the rules themselves are pinned by the literal expectations in
+//!   `replay.rs`;
+//! - the pricing in force.
 //!
 //! Before each block is produced the oracle predicts its complete
 //! `BlockOutcomes` (every admin outcome, expiry deletion with its receipt,
@@ -50,7 +53,9 @@ use arkiv_db::{
 use arkiv_node::{
     AdminInput, AdminOutcome, AdminRejection, Block, BlockInputs, BlockOutcomes, ChainParams,
     ChainSpec, Expiry, ExpiryDeletion, ExpiryFault, Genesis, HostFault, MemoryChain, OpOutcome,
-    TxEnvelope, TxOp, TxOutcome, TxStatus, replay,
+    TxEnvelope, TxOp, TxOutcome, TxStatus,
+    params::{ReservationFault, check_reservation},
+    replay,
 };
 use support::{
     ADMIN, ALICE, BOB, CAROL, CHAIN, due_key, genesis_with, host_entries, ns, request, total_key,
@@ -319,55 +324,12 @@ impl Weights {
         self.index_remove + 2 * self.root_update
     }
 
-    /// The reservation: `block_budget ≥ user_budget +
-    /// expiry_per_block × (DirectoryLookup + PointRead + RecordDelete +
-    /// c·CellRemove + 3·RootUpdate + 2a·(IndexRemove + 2·RootUpdate))` with
-    /// `c = a = max_cells`, and a representable sweep read bound
-    /// (`max(DirectoryLookup + TermSeek + TermVisit + 8·ReadByte,
-    /// DirectoryLookup + QueryGroup + TermSeek + (max_page + 1)·PostingEntry
-    /// + max_page·(ResultRow + 32·ReadByte))`), all with checked arithmetic.
+    /// The node's reservation check for these weights, as an admin outcome.
     fn reservation(&self) -> Result<(), AdminRejection> {
-        let c = LIMITS.max_cells as u64;
-        let page = LIMITS.max_page as u64;
-        let overflow = AdminRejection::ReservationOverflow;
-        let terms = self
-            .directory_lookup
-            .checked_add(self.term_seek)
-            .and_then(|sum| sum.checked_add(self.term_visit))
-            .and_then(|sum| sum.checked_add(self.read_byte.checked_mul(8)?));
-        let query = self
-            .read_byte
-            .checked_mul(32)
-            .and_then(|bytes| bytes.checked_add(self.result_row))
-            .and_then(|row| row.checked_mul(page))
-            .and_then(|rows| {
-                rows.checked_add(self.posting_entry.checked_mul(page + 1)?)?
-                    .checked_add(self.directory_lookup)?
-                    .checked_add(self.query_group)?
-                    .checked_add(self.term_seek)
-            });
-        terms.zip(query).ok_or(overflow)?;
-        let removal = self
-            .root_update
-            .checked_mul(2)
-            .and_then(|roots| roots.checked_add(self.index_remove))
-            .and_then(|each| each.checked_mul(2 * c));
-        let delete = self
-            .cell_remove
-            .checked_mul(c)
-            .and_then(|cells| cells.checked_add(self.directory_lookup))
-            .and_then(|sum| sum.checked_add(self.point_read))
-            .and_then(|sum| sum.checked_add(self.record_delete))
-            .and_then(|sum| sum.checked_add(self.root_update.checked_mul(3)?))
-            .and_then(|sum| sum.checked_add(removal?));
-        let required = delete
-            .and_then(|each| each.checked_mul(u64::from(PARAMS.expiry_per_block)))
-            .and_then(|reserved| reserved.checked_add(PARAMS.user_budget))
-            .ok_or(overflow)?;
-        if PARAMS.block_budget < required {
-            return Err(AdminRejection::ReservationViolated);
-        }
-        Ok(())
+        check_reservation(&PARAMS, &LIMITS, &self.schedule()).map_err(|fault| match fault {
+            ReservationFault::Violated { .. } => AdminRejection::ReservationViolated,
+            ReservationFault::Overflow => AdminRejection::ReservationOverflow,
+        })
     }
 }
 
@@ -1424,9 +1386,6 @@ impl Coverage {
             if exact.contains(&index) && tx.status == TxStatus::Committed {
                 self.note("exact budget committed");
             }
-            if tx.spent == envelope.tx_budget && tx.status == TxStatus::Committed {
-                self.note("budget spent exactly");
-            }
             if let [
                 TxOp::PatchRecord {
                     set,
@@ -2026,36 +1985,25 @@ fn generated_blocks_match_the_oracle() {
     assert!(!kinds.contains_key("admission rejected"));
 }
 
-/// The oracle's reservation arithmetic and `params::check_reservation`
-/// classify every schedule alike: those the generator treats as valid fit,
-/// the others do not.
+/// `params::check_reservation` accepts the schedules the generator treats as
+/// valid and refuses the others.
 #[test]
-fn oracle_reservation_matches_the_parameters() {
-    use arkiv_node::params::{ReservationFault, check_reservation};
-    let check = |weights: Weights, expected: Result<(), AdminRejection>| {
-        assert_eq!(weights.reservation(), expected, "{weights:?}");
-        let node =
-            check_reservation(&PARAMS, &LIMITS, &weights.schedule()).map_err(|fault| match fault {
-                ReservationFault::Violated { .. } => AdminRejection::ReservationViolated,
-                ReservationFault::Overflow => AdminRejection::ReservationOverflow,
-            });
-        assert_eq!(node, expected, "{weights:?}");
-    };
+fn the_reservation_classifies_the_generated_schedules() {
     for weights in [
         FIXTURE,
         Weights::uniform(2, 2),
         Weights::reads_x100(3),
         Weights::reshaped(4),
     ] {
-        check(weights, Ok(()));
+        assert_eq!(weights.reservation(), Ok(()), "{weights:?}");
     }
-    check(
-        Weights::too_dear(5),
-        Err(AdminRejection::ReservationViolated),
+    assert_eq!(
+        Weights::too_dear(5).reservation(),
+        Err(AdminRejection::ReservationViolated)
     );
-    check(
-        Weights::overflowing(6),
-        Err(AdminRejection::ReservationOverflow),
+    assert_eq!(
+        Weights::overflowing(6).reservation(),
+        Err(AdminRejection::ReservationOverflow)
     );
     // The dearest valid deletion is exactly the one the block budget
     // reserves for: one more unit breaks it.
@@ -2063,7 +2011,10 @@ fn oracle_reservation_matches_the_parameters() {
         record_delete: 21,
         ..Weights::reads_x100(7)
     };
-    check(tight, Err(AdminRejection::ReservationViolated));
+    assert_eq!(
+        tight.reservation(),
+        Err(AdminRejection::ReservationViolated)
+    );
 }
 
 #[path = "support/block_roots.rs"]

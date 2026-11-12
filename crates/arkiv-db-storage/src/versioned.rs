@@ -1,8 +1,7 @@
 //! The versioned storage contract for durable engine state and block history.
 //!
-//! [`KvStore`](crate::KvStore) describes one mutable map whose failed writes
-//! leave it unchanged. Durable block production needs a different contract,
-//! which this module defines:
+//! Durable block production needs more than a mutable map whose failed
+//! writes leave it unchanged. This module defines the contract:
 //!
 //! - **Immutable objects**, content-addressed by [`ObjectId`] and grouped in
 //!   [`SpaceId`]s (the namespace catalog, host state, and one space per
@@ -365,12 +364,7 @@ impl CommitBatch {
                 ),
             ));
         }
-        let mut objects: BTreeMap<(SpaceId, &ObjectId), &[u8]> = BTreeMap::new();
-        for (space, id, bytes) in &self.objects {
-            if *objects.entry((*space, id)).or_insert(bytes) != bytes.as_slice() {
-                return Err(object_conflict(*space, id));
-            }
-        }
+        validate_objects(&self.objects)?;
         let mut records: BTreeMap<(Table, &[u8]), &[u8]> = BTreeMap::new();
         for (table, key, value) in &self.records {
             table.check_record(key, value)?;
@@ -380,6 +374,18 @@ impl CommitBatch {
         }
         Ok(())
     }
+}
+
+/// Checks that no two of `objects` put different bytes under one id of one
+/// space: the object half of [`CommitBatch::validate`].
+pub fn validate_objects(objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> Result<(), StorageError> {
+    let mut seen: BTreeMap<(SpaceId, &ObjectId), &[u8]> = BTreeMap::new();
+    for (space, id, bytes) in objects {
+        if *seen.entry((*space, id)).or_insert(bytes) != bytes.as_slice() {
+            return Err(object_conflict(*space, id));
+        }
+    }
+    Ok(())
 }
 
 /// A one-time relabelling of a private store ([`VersionedStore::relabel`]).
@@ -438,6 +444,21 @@ pub fn relabel_mismatch(detail: impl fmt::Display) -> StorageError {
         StorageErrorKind::Incompatible,
         format!("store does not hold exactly the relabelled publication: {detail}"),
     )
+}
+
+/// Copies a stored value a backend still borrows, after checking its length
+/// against a bounded read's limit ([`ObjectReader::read_object_bounded`]).
+pub fn copy_bounded(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, StorageError> {
+    if bytes.len() > max_bytes {
+        return Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!(
+                "stored value has {} bytes, exceeds read limit {max_bytes}",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// The `Conflict` error for different bytes under one object id.
@@ -595,7 +616,9 @@ pub trait ObjectReader: Send + Sync {
     /// `Ok(None)` is an authoritative answer about committed state; a store
     /// that cannot answer returns an error instead. Objects in other spaces
     /// are never consulted.
-    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError>;
+    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
+        self.read_object_bounded(space, id, usize::MAX)
+    }
 
     /// Reads an object only if its stored length is at most `max_bytes`.
     ///
@@ -678,7 +701,9 @@ pub trait VersionedStore: ObjectReader {
     fn head(&self) -> Result<Option<Head>, StorageError>;
 
     /// Returns the committed record under `key` in `table`, or `None`.
-    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError>;
+    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.read_record_bounded(table, key, usize::MAX)
+    }
 
     /// Reads a record only if its stored value is at most `max_bytes`.
     ///
@@ -984,6 +1009,14 @@ impl StoreStats {
     }
 }
 
+/// What an applied write newly stored: each object's space and byte length,
+/// and the number of records.
+#[derive(Debug, Default)]
+pub struct Written {
+    pub objects: Vec<(SpaceId, usize)>,
+    pub records: u64,
+}
+
 /// Shared bookkeeping for [`StoreStats`], for store implementations.
 ///
 /// Every method takes a short internal lock; counters are updated only after
@@ -1030,28 +1063,29 @@ impl StatsRecorder {
         self.lock().head_reads += 1;
     }
 
-    /// Records a commit outcome, and for `Committed` the objects (space and
-    /// byte length) and the number of records it newly stored.
-    pub fn commit(
-        &self,
-        outcome: &CommitOutcome,
-        new_objects: &[(SpaceId, usize)],
-        new_records: u64,
-    ) {
+    /// Counts a write and returns its outcome: `Ok` is `Committed` with
+    /// what the write newly stored, `Err` is any other outcome.
+    pub fn write(&self, result: Result<Written, CommitOutcome>) -> CommitOutcome {
         let mut stats = self.lock();
-        match outcome {
-            CommitOutcome::Committed => {
-                stats.committed += 1;
-                stats.records_written += new_records;
-                for (space, len) in new_objects {
-                    let entry = stats.spaces.entry(*space).or_default();
-                    entry.objects_written += 1;
-                    entry.bytes_written += *len as u64;
+        let written = match result {
+            Ok(written) => written,
+            Err(outcome) => {
+                match outcome {
+                    CommitOutcome::Committed => stats.committed += 1,
+                    CommitOutcome::NotCommitted(_) => stats.not_committed += 1,
+                    CommitOutcome::Indeterminate(_) => stats.indeterminate += 1,
                 }
+                return outcome;
             }
-            CommitOutcome::NotCommitted(_) => stats.not_committed += 1,
-            CommitOutcome::Indeterminate(_) => stats.indeterminate += 1,
+        };
+        stats.committed += 1;
+        stats.records_written += written.records;
+        for (space, len) in written.objects {
+            let entry = stats.spaces.entry(space).or_default();
+            entry.objects_written += 1;
+            entry.bytes_written += len as u64;
         }
+        CommitOutcome::Committed
     }
 
     /// Records a successful recovery.

@@ -81,7 +81,7 @@ impl<K: TrieKey, V: TrieValue> MerkleMap<K, V> {
                         )
                         .into());
                     }
-                    Some(n.chunks_exact(2).map(|c| c[0] * 16 + c[1]).collect())
+                    Some(crate::nibbles::pack(&n))
                 } else {
                     None
                 };

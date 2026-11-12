@@ -1,15 +1,16 @@
 //! Signed admission and independent execution; bodies live outside the engine.
 
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     crypto::Signer,
     history::{BodyRef, History},
-    pool::Pool,
-    protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedInputs, SignedTx},
+    pool::{DropReason, Pool},
+    protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedInputs, SignedTx, ValidTx},
 };
+use crate::health::Health;
 use crate::{
     BlockOutcomes, Header, Inclusion, RequestIdentity, Scope,
-    exec::{DeferReason, build_block_hooked, execute_block_hooked},
+    exec::{BlockEnv, DeferReason, Mode, execute_block_hooked},
     simulator::{
         metadata,
         wire::{FEED_CAP, FeedBlock, Identity, hex, json_bytes, proof_limits},
@@ -80,7 +81,7 @@ impl HeaderRecord {
                 feed,
             })
         };
-        let record = parse().map_err(|_| Error("StorageCorrupt"))?;
+        let record = parse().map_err(|_| ErrorCode::StorageCorrupt)?;
         record.certificate.authenticate(genesis)?;
         record.feed.validate_digest()?;
         if record.feed.header.validate(genesis.genesis.chain_id)? != record.certificate.header
@@ -98,7 +99,7 @@ impl HeaderRecord {
             || record.feed.feed_version != 1
             || record.bytes()? != bytes
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(record)
     }
@@ -137,17 +138,13 @@ pub struct Host {
     pub identity: Identity,
     pub head: Header,
     pub paused: bool,
-    pub health: &'static str,
+    pub health: Health,
     pub pool: Pool,
-    pub prefill_stream: Option<Vec<u8>>,
-    /// Immutable, verified canonical stream file (`genesis_streaming`); never
-    /// loaded wholesale.
-    pub prefill_file: Option<std::path::PathBuf>,
+    prefill_stream: Option<Vec<u8>>,
+    prefill_file: Option<std::path::PathBuf>,
     history: History,
     signer: Option<Signer>,
     pending: Option<Pending>,
-    /// The last state-retention refusal, for API error details.
-    pub refusal: crate::retention::Refusal,
     /// Blocks this host has executed for production or import (simulations
     /// excluded): production executes each candidate once.
     pub block_executions: u64,
@@ -171,264 +168,65 @@ const CERTIFICATE_CACHE: usize = 256;
 /// `BLOCK_CACHE × INPUT_CAP` (about 24 MiB) of inputs.
 const BLOCK_CACHE: usize = 32;
 
-impl Host {
-    pub fn create(
-        store: Arc<dyn VersionedStore>,
-        history: History,
-        genesis: SignedGenesis,
-        source: [u8; 16],
-        certificate: SignedHeader,
-        signer: Option<Signer>,
-        options: Options,
-    ) -> Result<Self> {
-        Self::create_with_prefill(
-            store,
-            history,
-            genesis,
-            source,
-            certificate,
-            signer,
-            options,
-            None,
-        )
-    }
+/// The chain a node creates its height-zero database for.
+pub struct Launch {
+    pub history: History,
+    pub genesis: SignedGenesis,
+    pub source: [u8; 16],
+    /// The proposer's certificate of the genesis header.
+    pub certificate: SignedHeader,
+    pub signer: Option<Signer>,
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_with_prefill(
-        store: Arc<dyn VersionedStore>,
-        mut history: History,
-        genesis: SignedGenesis,
-        source: [u8; 16],
-        certificate: SignedHeader,
-        signer: Option<Signer>,
-        options: Options,
-        prefill_stream: Option<Vec<u8>>,
-    ) -> Result<Self> {
-        genesis.validate()?;
-        let candidate = match (&genesis.prefill, &prefill_stream) {
-            (Some(_), Some(bytes)) => Some(
-                crate::genesis_bundle::verified_candidate(&genesis, bytes)
-                    .map_err(|_| Error("InvalidPrefillBundle"))?,
-            ),
-            (None, None) => None,
-            _ => return Err(Error("PrefillBundleRequired")),
-        };
-        certificate.authenticate(&genesis)?;
-        if certificate.header != genesis.header()
-            || signer
+/// The entity prefill a genesis launches with.
+pub enum Prefill<'a> {
+    None,
+    /// The small canonical stream, verified here and kept to serve followers.
+    Stream(Vec<u8>),
+    /// A verified, privately staged store, installed without materializing
+    /// its trie, and the canonical stream file it was built from.
+    Staged {
+        engine: &'a DurableEngine,
+        stream_file: std::path::PathBuf,
+    },
+}
+
+/// What the engine publishes at height zero beside the state.
+struct GenesisRecord {
+    durable: SimulatorIdentity,
+    identity: Identity,
+    packet: SimulatorPacket,
+}
+
+impl Launch {
+    /// Authenticates the certificate and the signer against the genesis,
+    /// persists the empty genesis body and builds the height-zero record.
+    fn genesis_record(&mut self) -> Result<GenesisRecord> {
+        let genesis = &self.genesis;
+        self.certificate.authenticate(genesis)?;
+        if self.certificate.header != genesis.header()
+            || self
+                .signer
                 .as_ref()
                 .is_some_and(|s| s.address().as_bytes() != &genesis.proposer)
         {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let durable = SimulatorIdentity {
-            source_id: source,
-            run_id: genesis.run_id,
-            node_genesis_hash: genesis.hash(),
-            metadata: encode(&genesis),
-        };
-        let identity = identity(&durable, &genesis);
-        let block = SignedBlock {
-            header: certificate.clone(),
-            inputs: SignedInputs { txs: vec![] },
-            outcomes: BlockOutcomes::default(),
-        };
-        let body = history.persist(&encode(&block))?;
-        let record = HeaderRecord {
-            certificate,
-            body,
-            feed: FeedBlock::new(&identity, &genesis.header(), Default::default())?,
-        };
-        let packet = SimulatorPacket {
-            height: 0,
-            state_root: genesis.header().state_root,
-            bytes: record.bytes()?,
-            inclusions: vec![],
-        };
-        let initialization = if let Some(candidate) = candidate {
-            DurableEngine::initialize_simulator_prefilled(
-                store,
-                engine_genesis(&durable, &genesis),
-                options,
-                durable,
-                packet,
-                candidate,
-            )?
-        } else {
-            DurableEngine::initialize_simulator(
-                store,
-                engine_genesis(&durable, &genesis),
-                options,
-                durable,
-                packet,
-            )?
-        };
-        let engine = match initialization {
-            Initialization::Committed(engine) => engine,
-            Initialization::NotCommitted { .. } => return Err(Error("StorageUnavailable")),
-            Initialization::Indeterminate { .. } => return Err(Error("CommitUncertain")),
-        };
-        let pool = Pool::new(&genesis)?;
-        Ok(Self {
-            head: genesis.header(),
-            engine,
-            genesis,
-            identity,
-            paused: true,
-            health: "paused",
-            pool,
-            prefill_stream,
-            prefill_file: None,
-            history,
-            signer,
-            pending: None,
-            refusal: Default::default(),
-            block_executions: 0,
-            certificates: Default::default(),
-            blocks: Default::default(),
-        })
-    }
-
-    /// Install a verified, privately staged genesis without materializing its trie.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_from_staged(
-        store: Arc<dyn VersionedStore>,
-        mut history: History,
-        genesis: SignedGenesis,
-        source: [u8; 16],
-        certificate: SignedHeader,
-        signer: Option<Signer>,
-        options: Options,
-        staged: &DurableEngine,
-        prefill_file: std::path::PathBuf,
-    ) -> Result<Self> {
-        genesis.validate()?;
-        if genesis.prefill.as_ref().is_none_or(|p| !p.is_streaming())
-            || staged.head_snapshot().state_header()
-                != genesis
-                    .prefill
-                    .as_ref()
-                    .ok_or(Error("InvalidPrefillBundle"))?
-                    .state
-        {
-            return Err(Error("InvalidPrefillBundle"));
-        }
-        certificate.authenticate(&genesis)?;
-        if certificate.header != genesis.header()
-            || signer
-                .as_ref()
-                .is_some_and(|s| s.address().as_bytes() != &genesis.proposer)
-        {
-            return Err(Error("IdentityMismatch"));
-        }
-        let durable = SimulatorIdentity {
-            source_id: source,
-            run_id: genesis.run_id,
-            node_genesis_hash: genesis.hash(),
-            metadata: encode(&genesis),
-        };
-        let identity = identity(&durable, &genesis);
-        let block = SignedBlock {
-            header: certificate.clone(),
-            inputs: SignedInputs { txs: vec![] },
-            outcomes: BlockOutcomes::default(),
-        };
-        let body = history.persist(&encode(&block))?;
-        let record = HeaderRecord {
-            certificate,
-            body,
-            feed: FeedBlock::new(&identity, &genesis.header(), Default::default())?,
-        };
-        let packet = SimulatorPacket {
-            height: 0,
-            state_root: genesis.header().state_root,
-            bytes: record.bytes()?,
-            inclusions: vec![],
-        };
-        let initialization = staged.initialize_simulator_from_staged(
-            store,
-            engine_genesis(&durable, &genesis),
-            options,
-            durable,
-            packet,
-        )?;
-        let engine = match initialization {
-            Initialization::Committed(engine) => engine,
-            Initialization::NotCommitted { .. } => return Err(Error("StorageUnavailable")),
-            Initialization::Indeterminate { .. } => return Err(Error("CommitUncertain")),
-        };
-        Ok(Self {
-            head: genesis.header(),
-            pool: Pool::new(&genesis)?,
-            engine,
-            genesis,
-            identity,
-            history,
-            signer,
-            paused: true,
-            health: "paused",
-            prefill_stream: None,
-            prefill_file: Some(prefill_file),
-            pending: None,
-            refusal: Default::default(),
-            block_executions: 0,
-            certificates: Default::default(),
-            blocks: Default::default(),
-        })
-    }
-
-    /// Relabel a verified, privately staged genesis store in place as this
-    /// node's height-zero database instead of copying it (see
-    /// [`DurableEngine::adopt_staged_simulator`]). The staged engine is
-    /// consumed. On success its store holds the same height-zero record that
-    /// [`Self::create_from_staged`] would publish; the caller checks it with
-    /// [`Self::check_adopted`], moves its file into place and opens it with
-    /// [`Self::open`]. `threads` workers share the verification reads.
-    #[allow(clippy::too_many_arguments)]
-    pub fn adopt_staged(
-        history: &mut History,
-        genesis: &SignedGenesis,
-        source: [u8; 16],
-        certificate: SignedHeader,
-        signer: Option<&Signer>,
-        options: Options,
-        staged: DurableEngine,
-        threads: usize,
-    ) -> Result<()> {
-        genesis.validate()?;
-        // The staged header binds the store to the signed launch; the caller
-        // selects this path only for a streaming prefill.
-        if staged.head_snapshot().state_header()
-            != genesis
-                .prefill
-                .as_ref()
-                .ok_or(Error("InvalidPrefillBundle"))?
-                .state
-        {
-            return Err(Error("InvalidPrefillBundle"));
-        }
-        certificate.authenticate(genesis)?;
-        if certificate.header != genesis.header()
-            || signer.is_some_and(|s| s.address().as_bytes() != &genesis.proposer)
-        {
-            return Err(Error("IdentityMismatch"));
-        }
-        let durable = SimulatorIdentity {
-            source_id: source,
+            source_id: self.source,
             run_id: genesis.run_id,
             node_genesis_hash: genesis.hash(),
             metadata: encode(genesis),
         };
         let identity = identity(&durable, genesis);
         let block = SignedBlock {
-            header: certificate.clone(),
+            header: self.certificate.clone(),
             inputs: SignedInputs { txs: vec![] },
             outcomes: BlockOutcomes::default(),
         };
-        let body = history.persist(&encode(&block))?;
         let record = HeaderRecord {
-            certificate,
-            body,
+            certificate: self.certificate.clone(),
+            body: self.history.persist(&encode(&block))?,
             feed: FeedBlock::new(&identity, &genesis.header(), Default::default())?,
         };
         let packet = SimulatorPacket {
@@ -437,8 +235,169 @@ impl Host {
             bytes: record.bytes()?,
             inclusions: vec![],
         };
+        Ok(GenesisRecord {
+            durable,
+            identity,
+            packet,
+        })
+    }
+}
+
+impl Host {
+    /// Creates the height-zero database of `launch` in `store`.
+    pub fn create(
+        store: Arc<dyn VersionedStore>,
+        options: Options,
+        mut launch: Launch,
+        prefill: Prefill<'_>,
+    ) -> Result<Self> {
+        let genesis = &launch.genesis;
+        genesis.validate()?;
+        let candidate = match (&genesis.prefill, &prefill) {
+            (Some(_), Prefill::Stream(bytes)) => Some(
+                crate::genesis_bundle::verified_candidate(genesis, bytes)
+                    .map_err(|_| ErrorCode::InvalidPrefillBundle)?,
+            ),
+            (None, Prefill::None) => None,
+            (Some(p), Prefill::Staged { engine, .. })
+                if p.is_streaming() && engine.head_snapshot().state_header() == p.state =>
+            {
+                None
+            }
+            (_, Prefill::Staged { .. }) => return Err(ErrorCode::InvalidPrefillBundle.into()),
+            _ => return Err(ErrorCode::PrefillBundleRequired.into()),
+        };
+        let GenesisRecord {
+            durable,
+            identity,
+            packet,
+        } = launch.genesis_record()?;
+        let engine_genesis = engine_genesis(&durable, &launch.genesis);
+        let initialization = match (&prefill, candidate) {
+            (Prefill::Staged { engine, .. }, _) => engine.initialize_simulator_from_staged(
+                store,
+                engine_genesis,
+                options,
+                durable,
+                packet,
+            )?,
+            (_, Some(candidate)) => DurableEngine::initialize_simulator_prefilled(
+                store,
+                engine_genesis,
+                options,
+                durable,
+                packet,
+                candidate,
+            )?,
+            (_, None) => DurableEngine::initialize_simulator(
+                store,
+                engine_genesis,
+                options,
+                durable,
+                packet,
+            )?,
+        };
+        let engine = match initialization {
+            Initialization::Committed(engine) => engine,
+            Initialization::NotCommitted { .. } => return Err(ErrorCode::StorageUnavailable.into()),
+            Initialization::Indeterminate { .. } => return Err(ErrorCode::CommitUncertain.into()),
+        };
+        let head = launch.genesis.header();
+        let host = Self::assemble(
+            engine,
+            launch.genesis,
+            identity,
+            head,
+            launch.history,
+            launch.signer,
+        )?;
+        Ok(match prefill {
+            Prefill::None => host,
+            Prefill::Stream(bytes) => host.serving_prefill_stream(bytes),
+            Prefill::Staged { stream_file, .. } => host.serving_prefill_file(stream_file),
+        })
+    }
+
+    /// A paused host at `head` that serves no prefill.
+    fn assemble(
+        engine: DurableEngine,
+        genesis: SignedGenesis,
+        identity: Identity,
+        head: Header,
+        history: History,
+        signer: Option<Signer>,
+    ) -> Result<Self> {
+        Ok(Self {
+            head,
+            pool: Pool::new(&genesis)?,
+            engine,
+            genesis,
+            identity,
+            paused: true,
+            health: Health::Paused,
+            prefill_stream: None,
+            prefill_file: None,
+            history,
+            signer,
+            pending: None,
+            block_executions: 0,
+            certificates: Default::default(),
+            blocks: Default::default(),
+        })
+    }
+
+    /// Serves the small canonical prefill stream to followers.
+    pub fn serving_prefill_stream(mut self, stream: Vec<u8>) -> Self {
+        self.prefill_stream = Some(stream);
+        self
+    }
+
+    /// Serves the verified canonical prefill stream file to followers in
+    /// chunks; it is never loaded wholesale.
+    pub fn serving_prefill_file(mut self, file: std::path::PathBuf) -> Self {
+        self.prefill_file = Some(file);
+        self
+    }
+
+    pub fn prefill_stream(&self) -> Option<&[u8]> {
+        self.prefill_stream.as_deref()
+    }
+
+    pub fn prefill_file(&self) -> Option<&std::path::Path> {
+        self.prefill_file.as_deref()
+    }
+
+    /// Relabel a verified, privately staged genesis store in place as this
+    /// node's height-zero database instead of copying it (see
+    /// [`DurableEngine::adopt_staged_simulator`]). The staged engine is
+    /// consumed. On success its store holds the same height-zero record that
+    /// [`Self::create`] would publish from it; the caller checks it with
+    /// [`Self::check_adopted`], moves its file into place and opens it with
+    /// [`Self::open`]. `threads` workers share the verification reads.
+    pub fn adopt_staged(
+        launch: &mut Launch,
+        options: Options,
+        staged: DurableEngine,
+        threads: usize,
+    ) -> Result<()> {
+        launch.genesis.validate()?;
+        // The staged header binds the store to the signed launch; the caller
+        // selects this path only for a streaming prefill.
+        if staged.head_snapshot().state_header()
+            != launch
+                .genesis
+                .prefill
+                .as_ref()
+                .ok_or(ErrorCode::InvalidPrefillBundle)?
+                .state
+        {
+            return Err(ErrorCode::InvalidPrefillBundle.into());
+        }
+        let GenesisRecord {
+            durable, packet, ..
+        } = launch.genesis_record()?;
         let outcome = staged.adopt_staged_simulator(
-            engine_genesis(&durable, genesis),
+            engine_genesis(&durable, &launch.genesis),
             options,
             durable,
             packet,
@@ -458,8 +417,8 @@ impl Host {
         }
         match outcome? {
             Publication::Committed(_) => Ok(()),
-            Publication::NotCommitted(_) => Err(Error("StorageUnavailable")),
-            Publication::Indeterminate(_) => Err(Error("CommitUncertain")),
+            Publication::NotCommitted(_) => Err(ErrorCode::StorageUnavailable.into()),
+            Publication::Indeterminate(_) => Err(ErrorCode::CommitUncertain.into()),
         }
     }
 
@@ -481,7 +440,7 @@ impl Host {
             metadata: encode(genesis),
         };
         if DurableEngine::read_simulator_identity(store.as_ref())? != expected {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let identity = identity(&expected, genesis);
         let engine = DurableEngine::open_simulator(
@@ -496,7 +455,7 @@ impl Host {
             || record.certificate.header != genesis.header()
             || stored.info.state_root != genesis.header().state_root
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(())
     }
@@ -510,7 +469,7 @@ impl Host {
     ) -> Result<Self> {
         let durable = DurableEngine::read_simulator_identity(store.as_ref())?;
         let genesis: SignedGenesis =
-            decode_exact(&durable.metadata).map_err(|_| Error("IdentityMismatch"))?;
+            decode_exact(&durable.metadata).map_err(|_| ErrorCode::IdentityMismatch)?;
         genesis.validate()?;
         if encode(&genesis) != encode(expected)
             || durable.node_genesis_hash != genesis.hash()
@@ -519,7 +478,7 @@ impl Host {
                 .as_ref()
                 .is_some_and(|s| s.address().as_bytes() != &genesis.proposer)
         {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let identity = identity(&durable, &genesis);
         let engine = DurableEngine::open_simulator(
@@ -533,47 +492,31 @@ impl Host {
         if record.certificate.header.height != stored.info.snapshot.sequence()
             || record.certificate.header.state_root != stored.info.state_root
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
-        let mut host = Self {
-            head: record.certificate.header,
-            pool: Pool::new(&genesis)?,
-            prefill_stream: None,
-            prefill_file: None,
-            engine,
-            genesis,
-            identity,
-            paused: true,
-            health: "paused",
-            history,
-            signer,
-            pending: None,
-            refusal: Default::default(),
-            block_executions: 0,
-            certificates: Default::default(),
-            blocks: Default::default(),
-        };
+        let head = record.certificate.header;
+        let mut host = Self::assemble(engine, genesis, identity, head, history, signer)?;
         host.block(host.head.height)?;
         if host.signer.is_none() {
-            host.health = "following";
+            host.health = Health::Following;
         }
         Ok(host)
     }
 
     /// Opens the state after `height`, refusing heights below the state
-    /// floor up front with `HistoryPruned` (details in `refusal`).
+    /// floor up front with `HistoryPruned`.
     pub fn state(&self, height: u64) -> Result<arkiv_db::Snapshot> {
-        crate::retention::state(&self.engine, &self.refusal, height)
+        crate::retention::state(&self.engine, height)
     }
 
     /// Refuses state at `height` below the floor without opening it.
     pub fn require_state(&self, height: u64) -> Result<()> {
-        crate::retention::require_state(&self.engine, &self.refusal, height)
+        crate::retention::require_state(&self.engine, height)
     }
 
     /// Refuses receipts/logs of block `height` (they need state `height - 1`).
     pub fn require_receipts(&self, height: u64) -> Result<()> {
-        crate::retention::require_receipts(&self.engine, &self.refusal, height)
+        crate::retention::require_receipts(&self.engine, height)
     }
 
     pub fn is_producer(&self) -> bool {
@@ -582,14 +525,14 @@ impl Host {
 
     pub fn record(&self, height: u64) -> Result<HeaderRecord> {
         if height > self.head.height {
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         let stored = self.engine.simulator_block(height)?;
         let record = HeaderRecord::from_bytes(&stored.bytes, &self.genesis, &self.identity)?;
         if record.certificate.header.height != height
             || record.certificate.header.state_root != stored.info.state_root
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(record)
     }
@@ -637,14 +580,16 @@ impl Host {
     fn read_block(&self, height: u64) -> Result<SignedBlock> {
         let record = self.record(height)?;
         let bytes = self.history.read(&record.body)?;
-        let block: SignedBlock = decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
+        let block: SignedBlock = decode_exact(&bytes).map_err(|e| {
+            ErrorCode::StorageCorrupt.caused_by(format_args!("block {height}: {e}"))
+        })?;
         block.authenticate(&self.genesis)?;
         if encode(&block) != bytes
             || block.header != record.certificate
             || block.header.header.outcomes_digest != block.outcomes.digest()
             || (height != 0 && block.header.header.inputs_digest != block.inputs.digest())
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(block)
     }
@@ -678,8 +623,10 @@ impl Host {
         let burnt = crate::accounts::burned(snapshot.try_host_get(&crate::accounts::BURN_KEY)?)?;
         let initial = config
             .initial_supply()
-            .map_err(|_| Error("StorageCorrupt"))?;
-        let supply = initial.checked_sub(burnt).ok_or(Error("StorageCorrupt"))?;
+            .map_err(|_| ErrorCode::StorageCorrupt)?;
+        let supply = initial
+            .checked_sub(burnt)
+            .ok_or(ErrorCode::StorageCorrupt)?;
         let mut value = json!({
             "actor": hex(actor.as_bytes()),
             "height": height.to_string(),
@@ -706,7 +653,7 @@ impl Host {
     fn inclusion(&self, identity: &RequestIdentity) -> Result<Option<(Inclusion, u64)>> {
         self.engine
             .simulator_inclusion(&encode(identity))?
-            .map(|b| decode_exact(&b).map_err(|_| Error("StorageCorrupt")))
+            .map(|b| decode_exact(&b).map_err(|_| Error::from(ErrorCode::StorageCorrupt)))
             .transpose()
     }
 
@@ -723,11 +670,11 @@ impl Host {
                 .feed
                 .transactions
                 .get(inclusion.index as usize)
-                .ok_or(Error("StorageCorrupt"))?;
+                .ok_or(ErrorCode::StorageCorrupt)?;
             let gas_used = tx
                 .spent_units
                 .parse::<u64>()
-                .map_err(|_| Error("StorageCorrupt"))?;
+                .map_err(|_| ErrorCode::StorageCorrupt)?;
             // Rent is burned beside the fee, not as gas.
             let rent = &tx.rent_wei;
             return Ok(json!({
@@ -759,7 +706,7 @@ impl Host {
         if let Some((hash, reason)) = self.pool.dropped.request(actor, request_id) {
             return Ok(json!({
                 "status": "dropped",
-                "reason": reason,
+                "reason": reason.as_str(),
                 "actor": hex(actor.as_bytes()),
                 "requestId": hex(&request_id),
                 "transactionHash": hash,
@@ -769,26 +716,40 @@ impl Host {
         Ok(json!({"status":"unknown","actor":hex(actor.as_bytes()),"requestId":hex(&request_id)}))
     }
 
+    /// Validates `tx` and admits it; callers that validated outside the node
+    /// lock use [`Self::admit`].
     pub fn submit(&mut self, tx: SignedTx) -> Result<Json> {
+        self.accepting()?;
+        let tx = ValidTx::new(tx, &self.genesis)?;
+        self.admit(tx)
+    }
+
+    fn accepting(&self) -> Result<()> {
         if !self.is_producer() {
-            return Err(Error("ProducerOnly"));
+            return Err(ErrorCode::ProducerOnly.into());
         }
         if self.pending.is_some()
-            || self.health == "storage-fenced"
-            || self.health == "chain-conflict"
+            || self.health == Health::StorageFenced
+            || self.health == Health::ChainConflict
         {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
-        tx.validate(&self.genesis)?;
+        Ok(())
+    }
+
+    /// Admits a transaction validated against this node's genesis to the pool.
+    pub fn admit(&mut self, tx: ValidTx) -> Result<Json> {
+        self.accepting()?;
+        let tx = tx.into_inner();
         let identity = tx.identity();
         if let Some((found, _)) = self.inclusion(&identity)? {
             if found.digest != tx.hash() {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
             return self.request_status(identity.actor, identity.request_id);
         }
         if self.head.height == 0 && self.genesis.prefill.is_none() {
-            return Err(Error("ChainInitializing"));
+            return Err(ErrorCode::ChainInitializing.into());
         }
         let next = self.committed_nonce(identity.actor)?;
         let balance = self
@@ -798,7 +759,7 @@ impl Host {
         if self.pool.admissible(&tx, next, balance)?.is_none() {
             let quote = self.quote(&tx.tx)?;
             if quote.new_units > self.genesis.genesis.params.max_new_storage_units_per_block {
-                return Err(Error("ExceedsStorageCap"));
+                return Err(ErrorCode::ExceedsStorageCap.into());
             }
             self.pool.insert_funded(tx, next, balance, quote.rent_wei)?;
         }
@@ -829,9 +790,10 @@ impl Host {
                 .head
                 .height
                 .checked_add(1)
-                .ok_or(Error("CapacityReached"))?,
+                .ok_or(ErrorCode::CapacityReached)?,
             chain_id: spec.chain_id(),
-            rent: crate::gas::RentClock::of(spec.params()).ok_or(Error("InvalidSignedGenesis"))?,
+            rent: crate::gas::RentClock::of(spec.params())
+                .ok_or(ErrorCode::InvalidSignedGenesis)?,
             expiry_per_block: spec.params().expiry_per_block,
             expiry_spill_window: crate::exec::EXPIRY_SPILL_WINDOW,
             payer: None,
@@ -852,19 +814,19 @@ impl Host {
         )
         .map_err(|e| match e {
             crate::ExecError::Storage(e) => Error::from(e),
-            _ => Error("StorageCorrupt"),
+            _ => Error::from(ErrorCode::StorageCorrupt),
         })
     }
 
     pub fn produce(&mut self) -> Result<SignedHeader> {
         if !self.is_producer() {
-            return Err(Error("ProducerOnly"));
+            return Err(ErrorCode::ProducerOnly.into());
         }
         if self.pending.is_some() {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         if self.head.height == 0 && self.genesis.prefill.is_none() {
-            let signer = self.signer.as_ref().ok_or(Error("ProducerOnly"))?;
+            let signer = self.signer.as_ref().ok_or(ErrorCode::ProducerOnly)?;
             let tx = crate::TxEnvelope {
                 chain_id: self.genesis.genesis.chain_id,
                 actor: signer.address(),
@@ -872,7 +834,7 @@ impl Host {
                 tx_budget: self.genesis.genesis.params.user_budget,
                 ops: vec![crate::TxOp::CreateNamespace {
                     name: arkiv_db::NamespaceName::new("entities")
-                        .map_err(|_| Error("InvalidRequest"))?,
+                        .map_err(|_| ErrorCode::InvalidRequest)?,
                 }],
             };
             let signed = SignedTx::sign(&self.genesis, 0, tx, signer)?;
@@ -888,27 +850,27 @@ impl Host {
 
     pub fn import(&mut self, block: SignedBlock) -> Result<SignedHeader> {
         if self.is_producer() {
-            return Err(Error("FollowerOnly"));
+            return Err(ErrorCode::FollowerOnly.into());
         }
         self.observe_certificate(&block.header)?;
-        if self.health == "chain-conflict" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict {
+            return Err(ErrorCode::ChainConflict.into());
         }
         if self.pending.is_some() {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         let height = block.header.header.height;
         if height <= self.head.height {
             let prior = self.certificate(height)?;
             if prior.header != block.header.header {
-                self.health = "chain-conflict";
+                self.health = Health::ChainConflict;
                 let evidence = encode(&(prior, block.header));
                 self.history.freeze_conflict(&evidence)?;
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
             let known = self.shared_block(height)?;
             if known.inputs != block.inputs || known.outcomes != block.outcomes {
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
             return self.certificate(self.head.height);
         }
@@ -917,9 +879,9 @@ impl Host {
                 .head
                 .height
                 .checked_add(1)
-                .ok_or(Error("CapacityReached"))?
+                .ok_or(ErrorCode::CapacityReached)?
         {
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         block.authenticate(&self.genesis)?;
         self.execute_publish(block.inputs.clone(), Some(&block))
@@ -929,13 +891,13 @@ impl Host {
     /// equivocation even when no new block body is advertised.
     pub fn observe_certificate(&mut self, certificate: &SignedHeader) -> Result<()> {
         certificate.authenticate(&self.genesis)?;
-        if self.health == "chain-conflict" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict {
+            return Err(ErrorCode::ChainConflict.into());
         }
         let previous = match self.history.remember_header(certificate) {
             Ok(previous) => previous,
             Err(error) => {
-                self.health = "storage-fenced";
+                self.health = Health::StorageFenced;
                 return Err(error);
             }
         };
@@ -953,14 +915,14 @@ impl Host {
     pub fn observe_pair(&mut self, first: &SignedHeader, second: &SignedHeader) -> Result<()> {
         first.authenticate(&self.genesis)?;
         second.authenticate(&self.genesis)?;
-        if self.health == "chain-conflict" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict {
+            return Err(ErrorCode::ChainConflict.into());
         }
         if first.header.height == second.header.height && first.header != second.header {
-            self.health = "chain-conflict";
+            self.health = Health::ChainConflict;
             self.history
                 .freeze_conflict(&encode(&(first.clone(), second.clone())))?;
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         Ok(())
     }
@@ -975,26 +937,26 @@ impl Host {
         inputs: SignedInputs,
         expected: Option<&SignedBlock>,
     ) -> Result<SignedHeader> {
-        if self.health == "storage-fenced" || self.health == "chain-conflict" {
-            return Err(Error("CommitUncertain"));
+        if self.health == Health::StorageFenced || self.health == Health::ChainConflict {
+            return Err(ErrorCode::CommitUncertain.into());
         }
         let height = self
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         inputs.validate(&self.genesis, height)?;
         let mut next = BTreeMap::new();
         for tx in &inputs.txs {
             if self.inclusion(&tx.identity())?.is_some() {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
             let nonce = match next.get(&tx.tx.actor) {
                 Some(n) => *n,
                 None => self.committed_nonce(tx.tx.actor)?,
             };
             if tx.nonce != nonce || nonce == u64::MAX {
-                return Err(Error("InvalidNonce"));
+                return Err(ErrorCode::InvalidNonce.into());
             }
             next.insert(tx.tx.actor, nonce + 1);
         }
@@ -1026,34 +988,31 @@ impl Host {
         };
         let timestamp = self.genesis.timestamp(height)?;
         self.block_executions += 1;
-        let executed = if expected.is_some() {
-            execute_block_hooked(
-                &spec,
-                branch,
-                &self.head,
-                height,
-                timestamp,
-                &native,
-                Some(accounts),
-                after_tx,
-                observer,
-            )
+        // A block received is executed as given; a block produced leaves
+        // out the candidates it cannot include.
+        let mode = if expected.is_some() {
+            Mode::Strict
         } else {
-            build_block_hooked(
-                &spec,
-                branch,
-                &self.head,
-                height,
-                timestamp,
-                &native,
-                Some(accounts),
-                after_tx,
-                observer,
-            )
+            Mode::Build
         };
+        let env = BlockEnv {
+            spec: &spec,
+            parent: &self.head,
+            height,
+            timestamp_ms: timestamp,
+        };
+        let executed = execute_block_hooked(
+            env,
+            branch,
+            &native,
+            Some(accounts),
+            mode,
+            after_tx,
+            observer,
+        );
         let mut executed = executed.map_err(|e| match e {
             crate::ExecError::Storage(e) => Error::from(e),
-            _ => Error("InvalidBlock"),
+            _ => Error::from(ErrorCode::InvalidBlock),
         })?;
         // The block holds the included candidates only, in order.
         let inputs = if executed.deferred.is_empty() {
@@ -1071,7 +1030,7 @@ impl Host {
                 {
                     // No block can hold it.
                     self.pool
-                        .evict_from(tx.tx.actor, tx.nonce, "ExceedsStorageCap");
+                        .evict_from(tx.tx.actor, tx.nonce, DropReason::ExceedsStorageCap);
                 }
             }
             kept
@@ -1084,18 +1043,18 @@ impl Host {
                 Some(crate::TxStatus::Committed)
             )
         {
-            return Err(Error("BootstrapFailed"));
+            return Err(ErrorCode::BootstrapFailed.into());
         }
         let certificate = match expected {
             Some(block) => block.header.clone(),
             None => SignedHeader::sign(
                 &self.genesis,
                 executed.header,
-                self.signer.as_ref().ok_or(Error("ProducerOnly"))?,
+                self.signer.as_ref().ok_or(ErrorCode::ProducerOnly)?,
             )?,
         };
         if certificate.header != executed.header {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let block = SignedBlock {
             header: certificate.clone(),
@@ -1103,13 +1062,13 @@ impl Host {
             outcomes: executed.outcomes,
         };
         if expected.is_some_and(|e| e.outcomes != block.outcomes) {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let body_bytes = encode(&block);
         if body_bytes.len() > self.genesis.limits.max_body_bytes as usize {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
-        let mut metadata = captured.ok_or(Error("StorageCorrupt"))?;
+        let mut metadata = captured.ok_or(ErrorCode::StorageCorrupt)?;
         for (tx, signed) in metadata.transactions.iter_mut().zip(&block.inputs.txs) {
             tx.digest = hex(signed.hash().as_slice());
         }
@@ -1122,7 +1081,7 @@ impl Host {
         };
         let bytes = record.bytes()?;
         if bytes.len() > 8 * 1024 * 1024 - 116 || body_bytes.len() * 2 + 4096 > 8 * 1024 * 1024 {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         let inclusions = block
             .inputs
@@ -1162,10 +1121,10 @@ impl Host {
     }
 
     fn finish_pending(&mut self, retry: bool) -> Result<SignedHeader> {
-        if self.health == "chain-conflict" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict {
+            return Err(ErrorCode::ChainConflict.into());
         }
-        let pending = self.pending.as_mut().ok_or(Error("InvalidRequest"))?;
+        let pending = self.pending.as_mut().ok_or(ErrorCode::InvalidRequest)?;
         if !pending.history_saved {
             let result = if retry {
                 self.history.retry_exact(&pending.bytes)
@@ -1175,11 +1134,11 @@ impl Host {
             match result {
                 Ok(reference) if reference == pending.record.body => pending.history_saved = true,
                 Ok(_) => {
-                    self.health = "storage-fenced";
-                    return Err(Error("StorageCorrupt"));
+                    self.health = Health::StorageFenced;
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 Err(e) => {
-                    self.health = "storage-fenced";
+                    self.health = Health::StorageFenced;
                     return Err(e);
                 }
             }
@@ -1187,18 +1146,18 @@ impl Host {
         if pending.engine_attempted {
             match self.engine.recover_pending()? {
                 Recovery::RetryPrepared => {}
-                _ => return Err(Error("CommitUncertain")),
+                _ => return Err(ErrorCode::CommitUncertain.into()),
             }
         }
         pending.engine_attempted = true;
         match self.engine.commit()? {
             Publication::Committed(info) => {
-                let pending = self.pending.take().ok_or(Error("StorageCorrupt"))?;
+                let pending = self.pending.take().ok_or(ErrorCode::StorageCorrupt)?;
                 if info.snapshot.sequence() != pending.record.certificate.header.height
                     || info.state_root != pending.record.certificate.header.state_root
                 {
-                    self.health = "storage-fenced";
-                    return Err(Error("StorageCorrupt"));
+                    self.health = Health::StorageFenced;
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 self.pool.remove_committed(&pending.block.inputs);
                 self.head = pending.record.certificate.header;
@@ -1217,19 +1176,23 @@ impl Host {
                     })?;
                 }
                 self.health = if self.is_producer() {
-                    if self.paused { "paused" } else { "running" }
+                    if self.paused {
+                        Health::Paused
+                    } else {
+                        Health::Running
+                    }
                 } else {
-                    "following"
+                    Health::Following
                 };
                 Ok(pending.record.certificate)
             }
             Publication::NotCommitted(_) => {
-                self.health = "storage-fenced";
-                Err(Error("StorageUnavailable"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::StorageUnavailable.into())
             }
             Publication::Indeterminate(_) => {
-                self.health = "storage-fenced";
-                Err(Error("CommitUncertain"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::CommitUncertain.into())
             }
         }
     }
@@ -1240,14 +1203,14 @@ impl Host {
 
     pub fn proof(&self, request: &arkiv_db::proof::EqRequest) -> Result<Vec<u8>> {
         eq_proof_bytes(
-            &self.proof_state(&request.snapshot, "CursorMismatch")?,
+            &self.proof_state(&request.snapshot, ErrorCode::CursorMismatch)?,
             request,
         )
     }
 
     pub fn range_proof(&self, request: &arkiv_db::proof::RangeRequest) -> Result<Vec<u8>> {
         range_proof_bytes(
-            &self.proof_state(&request.snapshot, "InvalidRequest")?,
+            &self.proof_state(&request.snapshot, ErrorCode::InvalidRequest)?,
             request,
         )
     }
@@ -1259,14 +1222,14 @@ impl Host {
     pub fn proof_state(
         &self,
         snapshot: &arkiv_db::proof::SnapshotRef,
-        mismatch: &'static str,
+        mismatch: ErrorCode,
     ) -> Result<arkiv_db::Snapshot> {
         let header = self.certificate(snapshot.height)?.header;
         if snapshot.genesis_hash != self.genesis.hash()
             || snapshot.block_hash != header.hash()
             || snapshot.state_root != header.state_root
         {
-            return Err(Error(mismatch));
+            return Err(mismatch.into());
         }
         self.state(header.height)
     }

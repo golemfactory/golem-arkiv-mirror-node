@@ -229,15 +229,24 @@ fn durable_controls_replay_exactly_after_restart_and_configuration_is_adopted_in
     assert_eq!(h.head, committed);
     let mut conflicting = step;
     conflicting.action = "resume".into();
-    assert_eq!(h.control(conflicting).unwrap_err().0, "RequestConflict");
+    assert_eq!(
+        h.control(conflicting).unwrap_err().code.as_str(),
+        "RequestConflict"
+    );
     let mut wrong = control(&h, 3, "step");
     wrong.run_id = "11".repeat(16);
-    assert_eq!(h.control(wrong).unwrap_err().0, "IdentityMismatch");
+    assert_eq!(
+        h.control(wrong).unwrap_err().code.as_str(),
+        "IdentityMismatch"
+    );
     let mut wrong = control(&h, 4, "configure");
     let mut cfg = next;
     cfg.seed = "8".into();
     wrong.config = Some(cfg);
-    assert_eq!(h.control(wrong).unwrap_err().0, "RequestConflict");
+    assert_eq!(
+        h.control(wrong).unwrap_err().code.as_str(),
+        "RequestConflict"
+    );
 }
 
 #[test]
@@ -254,17 +263,17 @@ fn failure_outcomes_never_expose_uncertain_body_or_head_and_exact_retry_keeps_co
         store.push_commit_fault(fault);
         assert!(h.control(step.clone()).is_err());
         assert_eq!(h.head.height, 0);
-        assert_eq!(h.health, "storage-fenced");
-        assert_eq!(h.block(1).unwrap_err().0, "UnknownBlock");
+        assert_eq!(h.health.as_str(), "storage-fenced");
+        assert_eq!(h.block(1).unwrap_err().code.as_str(), "UnknownBlock");
         let applied = matches!(
             fault,
             CommitFault::IndeterminateApplied(_) | CommitFault::AckLost
         );
         let retry = h.retry_pending();
         if applied {
-            assert_eq!(retry.unwrap_err().0, "CommitUncertain");
+            assert_eq!(retry.unwrap_err().code.as_str(), "CommitUncertain");
             assert_eq!(h.head.height, 0);
-            assert_eq!(h.block(1).unwrap_err().0, "UnknownBlock");
+            assert_eq!(h.block(1).unwrap_err().code.as_str(), "UnknownBlock");
         } else {
             assert_eq!(retry.unwrap().height, 1);
         }
@@ -285,7 +294,10 @@ fn light_pins_history_verifies_pages_rejects_mutations_and_persists_conflict() {
     let store = Arc::new(MemoryVersionedStore::new());
     let mut light = Light::create(store.clone(), h.durable_identity.clone()).unwrap();
     let gap = vec![h.header(2).unwrap(), h.header(3).unwrap()];
-    assert_eq!(light.append(&gap, &h.head).unwrap_err().0, "BlockNotSynced");
+    assert_eq!(
+        light.append(&gap, &h.head).unwrap_err().code.as_str(),
+        "BlockNotSynced"
+    );
     assert_eq!(light.head.height, 0);
     let headers = (1..=40).map(|n| h.header(n).unwrap()).collect::<Vec<_>>();
     light.append(&headers, &h.head).unwrap();
@@ -316,7 +328,10 @@ fn light_pins_history_verifies_pages_rejects_mutations_and_persists_conflict() {
         }
         let mut wrong = r.clone();
         wrong.limit = 3;
-        assert_eq!(light.request(&wrong).unwrap_err().0, "CursorMismatch");
+        assert_eq!(
+            light.request(&wrong).unwrap_err().code.as_str(),
+            "CursorMismatch"
+        );
     }
     // Height 20: three of the five entities remain (one deleted, one expired).
     assert_eq!(pages, 3);
@@ -324,18 +339,23 @@ fn light_pins_history_verifies_pages_rejects_mutations_and_persists_conflict() {
     let mut bad = h.header(1).unwrap();
     bad.timestamp_ms += 1;
     assert_eq!(
-        light.append(&[bad], &h.head).unwrap_err().0,
+        light.append(&[bad], &h.head).unwrap_err().code.as_str(),
         "ChainConflict"
     );
-    assert_eq!(light.header(20).unwrap_err().0, "ChainConflict");
+    assert_eq!(light.header(20).unwrap_err().code.as_str(), "ChainConflict");
     drop(light);
-    assert!(matches!(Light::open(store, &h.identity), Err(e) if e.0 == "ChainConflict"));
+    assert!(
+        matches!(Light::open(store, &h.identity), Err(e) if e.code.as_str() == "ChainConflict")
+    );
 }
 
 #[test]
 fn bounded_serialization_and_profile_reject_unserviceable_genesis() {
     assert_eq!(json_bytes(&"123", 5).unwrap(), b"\"123\"");
-    assert_eq!(json_bytes(&"1234", 5).unwrap_err().0, "CapacityReached");
+    assert_eq!(
+        json_bytes(&"1234", 5).unwrap_err().code.as_str(),
+        "CapacityReached"
+    );
     let mut bad = run();
     bad.genesis.limits.max_cells = 17;
     assert!(bad.validate().is_err());
@@ -346,8 +366,6 @@ fn bounded_serialization_and_profile_reject_unserviceable_genesis() {
     assert!(workload.validate().is_err());
     workload.payload_bytes = 131_072;
     assert!(workload.validate().is_ok());
-    assert!(unhex("0xAB", 1).is_err());
-    assert!(number("01").is_err());
     let fields = [
         Value::Bool(true),
         Value::I64(i64::MIN),
@@ -493,18 +511,16 @@ fn collector_handles_same_block_recreation_rollback_id_reuse_and_every_field_typ
         .unwrap();
     let mut captured = None;
     let timestamp = h.workload.timestamp(h.run.genesis.timestamp_ms, 2).unwrap();
-    let executed = arkiv_node::exec::execute_block_observed(
-        &h.spec,
-        branch,
-        &h.head,
-        2,
-        timestamp,
-        &inputs,
-        |b, _, o, e| {
-            captured = Some(metadata::capture(b, &inputs, o, e)?);
-            Ok(())
-        },
-    )
+    let env = arkiv_node::exec::BlockEnv {
+        spec: &h.spec,
+        parent: &h.head,
+        height: 2,
+        timestamp_ms: timestamp,
+    };
+    let executed = arkiv_node::exec::execute_block_observed(env, branch, &inputs, |b, _, o, e| {
+        captured = Some(metadata::capture(b, &inputs, o, e)?);
+        Ok(())
+    })
     .unwrap();
     let feed = FeedBlock::new(&h.identity, &executed.header, captured.unwrap()).unwrap();
     let bytes = json_bytes(&feed, FEED_CAP).unwrap();

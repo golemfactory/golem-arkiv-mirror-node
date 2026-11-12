@@ -16,8 +16,8 @@ use alloy_primitives::keccak256;
 use arkiv_db_storage::versioned::{
     BackendStats, CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader,
     RESERVED_META_PREFIX, Relabel, SpaceId, StatsRecorder, StorageError, StorageErrorKind,
-    StoreStats, Table, VersionedStore, head_mismatch, object_conflict, record_conflict,
-    relabel_mismatch,
+    StoreStats, Table, VersionedStore, Written, copy_bounded, head_mismatch, object_conflict,
+    record_conflict, relabel_mismatch, validate_objects,
 };
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
@@ -477,51 +477,50 @@ impl RedbStore {
         })
     }
 
-    fn commit_batch(
-        &self,
-        batch: &CommitBatch,
-        headless: bool,
-    ) -> (CommitOutcome, Vec<(SpaceId, usize)>, u64) {
-        self.transact(|| batch.validate(), |txn| stage(txn, batch, headless))
-    }
-
     /// Runs `apply` in one durable write transaction after `validate`, under
-    /// the writer lock, and maps redb's outcome to a [`CommitOutcome`].
+    /// the writer lock, maps redb's outcome to a [`CommitOutcome`] and
+    /// counts it.
     fn transact(
         &self,
         validate: impl FnOnce() -> Result<(), StorageError>,
-        apply: impl FnOnce(&WriteTransaction) -> Result<(Vec<(SpaceId, usize)>, u64), Fault>,
-    ) -> (CommitOutcome, Vec<(SpaceId, usize)>, u64) {
+        apply: impl FnOnce(&WriteTransaction) -> Result<Written, Fault>,
+    ) -> CommitOutcome {
         let _writer = lock(&self.writer);
+        self.stats.write(self.transact_locked(validate, apply))
+    }
+
+    fn transact_locked(
+        &self,
+        validate: impl FnOnce() -> Result<(), StorageError>,
+        apply: impl FnOnce(&WriteTransaction) -> Result<Written, Fault>,
+    ) -> Result<Written, CommitOutcome> {
         // A latched failure answers every call, even a malformed batch.
         if let Some(error) = self.failure() {
-            return (CommitOutcome::NotCommitted(error), Vec::new(), 0);
+            return Err(CommitOutcome::NotCommitted(error));
         }
-        if let Err(error) = validate() {
-            return (CommitOutcome::NotCommitted(error), Vec::new(), 0);
-        }
+        validate().map_err(CommitOutcome::NotCommitted)?;
         let slot = self.slot.read().unwrap_or_else(PoisonError::into_inner);
         let Some(db) = slot.db.as_ref() else {
             let error = self.failure().unwrap_or_else(closed);
-            return (CommitOutcome::NotCommitted(error), Vec::new(), 0);
+            return Err(CommitOutcome::NotCommitted(error));
         };
         let staged = (|| -> Result<_, Fault> {
             let mut txn = db.begin_write()?;
             txn.set_durability(Durability::Immediate)?;
             txn.set_quick_repair(self.config.quick_repair);
-            let (objects, records) = apply(&txn)?;
-            Ok((txn, objects, records))
+            let written = apply(&txn)?;
+            Ok((txn, written))
         })();
-        let (txn, objects, records) = match staged {
+        let (txn, written) = match staged {
             Ok(staged) => staged,
             Err(fault) => {
                 // The transaction was dropped, which aborts it.
                 self.observe(&fault.0);
-                return (CommitOutcome::NotCommitted(fault.0), Vec::new(), 0);
+                return Err(CommitOutcome::NotCommitted(fault.0));
             }
         };
         match txn.commit() {
-            Ok(()) => (CommitOutcome::Committed, objects, records),
+            Ok(()) => Ok(written),
             Err(redb::CommitError::TransactionPoisoned) => {
                 // redb rolled the transaction back.
                 let error = StorageError::new(
@@ -529,39 +528,42 @@ impl RedbStore {
                     "redb transaction poisoned and rolled back",
                 );
                 self.observe(&error);
-                (CommitOutcome::NotCommitted(error), Vec::new(), 0)
+                Err(CommitOutcome::NotCommitted(error))
             }
             Err(error) => {
                 // redb refuses further writes on this handle whatever the
                 // cause, so the store fails until it is reopened.
                 let error = Fault::from(error).0;
                 self.latch(&error);
-                (CommitOutcome::Indeterminate(error), Vec::new(), 0)
+                Err(CommitOutcome::Indeterminate(error))
             }
         }
     }
 }
 
-/// Stages a whole batch in `txn`: head check, objects, records, new head.
+/// Stages a write in `txn`: head check, objects, records, and the new head
+/// if there is one.
 fn stage(
     txn: &WriteTransaction,
-    batch: &CommitBatch,
-    headless: bool,
-) -> Result<(Vec<(SpaceId, usize)>, u64), Fault> {
+    expected_head: Option<Head>,
+    objects: &[(SpaceId, ObjectId, Vec<u8>)],
+    records: &[(Table, Vec<u8>, Vec<u8>)],
+    new_head: Option<Head>,
+) -> Result<Written, Fault> {
     let mut meta = txn.open_table(META)?;
     let current = match meta.get(HEAD_KEY)? {
         Some(guard) => Some(Head::decode(guard.value())?),
         None => None,
     };
-    if current != batch.expected_head {
-        return Err(head_mismatch(batch.expected_head, current).into());
+    if current != expected_head {
+        return Err(head_mismatch(expected_head, current).into());
     }
 
     let mut by_space: BTreeMap<SpaceId, Vec<(&ObjectId, &[u8])>> = BTreeMap::new();
-    for (space, id, bytes) in &batch.objects {
+    for (space, id, bytes) in objects {
         by_space.entry(*space).or_default().push((id, bytes));
     }
-    let mut new_objects = Vec::new();
+    let mut written = Written::default();
     for (space, objects) in by_space {
         let name = object_table_name(space);
         let mut table = txn.open_table(object_table(&name))?;
@@ -572,16 +574,14 @@ fn stage(
                 Some(false) => return Err(object_conflict(space, id).into()),
                 None => {
                     table.insert(id, bytes)?;
-                    new_objects.push((space, bytes.len()));
+                    written.objects.push((space, bytes.len()));
                 }
             }
         }
     }
 
-    let mut new_records = 0;
     for table in Table::ALL {
-        let mut entries = batch
-            .records
+        let mut entries = records
             .iter()
             .filter(|(of, _, _)| *of == table)
             .map(|(_, key, value)| (key.as_slice(), value.as_slice()))
@@ -595,7 +595,7 @@ fn stage(
                 for (key, value) in entries {
                     let name = std::str::from_utf8(key).map_err(|_| shape(table))?;
                     let existing = meta.get(name)?.map(|stored| stored.value() == value);
-                    new_records +=
+                    written.records +=
                         insert_only(existing, table, key, || meta.insert(name, value).map(drop))?;
                 }
             }
@@ -608,7 +608,7 @@ fn stage(
                 for (key, value) in entries {
                     let height = u64::from_be_bytes(key.try_into().map_err(|_| shape(table))?);
                     let existing = records.get(height)?.map(|stored| stored.value() == value);
-                    new_records += insert_only(existing, table, key, || {
+                    written.records += insert_only(existing, table, key, || {
                         records.insert(height, value).map(drop)
                     })?;
                 }
@@ -617,7 +617,7 @@ fn stage(
                 let mut records = txn.open_table(INCLUSIONS)?;
                 for (key, value) in entries {
                     let existing = records.get(key)?.map(|stored| stored.value() == value);
-                    new_records += insert_only(existing, table, key, || {
+                    written.records += insert_only(existing, table, key, || {
                         records.insert(key, value).map(drop)
                     })?;
                 }
@@ -628,7 +628,7 @@ fn stage(
                     let hash: &[u8; 32] = key.try_into().map_err(|_| shape(table))?;
                     let height = u64::from_be_bytes(value.try_into().map_err(|_| shape(table))?);
                     let existing = records.get(hash)?.map(|stored| stored.value() == height);
-                    new_records += insert_only(existing, table, key, || {
+                    written.records += insert_only(existing, table, key, || {
                         records.insert(hash, height).map(drop)
                     })?;
                 }
@@ -636,18 +636,15 @@ fn stage(
         }
     }
 
-    if !headless {
-        meta.insert(HEAD_KEY, batch.new_head.encode().as_slice())?;
+    if let Some(head) = new_head {
+        meta.insert(HEAD_KEY, head.encode().as_slice())?;
     }
-    Ok((new_objects, new_records))
+    Ok(written)
 }
 
 /// Checks that the store holds exactly `relabel`'s head and retired records,
 /// removes them all, then stages its batch as a first commit, in `txn`.
-fn stage_relabel(
-    txn: &WriteTransaction,
-    relabel: &Relabel,
-) -> Result<(Vec<(SpaceId, usize)>, u64), Fault> {
+fn stage_relabel(txn: &WriteTransaction, relabel: &Relabel) -> Result<Written, Fault> {
     {
         let mut meta = txn.open_table(META)?;
         let current = match meta.get(HEAD_KEY)? {
@@ -729,7 +726,17 @@ fn stage_relabel(
     }
     // Every table is empty of caller records and the head is gone, so the
     // replacement stages exactly like an initial commit.
-    stage(txn, &relabel.batch, false)
+    stage_batch(txn, &relabel.batch)
+}
+
+fn stage_batch(txn: &WriteTransaction, batch: &CommitBatch) -> Result<Written, Fault> {
+    stage(
+        txn,
+        batch.expected_head,
+        &batch.objects,
+        &batch.records,
+        Some(batch.new_head),
+    )
 }
 
 fn shape(table: Table) -> Fault {
@@ -1008,10 +1015,6 @@ fn check_meta(format: Option<&[u8]>, id: Option<&[u8]>) -> Result<DatabaseId, Fa
 }
 
 impl ObjectReader for RedbStore {
-    fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-        self.read_object_bounded(space, id, usize::MAX)
-    }
-
     fn read_object_bounded(
         &self,
         space: SpaceId,
@@ -1034,10 +1037,10 @@ impl ObjectReader for RedbStore {
                 }
                 Err(error) => return Err(error.into()),
             };
-            table
+            Ok(table
                 .get(id)?
                 .map(|value| copy_bounded(value.value(), max_bytes))
-                .transpose()
+                .transpose()?)
         })?;
         if let Some(bytes) = &found
             && keccak256(bytes).0 != *id
@@ -1074,10 +1077,6 @@ impl VersionedStore for RedbStore {
         Ok(head)
     }
 
-    fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.read_record_bounded(table, key, usize::MAX)
-    }
-
     fn read_record_bounded(
         &self,
         table: Table,
@@ -1089,7 +1088,7 @@ impl VersionedStore for RedbStore {
             let txn = db.begin_read()?;
             // A key that cannot have the table's shape is absent by
             // construction.
-            match table {
+            let found = match table {
                 Table::Meta => match std::str::from_utf8(key) {
                     Ok(name) => txn
                         .open_table(META)?
@@ -1119,8 +1118,8 @@ impl VersionedStore for RedbStore {
                         .map(|value| copy_bounded(&value.value().to_be_bytes(), max_bytes)),
                     Err(_) => None,
                 },
-            }
-            .transpose()
+            };
+            Ok(found.transpose()?)
         })?;
         self.stats.record_read(found.as_ref().map(Vec::len));
         timing.success();
@@ -1129,8 +1128,7 @@ impl VersionedStore for RedbStore {
 
     fn commit(&self, batch: &CommitBatch) -> CommitOutcome {
         let mut timing = self.timings[3].start();
-        let (outcome, objects, records) = self.commit_batch(batch, false);
-        self.stats.commit(&outcome, &objects, records);
+        let outcome = self.transact(|| batch.validate(), |txn| stage_batch(txn, batch));
         if matches!(outcome, CommitOutcome::Committed) {
             timing.success();
         }
@@ -1138,18 +1136,15 @@ impl VersionedStore for RedbStore {
     }
 
     fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
-        let mut batch = CommitBatch::new(None, Head::default());
-        batch.objects = objects.to_vec();
-        let (outcome, objects, records) = self.commit_batch(&batch, true);
-        self.stats.commit(&outcome, &objects, records);
-        outcome
+        self.transact(
+            || validate_objects(objects),
+            |txn| stage(txn, None, objects, &[], None),
+        )
     }
 
     fn relabel(&self, relabel: &Relabel) -> CommitOutcome {
         let mut timing = self.timings[3].start();
-        let (outcome, objects, records) =
-            self.transact(|| relabel.validate(), |txn| stage_relabel(txn, relabel));
-        self.stats.commit(&outcome, &objects, records);
+        let outcome = self.transact(|| relabel.validate(), |txn| stage_relabel(txn, relabel));
         if matches!(outcome, CommitOutcome::Committed) {
             timing.success();
         }
@@ -1214,21 +1209,6 @@ impl VersionedStore for RedbStore {
     fn stats(&self) -> StoreStats {
         self.stats.snapshot(Some(self.probe.stats()))
     }
-}
-
-/// The redb value guard is still borrowed here: reject its length before
-/// making the returned value copy.
-fn copy_bounded(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, Fault> {
-    if bytes.len() > max_bytes {
-        return Err(Fault::new(
-            StorageErrorKind::Corrupt,
-            format!(
-                "stored value has {} bytes, exceeds read limit {max_bytes}",
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]

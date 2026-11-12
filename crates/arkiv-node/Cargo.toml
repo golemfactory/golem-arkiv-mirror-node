@@ -2,6 +2,7 @@
 name = "arkiv-node"
 description = "The append-only Arkiv pseudo node: block format, deterministic execution and replay, genesis tooling, and the signed proposer, simulator and demo binaries"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -30,6 +31,8 @@ getrandom = "0.3"
 
 [dev-dependencies]
 arkiv-db-memory.workspace = true
+arkiv-db-storage = { workspace = true, features = ["testing"] }
+arkiv-db-redb = { workspace = true, features = ["testing"] }
 # The HTTP tests read and write raw sockets.
 tokio = { version = "1", features = ["io-util"] }
 # Used by the arkiv-db-trie test support that `tests/support/block_roots.rs`

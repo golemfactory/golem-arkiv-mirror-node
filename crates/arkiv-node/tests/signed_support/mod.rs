@@ -3,16 +3,24 @@
 
 #![allow(dead_code)]
 
+pub mod http;
+
 use alloy_primitives::U256;
-use arkiv_db::OwnerId;
+use arkiv_db::{OwnerId, durable::Options};
+use arkiv_db_memory::MemoryVersionedStore;
+use arkiv_db_storage::versioned::VersionedStore;
 use arkiv_node::{
-    Genesis,
+    Genesis, TxEnvelope, TxOp,
     accounts::AccountConfig,
+    arkiv::{self, ArkivOperation},
     signed::{
         crypto::Signer,
-        protocol::{SignedGenesis, default_native_genesis},
+        history::History,
+        host::{Host, Launch, Prefill},
+        protocol::{SignedGenesis, SignedHeader, SignedTx, default_native_genesis},
     },
 };
+use std::sync::Arc;
 
 /// The balance each funded test actor starts with: one million GLM.
 pub fn balance() -> U256 {
@@ -27,6 +35,13 @@ pub fn allocations(funded: &[OwnerId]) -> AccountConfig {
 /// The deterministic test signer for `byte`.
 pub fn signer(byte: u8) -> Signer {
     Signer::from_bytes([byte; 32]).unwrap()
+}
+
+/// The test signer whose private key is the number `n`.
+pub fn scalar_signer(n: u16) -> Signer {
+    let mut key = [0; 32];
+    key[30..].copy_from_slice(&n.to_be_bytes());
+    Signer::from_bytes(key).unwrap()
 }
 
 /// The addresses of the signers for `bytes`.
@@ -73,4 +88,75 @@ pub fn genesis(
         block_period_ms,
         funded,
     )
+}
+
+/// What launches a host of `genesis` as node `source`, its history in the
+/// empty `history` store: the genesis certificate is `proposer`'s, who also
+/// signs blocks when the host is a `producer`.
+pub fn launch(
+    genesis: &SignedGenesis,
+    proposer: Signer,
+    source: [u8; 16],
+    history: Arc<dyn VersionedStore>,
+    producer: bool,
+) -> Launch {
+    Launch {
+        history: History::create(history, genesis.hash()).unwrap(),
+        genesis: genesis.clone(),
+        source,
+        certificate: SignedHeader::sign(genesis, genesis.header(), &proposer).unwrap(),
+        signer: producer.then_some(proposer),
+    }
+}
+
+/// A host of `genesis` over fresh memory stores (see [`launch`]).
+pub fn memory_host(
+    genesis: &SignedGenesis,
+    proposer: Signer,
+    source: [u8; 16],
+    producer: bool,
+) -> Host {
+    Host::create(
+        Arc::new(MemoryVersionedStore::new()),
+        Options::default(),
+        launch(
+            genesis,
+            proposer,
+            source,
+            Arc::new(MemoryVersionedStore::new()),
+            producer,
+        ),
+        Prefill::None,
+    )
+    .unwrap()
+}
+
+/// `operations` on the entity namespace.
+pub fn arkiv_ops(operations: Vec<ArkivOperation>) -> Vec<TxOp> {
+    operations
+        .into_iter()
+        .map(|operation| TxOp::Arkiv {
+            namespace: arkiv::entity_namespace(),
+            operation,
+        })
+        .collect()
+}
+
+/// A transaction of `signer` on the chain of `genesis`.
+pub fn sign_tx(
+    genesis: &SignedGenesis,
+    signer: &Signer,
+    nonce: u64,
+    request_id: [u8; 32],
+    tx_budget: u64,
+    ops: Vec<TxOp>,
+) -> SignedTx {
+    let envelope = TxEnvelope {
+        chain_id: genesis.genesis.chain_id,
+        actor: signer.address(),
+        request_id,
+        tx_budget,
+        ops,
+    };
+    SignedTx::sign(genesis, nonce, envelope, signer).unwrap()
 }

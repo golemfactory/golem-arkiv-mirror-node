@@ -3,15 +3,12 @@
 
 use arkiv_db_redb::testing::{BLOCK, CrashDisk, CrashMode};
 use arkiv_db_storage::versioned::{
-    CommitBatch, CommitOutcome, Health, Reconciliation, SpaceId, StorageErrorKind, VersionedStore,
-    reconcile,
+    CommitOutcome, Health, Reconciliation, SpaceId, StorageErrorKind, VersionedStore, reconcile,
 };
 
-use super::{assert_absent, assert_applied, block, commit, crash_store};
-
-pub fn config() -> arkiv_db_redb::RedbConfig {
-    arkiv_db_redb::RedbConfig::with_cache_size(64 << 10)
-}
+use super::{
+    assert_absent, assert_applied, block, commit, crash_store, durable_image, small_cache_config,
+};
 
 /// Whether `outcome` failed with `Full`.
 pub fn full(outcome: &CommitOutcome) -> bool {
@@ -67,7 +64,7 @@ pub struct Sweep {
 /// quota is lifted.
 pub fn sweep(space: Space) -> Sweep {
     let genesis = block(None, 0, 1, &[(SpaceId::Namespace(1), 50, 300)]);
-    let candidate: CommitBatch = block(
+    let candidate = block(
         Some(genesis.new_head),
         1,
         1,
@@ -76,17 +73,13 @@ pub fn sweep(space: Space) -> Sweep {
             (SpaceId::Namespace(2), 300, 400),
         ],
     );
-    let image = {
-        let disk = CrashDisk::new();
-        let store = crash_store(&disk, config());
-        commit(&store, genesis.clone());
-        disk.crash(store, CrashMode::DurableOnly)
-    };
+    let config = small_cache_config();
+    let image = durable_image(config, std::slice::from_ref(&genesis));
     let (base, needed) = {
         let disk = CrashDisk::from_image(image.clone());
         let base = space.used(&disk);
-        let store = crash_store(&disk, config());
-        commit(&store, candidate.clone());
+        let store = crash_store(&disk, config);
+        commit(&store, &candidate);
         (base, space.used(&disk))
     };
     assert!(needed > base, "the candidate must need more space");
@@ -106,7 +99,7 @@ pub fn sweep(space: Space) -> Sweep {
     };
     for &quota in &quotas {
         let disk = CrashDisk::from_image(image.clone());
-        let store = crash_store(&disk, config());
+        let store = crash_store(&disk, config);
         space.limit(&disk, Some(quota));
         let outcome = store.commit(&candidate);
         match &outcome {
@@ -142,14 +135,14 @@ pub fn sweep(space: Space) -> Sweep {
         // A power cut now leaves the parent.
         let cut = crash_store(
             &CrashDisk::from_image(disk.crash_image(CrashMode::DurableOnly)),
-            config(),
+            config,
         );
         assert_eq!(cut.head().unwrap(), Some(genesis.new_head));
         assert_absent(&cut, &candidate);
 
         // Space returns: the identical batch commits exactly once.
         space.limit(&disk, None);
-        commit(&store, candidate.clone());
+        commit(&store, &candidate);
         assert_applied(&store, &candidate);
         assert!(matches!(
             store.commit(&candidate),

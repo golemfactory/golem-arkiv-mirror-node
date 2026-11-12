@@ -50,7 +50,7 @@ fn conflict(genesis: &SignedGenesis, signer: &Signer, header: &SignedHeader) -> 
 }
 
 fn message<T>(result: arkiv_node::signed::Result<T>) -> &'static str {
-    result.err().expect("expected rejection").0
+    result.err().expect("expected rejection").code.as_str()
 }
 
 #[test]
@@ -476,9 +476,9 @@ fn light_rejects_invalid_signature_parent_time_and_gap_without_freezing() {
         "BlockNotSynced"
     );
     assert_eq!(light.head, root.header);
-    assert_eq!(light.health, "following");
+    assert_eq!(light.health.as_str(), "following");
     light.append(&[first], &second).unwrap();
-    assert_eq!(light.health, "stalled");
+    assert_eq!(light.health.as_str(), "stalled");
     light
         .append(std::slice::from_ref(&second), &second)
         .unwrap();

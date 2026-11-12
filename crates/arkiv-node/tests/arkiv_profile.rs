@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 fn run() -> RunConfig {
     RunConfig {
-        genesis: arkiv_node::demo::workload::genesis(9002, 0),
+        genesis: arkiv_node::dev::genesis(9002, 0),
         workload: Workload::default(),
     }
 }

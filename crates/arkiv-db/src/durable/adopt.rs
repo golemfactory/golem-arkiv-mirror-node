@@ -12,8 +12,8 @@
 //! and decoded at least once and every entry is counted exactly once.
 use super::{
     streaming::{
-        POSTING_CACHE_SLOTS, PostingCache, check_host, check_namespace, check_object_size,
-        check_row,
+        POSTING_CACHE_SLOTS, PostingCache, WalkError, check_host, check_namespace,
+        check_object_size, check_row,
     },
     *,
 };
@@ -22,7 +22,7 @@ use crate::{
     layout::{Catalog, HostMap, Keys, PostingMap, Records, Rows, Terms},
 };
 use arkiv_db_storage::versioned::{Relabel, SpaceId};
-use arkiv_db_trie::{ExploreNode, MerkleMap, NodeKind, NodeLoader, TrieError, TrieKey, TrieValue};
+use arkiv_db_trie::{ExploreNode, MerkleMap, NodeKind, NodeLoader, TrieKey, TrieValue};
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     sync::{
@@ -35,13 +35,6 @@ use std::{
 const SPLIT_ENTRIES: u64 = 1 << 16;
 /// Pending parts at most; a part found while the queue is full runs inline.
 const QUEUE_PARTS: usize = 4096;
-
-struct Stop(DurableError);
-impl From<TrieError> for Stop {
-    fn from(e: TrieError) -> Self {
-        Self(corrupt(format!("import traversal: {e}")))
-    }
-}
 
 #[derive(Clone)]
 enum Map {
@@ -73,6 +66,15 @@ struct Total {
     seen: AtomicU64,
     parts: AtomicUsize,
 }
+impl Total {
+    fn new(expected: u64, parts: usize) -> Arc<Self> {
+        Arc::new(Self {
+            expected,
+            seen: AtomicU64::new(0),
+            parts: AtomicUsize::new(parts),
+        })
+    }
+}
 
 /// A whole map (`total` unset: not yet split) or one key range of it.
 struct Part {
@@ -82,6 +84,24 @@ struct Part {
     lower: Option<Vec<u8>>,
     upper: Option<Vec<u8>>,
     total: Option<Arc<Total>>,
+}
+impl Part {
+    fn whole(map: Map, space: SpaceId) -> Self {
+        Self {
+            map,
+            space,
+            lower: None,
+            upper: None,
+            total: None,
+        }
+    }
+    /// The namespace a posting is cached under; zero outside a namespace.
+    fn namespace(&self) -> u64 {
+        match self.space {
+            SpaceId::Namespace(n) => n,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -112,19 +132,19 @@ struct Loader<'a, 'b> {
     space: SpaceId,
 }
 impl<V: TrieValue> NodeLoader<V> for Loader<'_, '_> {
-    type Error = Stop;
-    fn read(&self, id: &crate::B256) -> Result<Option<Vec<u8>>, Stop> {
+    type Error = WalkError;
+    fn read(&self, id: &crate::B256) -> Result<Option<Vec<u8>>, WalkError> {
         let verifier = self.verifier;
         if verifier.failed.load(Ordering::Acquire) {
             // Another part already failed; its error is the one reported.
-            return Err(Stop(DurableError::WriterUnavailable));
+            return Err(WalkError(DurableError::WriterUnavailable));
         }
         let bytes = verifier
             .source
             .read_object_bounded(self.space, &id.0, verifier.object_cap)
-            .map_err(|e| Stop(e.into()))?;
+            .map_err(|e| WalkError(e.into()))?;
         if let Some(bytes) = &bytes {
-            check_object_size(bytes.len(), verifier.options).map_err(Stop)?;
+            check_object_size(bytes.len(), verifier.options).map_err(WalkError)?;
         }
         Ok(bytes)
     }
@@ -188,20 +208,14 @@ impl<'a> Verifier<'a> {
 
     fn run(&self, threads: usize) -> Result<(), DurableError> {
         let catalog = Catalog::from_root(self.state.catalog_root, self.state.catalog_len)
-            .map_err(|e| Stop::from(e).0)?;
+            .map_err(|e| WalkError::from(e).0)?;
         let host = HostMap::from_root(self.state.host_root, self.state.host_len)
-            .map_err(|e| Stop::from(e).0)?;
+            .map_err(|e| WalkError::from(e).0)?;
         for (map, space) in [
             (Map::Catalog(catalog), SpaceId::Catalog),
             (Map::Host(host), SpaceId::Host),
         ] {
-            lock(&self.queue).parts.push_back(Part {
-                map,
-                space,
-                lower: None,
-                upper: None,
-                total: None,
-            });
+            lock(&self.queue).parts.push_back(Part::whole(map, space));
         }
         std::thread::scope(|scope| {
             for _ in 0..threads.max(1) {
@@ -268,26 +282,14 @@ impl<'a> Verifier<'a> {
         space: SpaceId,
         postings: &mut PostingCache,
     ) -> Result<(), DurableError> {
-        self.push(
-            Part {
-                map,
-                space,
-                lower: None,
-                upper: None,
-                total: None,
-            },
-            postings,
-        )
+        self.push(Part::whole(map, space), postings)
     }
 
     fn part(&self, part: Part, postings: &mut PostingCache) -> Result<(), DurableError> {
         let Some(total) = part.total.clone() else {
             return self.split(part, postings);
         };
-        let namespace = match part.space {
-            SpaceId::Namespace(n) => n,
-            _ => 0,
-        };
+        let namespace = part.namespace();
         let counted = match &part.map {
             Map::Catalog(m) => self.range(m, &part, |id, ns| {
                 check_namespace(self.state, id, &ns)?;
@@ -337,10 +339,7 @@ impl<'a> Verifier<'a> {
     /// Cut a whole map into its parts, run the first and queue the rest.
     fn split(&self, part: Part, postings: &mut PostingCache) -> Result<(), DurableError> {
         let len = part.map.len();
-        let namespace = match part.space {
-            SpaceId::Namespace(n) => n,
-            _ => 0,
-        };
+        let namespace = part.namespace();
         if let Map::Posting(map) = &part.map
             && len <= self.split
         {
@@ -350,11 +349,7 @@ impl<'a> Verifier<'a> {
             }
             self.part(
                 Part {
-                    total: Some(Arc::new(Total {
-                        expected: len,
-                        seen: AtomicU64::new(0),
-                        parts: AtomicUsize::new(1),
-                    })),
+                    total: Some(Total::new(len, 1)),
                     ..part
                 },
                 postings,
@@ -376,11 +371,7 @@ impl<'a> Verifier<'a> {
         } else {
             Vec::new()
         };
-        let total = Arc::new(Total {
-            expected: len,
-            seen: AtomicU64::new(0),
-            parts: AtomicUsize::new(bounds.len() + 1),
-        });
+        let total = Total::new(len, bounds.len() + 1);
         let lowers = std::iter::once(None).chain(bounds.iter().cloned().map(Some));
         let uppers = bounds
             .iter()
@@ -519,7 +510,7 @@ impl DurableEngine {
     ///
     /// The store must hold exactly one height-zero publication, as
     /// [`initialize_bulk`](Self::initialize_bulk) writes it, and nothing else:
-    /// no later snapshots, checkpoints or floors, hence no objects of other
+    /// no later snapshots or floors, hence no objects of other
     /// states. Every object reachable from the staged state is first read and
     /// checked as [`initialize_simulator_from_staged`] checks it while copying:
     /// content hash, object and batch caps, trie structure, entry counts,
@@ -546,20 +537,7 @@ impl DurableEngine {
         packet: simulator::SimulatorPacket,
         threads: usize,
     ) -> Result<Publication, DurableError> {
-        genesis.validate()?;
-        options.validate()?;
-        self.context.generation()?;
-        if self.state != WriterState::Ready || self.simulator.is_some() {
-            return Err(incompatible(
-                "adoption requires a ready engine-only staging source",
-            ));
-        }
-        if genesis.initial_state.as_ref() != Some(&self.manifest.state)
-            || genesis.limits != self.genesis.limits
-            || genesis.pricing != self.genesis.pricing
-        {
-            return Err(incompatible("staged source/genesis association"));
-        }
+        self.check_staging_source(&genesis, &options, "adoption")?;
         if self.manifest.sequence != 0 || self.manifest.parent.is_some() {
             return Err(incompatible(
                 "adoption requires a staged store with a single height-zero publication",
@@ -571,25 +549,10 @@ impl DurableEngine {
             return Err(corrupt("staged head/manifest association"));
         }
         identity.validate(&genesis)?;
-        if packet.reserved_bytes()? > options.prepare_bytes {
-            return Err(DurableError::ResourceLimit(
-                "genesis packet exceeds batch cap".into(),
-            ));
-        }
-        let manifest = EngineManifest {
-            genesis: genesis.id(),
-            sequence: 0,
-            parent: None,
-            state_root: self.manifest.state_root,
-            state: self.manifest.state.clone(),
-        };
+        packet.check_fits(&options)?;
+        let manifest = EngineManifest::genesis(&genesis, self.manifest.state.clone());
         // The records `initialize_simulator_from_staged` commits.
-        let mut batch = manifest_batch(None, &manifest);
-        batch
-            .put_record(Table::Meta, PROFILE_KEY, simulator::profile_bytes())
-            .put_record(Table::Meta, GENESIS_KEY, genesis.envelope())
-            .put_record(Table::Meta, simulator::IDENTITY_KEY, identity.envelope()?);
-        packet.append(&mut batch, &manifest)?;
+        let batch = genesis_batch(&manifest, &genesis, Some(&identity), Some(&packet))?;
         if batch.logical_bytes() > options.prepare_bytes as u64 {
             return Err(DurableError::ResourceLimit(
                 "genesis metadata exceeds batch cap".into(),
@@ -612,11 +575,7 @@ impl DurableEngine {
             ),
         ];
         verify_staged(store.as_ref(), &manifest.state, &genesis, &options, threads)?;
-        let info = CommitInfo {
-            snapshot: SnapshotId::from_sequence(0),
-            commit_id: manifest.id(),
-            state_root: manifest.state_root,
-        };
+        let info = info_of(&manifest);
         // Release the staged interpretation and its caches first; `store` is
         // the only handle left.
         drop(self);
@@ -642,73 +601,22 @@ mod tests {
         PriceSchedule, RecordKey, Revision, Value, durable::BulkGenesisBuilder,
     };
     use arkiv_db_memory::MemoryVersionedStore;
-    use arkiv_db_storage::versioned::{
-        CommitBatch, DatabaseId, Head, Health, ObjectId, ObjectReader, StorageError, StoreStats,
+    use arkiv_db_storage::{
+        testing::FaultyStore,
+        versioned::{ObjectId, ObjectReader},
     };
     use std::collections::{BTreeMap, HashSet};
 
-    /// Records every object read; can hide or flip one object.
-    struct Probe {
-        inner: Arc<MemoryVersionedStore>,
-        read: Mutex<HashSet<(SpaceId, ObjectId)>>,
-        target: Mutex<Option<(ObjectId, bool)>>,
-    }
-    impl ObjectReader for Probe {
-        fn read_object(&self, s: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-            self.read_object_bounded(s, id, usize::MAX)
-        }
-        fn read_object_bounded(
-            &self,
-            space: SpaceId,
-            id: &ObjectId,
-            cap: usize,
-        ) -> Result<Option<Vec<u8>>, StorageError> {
-            let mut bytes = self.inner.read_object_bounded(space, id, cap)?;
-            match *lock(&self.target) {
-                Some((target, false)) if target == *id => bytes = None,
-                Some((target, true)) if target == *id => {
-                    if let Some(b) = bytes.as_mut() {
-                        *b.last_mut().unwrap() ^= 1;
-                    }
-                }
-                _ => {}
-            }
-            if bytes.is_some() {
-                lock(&self.read).insert((space, *id));
-            }
-            Ok(bytes)
-        }
-    }
-    impl VersionedStore for Probe {
-        fn database_id(&self) -> DatabaseId {
-            self.inner.database_id()
-        }
-        fn head(&self) -> Result<Option<Head>, StorageError> {
-            self.inner.head()
-        }
-        fn read_record(&self, t: Table, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-            self.inner.read_record(t, k)
-        }
-        fn read_record_bounded(
-            &self,
-            t: Table,
-            k: &[u8],
-            n: usize,
-        ) -> Result<Option<Vec<u8>>, StorageError> {
-            self.inner.read_record_bounded(t, k, n)
-        }
-        fn commit(&self, b: &CommitBatch) -> CommitOutcome {
-            self.inner.commit(b)
-        }
-        fn health(&self) -> Health {
-            self.inner.health()
-        }
-        fn recover(&self) -> Result<Option<Head>, StorageError> {
-            self.inner.recover()
-        }
-        fn stats(&self) -> StoreStats {
-            self.inner.stats()
-        }
+    /// A wrapper of `store` and the set of objects read through it.
+    type Reads = Arc<Mutex<HashSet<(SpaceId, ObjectId)>>>;
+    fn probe(store: &Arc<MemoryVersionedStore>) -> (FaultyStore<Arc<MemoryVersionedStore>>, Reads) {
+        let probe = FaultyStore::new(store.clone());
+        let reads = Reads::default();
+        let seen = reads.clone();
+        probe.set_object_read_hook(Some(Arc::new(move |space, id: &ObjectId| {
+            lock(&seen).insert((space, *id));
+        })));
+        (probe, reads)
     }
 
     struct Temp(std::path::PathBuf);
@@ -766,14 +674,6 @@ mod tests {
         (store, engine, genesis)
     }
 
-    fn probe(store: &Arc<MemoryVersionedStore>) -> Probe {
-        Probe {
-            inner: store.clone(),
-            read: Mutex::new(HashSet::new()),
-            target: Mutex::new(None),
-        }
-    }
-
     const SETTINGS: [(u64, usize); 4] = [(u64::MAX, 1), (4, 1), (4, 4), (16, 3)];
 
     #[test]
@@ -785,7 +685,7 @@ mod tests {
             .clone();
         assert!(reach.values().map(|r| r.objects).sum::<u64>() > 500);
         for (split, threads) in SETTINGS {
-            let probe = probe(&store);
+            let (probe, reads) = probe(&store);
             verify_split(
                 &probe,
                 &state,
@@ -796,7 +696,7 @@ mod tests {
             )
             .unwrap();
             let mut read: BTreeMap<SpaceId, u64> = BTreeMap::new();
-            for (space, _) in lock(&probe.read).iter() {
+            for (space, _) in lock(&reads).iter() {
                 *read.entry(*space).or_default() += 1;
             }
             // Reads are reachable by construction; equal counts mean every
@@ -831,9 +731,9 @@ mod tests {
     fn every_missing_or_changed_object_fails_every_partitioning() {
         let (store, engine, genesis) = staged(120);
         let state = engine.head_snapshot().state_header();
-        let probe = probe(&store);
+        let (probe, reads) = probe(&store);
         verify_split(&probe, &state, &genesis, &Options::default(), 1, u64::MAX).unwrap();
-        let mut objects: Vec<_> = lock(&probe.read).iter().copied().collect();
+        let mut objects: Vec<_> = lock(&reads).iter().copied().collect();
         objects.sort();
         let step = (objects.len() / 24).max(1);
         let sample: Vec<_> = objects
@@ -845,8 +745,10 @@ mod tests {
         assert!(sample.iter().any(|(s, _)| *s == SpaceId::Catalog));
         assert!(sample.iter().any(|(s, _)| *s == SpaceId::Host));
         for (space, id) in sample {
-            for flip in [false, true] {
-                *lock(&probe.target) = Some((id, flip));
+            let mut flipped = store.read_object(space, &id).unwrap().unwrap();
+            *flipped.last_mut().unwrap() ^= 1;
+            for (flip, replacement) in [(false, None), (true, Some(flipped))] {
+                probe.override_object(space, id, replacement);
                 for (split, threads) in SETTINGS {
                     assert!(
                         verify_split(
@@ -863,7 +765,7 @@ mod tests {
                 }
             }
         }
-        *lock(&probe.target) = None;
+        probe.clear_overrides();
         verify_split(&probe, &state, &genesis, &Options::default(), 4, 4).unwrap();
     }
 

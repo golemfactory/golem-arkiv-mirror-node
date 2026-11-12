@@ -805,7 +805,6 @@ async fn http_handler(
     axum::extract::State(app): axum::extract::State<App>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let result = async {
         let _permit = app
             .requests
@@ -825,17 +824,26 @@ async fn http_handler(
     let result = tokio::time::timeout(DEADLINE, result)
         .await
         .unwrap_or(Err(DemoError::Transport));
-    let response = RpcResponse::from_result(result);
-    let bytes = serde_json::to_vec(&response).unwrap_or_default();
-    let bytes = if bytes.len() > RESPONSE_CAP {
+    respond(&RpcResponse::from_result(result))
+}
+
+/// The HTTP body of `response`; one over the response cap becomes
+/// `ProofLimitExceeded`, one that cannot be serialized a 500.
+fn respond(response: &impl serde::Serialize) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let oversized = || {
         serde_json::to_vec(&RpcResponse::from_result(Err(
             DemoError::ProofLimitExceeded,
         )))
-        .expect("error response")
-    } else {
-        bytes
     };
-    ([("content-type", "application/json")], bytes).into_response()
+    let bytes = match serde_json::to_vec(response) {
+        Ok(bytes) if bytes.len() > RESPONSE_CAP => oversized(),
+        bytes => bytes,
+    };
+    match bytes {
+        Ok(bytes) => ([("content-type", "application/json")], bytes).into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Serve loopback by default (the CLI requires an explicit address to change it).
@@ -1022,4 +1030,21 @@ fn record_sample(node: &mut Node, sampled: u64, sampled_hash: B256, progress: bo
     }
     .into();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unserializable_response_is_a_500_not_an_empty_200() {
+        // JSON object keys must be strings.
+        let unserializable = BTreeMap::from([((1u8, 2u8), 3u8)]);
+        assert_eq!(
+            respond(&unserializable).status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let response = respond(&RpcResponse::from_result(Ok(json!({"ok": true}))));
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
 }

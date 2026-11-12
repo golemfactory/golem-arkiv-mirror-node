@@ -137,8 +137,7 @@ async fn dispatch(
     let Some(height) = sampled
         .get("result")
         .and_then(Value::as_str)
-        .and_then(|s| s.strip_prefix("0x"))
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .and_then(crate::text::quantity)
     else {
         return failure(id, -32603, "Invalid head response");
     };
@@ -344,7 +343,7 @@ mod tests {
     use crate::signed::{
         crypto::Signer,
         history::History,
-        host::Host,
+        host::{Host, Launch, Prefill},
         protocol::*,
         runtime::{Node, Runtime},
     };
@@ -371,12 +370,15 @@ mod tests {
             History::create(Arc::new(MemoryVersionedStore::new()), genesis.hash()).unwrap();
         let host = Host::create(
             Arc::new(MemoryVersionedStore::new()),
-            history,
-            genesis,
-            [1; 16],
-            certificate,
-            Some(signer),
             Options::default(),
+            Launch {
+                history,
+                genesis,
+                source: [1; 16],
+                certificate,
+                signer: Some(signer),
+            },
+            Prefill::None,
         )
         .unwrap();
         Runtime::new(Node::Full(Box::new(host)), None, None, None).unwrap()

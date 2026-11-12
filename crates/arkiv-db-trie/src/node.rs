@@ -188,6 +188,16 @@ impl<V: TrieValue> NodeBox<V> {
         })
     }
 
+    /// Wraps a node decoded from committed bytes, with its reference.
+    fn stored(node: Node<V>, rlp: RlpNode) -> Arc<Self> {
+        Arc::new(Self {
+            retained: measure(&node),
+            node,
+            rlp: OnceLock::from(rlp),
+            from_store: true,
+        })
+    }
+
     /// Appends the node's canonical encoding.
     pub fn encode(&self, out: &mut Vec<u8>) {
         self.node.encode(out);
@@ -215,12 +225,7 @@ impl<V: TrieValue> NodeBox<V> {
         } else {
             RlpNode::word_rlp(id)
         };
-        Ok(Arc::new(Self {
-            retained: measure(&node),
-            node,
-            rlp: OnceLock::from(rlp),
-            from_store: true,
-        }))
+        Ok(Self::stored(node, rlp))
     }
 }
 
@@ -488,12 +493,7 @@ fn materialize_child<V: TrieValue>(
             let malformed = |reason| TrieError::Malformed { id: *id, reason };
             let node = materialize(decode_raw(bytes).map_err(malformed)?, id)?;
             let rlp = RlpNode::from_raw(bytes).ok_or(malformed("inline child too long"))?;
-            Link::Mem(Arc::new(NodeBox {
-                retained: measure(&node),
-                node,
-                rlp: OnceLock::from(rlp),
-                from_store: true,
-            }))
+            Link::Mem(NodeBox::stored(node, rlp))
         }
     })
 }
@@ -705,38 +705,25 @@ mod tests {
             .into_iter()
             .chain(std::iter::repeat_n(empty, 14))
             .collect();
-        assert!(decode_raw(&branch_with(&two_children, &[0x80])).is_ok());
-        // A branch value, a one-child branch, a bad child reference.
-        assert!(decode_raw(&branch_with(&two_children, &[0x01])).is_err());
         let one_child: Vec<&[u8]> = [hash.as_slice()]
             .into_iter()
             .chain(std::iter::repeat_n(empty, 15))
             .collect();
-        assert!(decode_raw(&branch_with(&one_child, &[0x80])).is_err());
-        let mut short_hash = two_children.clone();
         let truncated = [0x9f].into_iter().chain([0x11; 31]).collect::<Vec<u8>>();
+        let mut short_hash = two_children.clone();
         short_hash[3] = &truncated;
-        assert!(decode_raw(&branch_with(&short_hash, &[0x80])).is_err());
 
         // Leaf and extension forms, built through alloy where it can.
         let leaf = alloy_rlp::encode(LeafNode::new(Nibbles::from_nibbles([1, 2]), vec![5]));
-        assert!(decode_raw(&leaf).is_ok());
         let empty_value = alloy_rlp::encode(LeafNode::new(Nibbles::from_nibbles([1, 2]), vec![]));
-        assert_eq!(decode_raw(&empty_value), Err("empty leaf value"));
         let mut trailing = leaf.clone();
         trailing.push(0);
-        assert!(decode_raw(&trailing).is_err());
-        let mut junk_padding = leaf;
         // [0xc4, 0x82, 0x20, 0x12, 0x05]: set the even path's low nibble.
+        let mut junk_padding = leaf.clone();
         junk_padding[2] = 0x21;
-        assert!(decode_raw(&junk_padding).is_err());
-        let empty_extension = [0xc2, 0x00, 0x80];
-        assert!(decode_raw(&empty_extension).is_err());
-        let extension_without_child = [0xc2, 0x11, 0x80];
-        assert!(decode_raw(&extension_without_child).is_err());
         // An inline child must be shorter than 32 bytes.
         let big_leaf = alloy_rlp::encode(LeafNode::new(Nibbles::from_nibbles([1]), vec![3; 40]));
-        let extension = {
+        let big_inline_child = {
             let mut payload = vec![0x11];
             payload.extend_from_slice(&big_leaf);
             let mut out = Vec::new();
@@ -748,14 +735,59 @@ mod tests {
             out.extend_from_slice(&payload);
             out
         };
-        assert_eq!(
-            decode_raw(&extension),
-            Err("inline child of 32 bytes or more")
-        );
-        // A string is not a node, nor is the empty-root marker.
-        assert!(decode_raw(&[0x80]).is_err());
-        assert!(decode_raw(&[]).is_err());
-        assert!(decode_raw(&[0xc0]).is_err());
+
+        assert!(decode_raw(&branch_with(&two_children, &[0x80])).is_ok());
+        assert!(decode_raw(&leaf).is_ok());
+        let rejected: [(&str, Vec<u8>, &str); 12] = [
+            (
+                "branch value",
+                branch_with(&two_children, &[0x01]),
+                "branch node carries a value",
+            ),
+            (
+                "one-child branch",
+                branch_with(&one_child, &[0x80]),
+                "branch node with fewer than two children",
+            ),
+            (
+                "short child hash",
+                branch_with(&short_hash, &[0x80]),
+                "invalid child reference",
+            ),
+            ("empty leaf value", empty_value, "empty leaf value"),
+            ("trailing byte", trailing, "bytes after the node"),
+            (
+                "junk path padding",
+                junk_padding,
+                "nonzero padding nibble in an even node path",
+            ),
+            (
+                "empty extension",
+                vec![0xc2, 0x00, 0x80],
+                "empty extension path",
+            ),
+            (
+                "extension without a child",
+                vec![0xc2, 0x11, 0x80],
+                "extension without a child",
+            ),
+            (
+                "big inline child",
+                big_inline_child,
+                "inline child of 32 bytes or more",
+            ),
+            // A string is not a node, nor is the empty-root marker.
+            ("empty string", vec![0x80], "node is not an RLP list"),
+            ("no bytes", vec![], "invalid RLP header"),
+            (
+                "empty list",
+                vec![0xc0],
+                "node is neither a 2-item nor a 17-item list",
+            ),
+        ];
+        for (name, bytes, reason) in rejected {
+            assert_eq!(decode_raw(&bytes).err(), Some(reason), "{name}");
+        }
     }
 
     #[test]

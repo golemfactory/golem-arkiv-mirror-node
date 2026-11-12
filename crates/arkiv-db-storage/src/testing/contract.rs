@@ -71,6 +71,8 @@ macro_rules! versioned_store_contract {
             faulty_disk_full_then_retry_commits_once,
             faulty_failed_recovery_is_retryable,
             faulty_stage_and_relabel_take_commit_faults,
+            faulty_overrides_replace_single_read_answers,
+            faulty_skips_precede_faults_and_the_hook_sees_object_reads,
         );
     };
     (@base $factory:expr) => {
@@ -1294,7 +1296,8 @@ pub fn faulty_failed_recovery_is_retryable(factory: &dyn StoreFactory) {
     );
     assert_eq!(store.recover().unwrap(), Some(head(0, 1)));
     assert_eq!(store.health(), Health::Available);
-    assert_eq!(store.injected().recoveries_failed, 3);
+    let injected = store.injected();
+    assert_eq!((injected.recoveries_failed, injected.recover_calls), (3, 5));
 }
 
 /// The write-fault queue also answers `stage_objects` and `relabel`:
@@ -1321,5 +1324,124 @@ pub fn faulty_stage_and_relabel_take_commit_faults(factory: &dyn StoreFactory) {
     store.push_commit_fault(CommitFault::IndeterminateApplied(StorageErrorKind::Io));
     indeterminate(store.relabel(&relabel), StorageErrorKind::Io);
     assert_eq!(store.head().unwrap(), Some(head(0, 2)));
-    assert_eq!(store.injected().commits_applied, 1);
+    let injected = store.injected();
+    assert_eq!((injected.commits_applied, injected.stage_calls), (1, 2));
+}
+
+/// A read override answers for one object, one record or the head and for
+/// nothing else, under the bounded read's length check, until it is cleared.
+pub fn faulty_overrides_replace_single_read_answers(factory: &dyn StoreFactory) {
+    let (store, _resources) = faulty(factory);
+    let (kept, kept_bytes) = object(factory, "kept", 1, 40);
+    let (target, target_bytes) = object(factory, "target", 2, 40);
+    let space = SpaceId::Namespace(1);
+    let mut batch = block_batch(factory, None, 0, 0);
+    batch
+        .put_object(space, kept, kept_bytes.clone())
+        .put_object(space, target, target_bytes.clone());
+    committed(store.commit(&batch));
+    let key = height_key(0);
+    let stored_record = record(&store, Table::Blocks, &key);
+
+    store.override_object(space, target, None);
+    store.override_record(Table::Blocks, &key, None);
+    store.override_head(Some(head(7, 9)));
+    assert_eq!(read(&store, space, &target), None);
+    assert_eq!(read(&store, space, &kept), Some(kept_bytes));
+    assert_eq!(record(&store, Table::Blocks, &key), None);
+    assert_eq!(store.head().unwrap(), Some(head(7, 9)));
+    assert_eq!(store.recover().unwrap(), Some(head(7, 9)));
+
+    let mut flipped = target_bytes.clone();
+    flipped[0] ^= 1;
+    store.override_object(space, target, Some(flipped.clone()));
+    store.override_record(Table::Blocks, &key, Some(vec![1, 2, 3]));
+    assert_eq!(read(&store, space, &target), Some(flipped.clone()));
+    assert_eq!(
+        store.read_object_bounded(space, &target, flipped.len()),
+        Ok(Some(flipped.clone()))
+    );
+    assert_eq!(
+        store
+            .read_object_bounded(space, &target, flipped.len() - 1)
+            .unwrap_err()
+            .kind,
+        StorageErrorKind::Corrupt
+    );
+    assert_eq!(
+        store
+            .read_record_bounded(Table::Blocks, &key, 2)
+            .unwrap_err()
+            .kind,
+        StorageErrorKind::Corrupt
+    );
+
+    store.forbid_unbounded_reads();
+    let panics =
+        |read: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).is_err();
+    assert!(panics(&|| drop(store.read_object(space, &target))));
+    assert!(panics(&|| drop(store.read_record(Table::Blocks, &key))));
+
+    store.clear_overrides();
+    assert_eq!(
+        store.read_object_bounded(space, &target, usize::MAX),
+        Ok(Some(target_bytes))
+    );
+    assert_eq!(
+        store.read_record_bounded(Table::Blocks, &key, usize::MAX),
+        Ok(stored_record)
+    );
+    assert_eq!(store.head().unwrap(), Some(head(0, 1)));
+}
+
+/// `fail_reads_after` and `skip_writes` let a number of calls through before
+/// the fault applies, and the object-read hook is told of every object read,
+/// failed ones included.
+pub fn faulty_skips_precede_faults_and_the_hook_sees_object_reads(factory: &dyn StoreFactory) {
+    let (store, _resources) = faulty(factory);
+    store.set_latching(false);
+    let objects: Vec<_> = (0..3)
+        .map(|n| {
+            let (id, bytes) = object(factory, "staged", n, 48);
+            (SpaceId::Host, id, bytes)
+        })
+        .collect();
+    store.skip_writes(1);
+    store.push_commit_fault(CommitFault::NotCommitted(StorageErrorKind::Io));
+    committed(store.stage_objects(&objects[..1]));
+    not_committed(store.stage_objects(&objects[1..2]), StorageErrorKind::Io);
+    committed(store.stage_objects(&objects[1..]));
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    store.set_object_read_hook(Some(Arc::new(move |space, id: &ObjectId| {
+        log.lock().unwrap().push((space, *id));
+    })));
+    store.fail_reads_after(ReadScope::AllObjects, 2, StorageErrorKind::Io);
+    for (space, id, bytes) in &objects[..2] {
+        assert_eq!(read(&store, *space, id), Some(bytes.clone()));
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .read_object(SpaceId::Host, &objects[2].1)
+                .unwrap_err()
+                .kind,
+            StorageErrorKind::Io
+        );
+    }
+    store.clear_read_faults();
+    store.set_object_read_hook(None);
+    assert_eq!(
+        read(&store, SpaceId::Host, &objects[2].1),
+        Some(objects[2].2.clone())
+    );
+    let ids = |range: &[usize]| -> Vec<_> {
+        range
+            .iter()
+            .map(|&n| (SpaceId::Host, objects[n].1))
+            .collect()
+    };
+    assert_eq!(*seen.lock().unwrap(), ids(&[0, 1, 2, 2]));
+    assert_eq!(store.injected().reads_failed, 2);
 }

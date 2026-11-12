@@ -7,12 +7,14 @@ mod state_api;
 #[path = "state_docs.rs"]
 mod state_docs;
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     host::Host,
     light::Light,
-    protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedTx},
+    protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedTx, ValidTx},
     reads::{ReadLimits, Reads},
 };
+use crate::health::Health;
+use crate::http::{admit, json_body};
 use crate::simulator::{
     light::{VerifiedRequest, resolve},
     query_language,
@@ -135,13 +137,13 @@ impl Runtime {
             crate::simulator::runtime::validate_peer(p)?;
         }
         if token.as_ref().is_some_and(|s| s.len() < 32) {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()
-            .map_err(|_| Error("StorageUnavailable"))?;
+            .map_err(|_| ErrorCode::StorageUnavailable)?;
         let rpc = super::rpc::initial_state(&node)?;
         Ok(Arc::new(Self {
             node: Mutex::new(node),
@@ -194,7 +196,9 @@ impl Runtime {
     /// holding the lock.
     pub fn write_node(&self) -> Result<MutexGuard<'_, Node>> {
         let _writer = Count::new(&self.writers);
-        self.node.lock().map_err(|_| Error("StorageUnavailable"))
+        self.node
+            .lock()
+            .map_err(|_| Error::from(ErrorCode::StorageUnavailable))
     }
 
     /// Takes the node lock for a read that must not fail just because the
@@ -208,7 +212,7 @@ impl Runtime {
         let _turn = self
             .read_turn
             .lock()
-            .map_err(|_| Error("StorageUnavailable"))?;
+            .map_err(|_| ErrorCode::StorageUnavailable)?;
         self.poll_node(Some(deadline), READ)
     }
 
@@ -220,7 +224,7 @@ impl Runtime {
         let _turn = self
             .rpc_turn
             .lock()
-            .map_err(|_| Error("StorageUnavailable"))?;
+            .map_err(|_| ErrorCode::StorageUnavailable)?;
         self.poll_node(None, RPC)
     }
 
@@ -253,12 +257,14 @@ impl Runtime {
                         self.next.store(after, Ordering::SeqCst);
                         return Ok(node);
                     }
-                    Err(TryLockError::Poisoned(_)) => return Err(Error("StorageUnavailable")),
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(ErrorCode::StorageUnavailable.into());
+                    }
                     Err(TryLockError::WouldBlock) => {}
                 }
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(Error("ServerBusy"));
+                return Err(ErrorCode::ServerBusy.into());
             }
             waiting.get_or_insert_with(|| Count::new(mine));
             if started.elapsed() < YIELD_FOR {
@@ -315,7 +321,7 @@ async fn with_node<T: Send + 'static>(
         f(&*rt.read_node()?)
     })
     .await
-    .map_err(|_| Error("StorageUnavailable"))?
+    .map_err(|_| ErrorCode::StorageUnavailable)?
 }
 
 /// Runs `f` under [`Runtime::write_node`] on a blocking thread.
@@ -326,7 +332,7 @@ async fn writing<T: Send + 'static>(
     let rt = rt.clone();
     tokio::task::spawn_blocking(move || f(&mut *rt.write_node()?))
         .await
-        .map_err(|_| Error("StorageUnavailable"))?
+        .map_err(|_| ErrorCode::StorageUnavailable)?
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,7 +362,7 @@ impl GenesisResponse {
             || self.identity.chain_id != chain_id.to_string()
             || self.identity.run_id != hex(&genesis.run_id)[2..]
         {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         Ok((genesis, certificate))
     }
@@ -534,63 +540,29 @@ pub fn status(node: &Node) -> Json {
     value
 }
 
-/// Details of this request's `HistoryPruned` refusal, recorded on the host
-/// while the request held the node lock.
-fn refusal(rt: &Shared, result: &Result<Json>) -> Option<(u64, u64)> {
-    if !matches!(result, Err(Error("HistoryPruned"))) {
-        return None;
+/// The HTTP status of a refused request.
+fn http_status(code: ErrorCode) -> StatusCode {
+    use ErrorCode::*;
+    match code {
+        Unauthorized => StatusCode::UNAUTHORIZED,
+        HistoryPruned => StatusCode::GONE,
+        ServerBusy | PoolFull => StatusCode::TOO_MANY_REQUESTS,
+        StorageUnavailable | HistoryUnavailable | CommitUncertain | ReadDeadlineExceeded => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
     }
-    match &*rt.node.try_lock().ok()? {
-        Node::Full(host) => host.refusal.take(),
-        Node::Light { .. } => None,
-    }
-}
-
-fn respond(rt: &Shared, result: Result<Json>) -> Response {
-    let refusal = refusal(rt, &result);
-    response_with(result, refusal)
 }
 
 fn response(result: Result<Json>) -> Response {
-    response_with(result, None)
-}
-
-fn response_with(result: Result<Json>, refusal: Option<(u64, u64)>) -> Response {
-    match result {
-        Ok(value) => match json_bytes(&value, RESPONSE_CAP) {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                bytes,
-            )
-                .into_response(),
-            Err(e) => response(Err(e)),
-        },
-        Err(e) => {
-            let status = match e.0 {
-                "Unauthorized" => StatusCode::UNAUTHORIZED,
-                "HistoryPruned" => StatusCode::GONE,
-                "ServerBusy" | "PoolFull" => StatusCode::TOO_MANY_REQUESTS,
-                "StorageUnavailable"
-                | "HistoryUnavailable"
-                | "CommitUncertain"
-                | super::reads::DEADLINE_EXCEEDED => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::UNPROCESSABLE_ENTITY,
-            };
-            (
-                status,
-                axum::Json(crate::retention::error_body(e.0, refusal)),
-            )
-                .into_response()
-        }
-    }
+    crate::http::json_response(result, RESPONSE_CAP, http_status)
 }
 
 fn actor(s: &str) -> Result<OwnerId> {
     Ok(OwnerId::new(
         unhex(s, 20)?
             .try_into()
-            .map_err(|_| Error("InvalidRequest"))?,
+            .map_err(|_| ErrorCode::InvalidRequest)?,
     ))
 }
 
@@ -609,30 +581,29 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
         return match node {
             Node::Full(host) => {
                 let stream = host
-                    .prefill_stream
-                    .as_ref()
-                    .ok_or(Error("PrefillBundleRequired"))?;
+                    .prefill_stream()
+                    .ok_or(ErrorCode::PrefillBundleRequired)?;
                 Ok(json!({"prefillBytes": hex(stream)}))
             }
-            _ => Err(Error("FullNodeRequired")),
+            _ => Err(ErrorCode::FullNodeRequired.into()),
         };
     }
     if path == "headers" || path == "feed/blocks" {
         let limit = q.limit.unwrap_or(HEADER_BATCH);
         if !(1..=HEADER_BATCH).contains(&limit) {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let start = if let Some(after) = &q.after_height {
             let n = number(after)?;
             if n > node.head().height {
-                return Err(Error("BlockNotSynced"));
+                return Err(ErrorCode::BlockNotSynced.into());
             }
             if q.after_hash.as_deref().map(hash).transpose()?
                 != Some(node.certificate(n)?.header.hash())
             {
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
-            n.checked_add(1).ok_or(Error("CapacityReached"))?
+            n.checked_add(1).ok_or(ErrorCode::CapacityReached)?
         } else {
             0
         };
@@ -651,7 +622,7 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
             }));
         }
         let Node::Full(h) = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         let mut blocks = Vec::new();
         for height in start..=end {
@@ -670,14 +641,14 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     }
     if let Some(height) = path.strip_prefix("feed/blocks/") {
         let Node::Full(h) = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         return Ok(json!(h.feed(number(height)?)?));
     }
     let parts: Vec<_> = path.split('/').collect();
     if let ["accounts", address] | ["accounts", address, "proof"] = parts.as_slice() {
         let Node::Full(h) = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         let height = q
             .height
@@ -689,7 +660,7 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     }
     if let ["accounts", address, "nonce"] = parts.as_slice() {
         let Node::Full(h) = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         let address = actor(address)?;
         let committed = h.committed_nonce(address)?;
@@ -702,16 +673,16 @@ fn read(node: &Node, path: &str, q: &ReadQuery) -> Result<Json> {
     }
     if let ["requests", address, id] = parts.as_slice() {
         let Node::Full(h) = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         return h.request_status(
             actor(address)?,
             unhex(id, 32)?
                 .try_into()
-                .map_err(|_| Error("InvalidRequest"))?,
+                .map_err(|_| ErrorCode::InvalidRequest)?,
         );
     }
-    Err(Error("InvalidRequest"))
+    Err(ErrorCode::InvalidRequest.into())
 }
 
 /// Bounded binary transport for a file-backed canonical genesis stream.
@@ -725,58 +696,54 @@ struct PrefillChunkQuery {
 
 async fn prefill_chunk(State(rt): State<Shared>, Query(q): Query<PrefillChunkQuery>) -> Response {
     const CHUNK_CAP: u32 = 1024 * 1024;
-    if q.length == 0 || q.length > CHUNK_CAP {
-        return response(Err(Error("InvalidRequest")));
-    }
-    let permit = match rt.slots.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return response(Err(Error("ServerBusy"))),
-    };
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let _permit = permit;
-        let (path, bytes) = {
-            let node = rt.read_node()?;
-            let Node::Full(host) = &*node else {
-                return Err(Error("FullNodeRequired"));
+    let result: Result<Vec<u8>> = async {
+        if q.length == 0 || q.length > CHUNK_CAP {
+            return Err(ErrorCode::InvalidRequest.into());
+        }
+        let permit = admit(&rt.slots)?;
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            let _permit = permit;
+            let (path, bytes) = {
+                let node = rt.read_node()?;
+                let Node::Full(host) = &*node else {
+                    return Err(ErrorCode::FullNodeRequired.into());
+                };
+                let launch = host
+                    .genesis
+                    .prefill
+                    .as_ref()
+                    .ok_or(ErrorCode::PrefillBundleRequired)?;
+                (
+                    host.prefill_file()
+                        .ok_or(ErrorCode::PrefillBundleRequired)?
+                        .to_owned(),
+                    launch.canonical_bytes,
+                )
             };
-            let launch = host
-                .genesis
-                .prefill
-                .as_ref()
-                .ok_or(Error("PrefillBundleRequired"))?;
-            (
-                host.prefill_file
-                    .clone()
-                    .ok_or(Error("PrefillBundleRequired"))?,
-                launch.canonical_bytes,
-            )
-        };
-        let end = q
-            .offset
-            .checked_add(u64::from(q.length))
-            .ok_or(Error("InvalidRequest"))?;
-        if end > bytes {
-            return Err(Error("InvalidRequest"));
-        }
-        let mut file = std::fs::File::open(path).map_err(|_| Error("StorageUnavailable"))?;
-        if file
-            .metadata()
-            .map_err(|_| Error("StorageUnavailable"))?
-            .len()
-            != bytes
-        {
-            return Err(Error("InvalidPrefillBundle"));
-        }
-        file.seek(SeekFrom::Start(q.offset))
-            .map_err(|_| Error("StorageUnavailable"))?;
-        let mut buffer = vec![0; q.length as usize];
-        file.read_exact(&mut buffer)
-            .map_err(|_| Error("StorageUnavailable"))?;
-        Ok(buffer)
-    })
-    .await
-    .unwrap_or(Err(Error("StorageUnavailable")));
+            let end = q
+                .offset
+                .checked_add(u64::from(q.length))
+                .ok_or(ErrorCode::InvalidRequest)?;
+            if end > bytes {
+                return Err(ErrorCode::InvalidRequest.into());
+            }
+            let unavailable = |error: std::io::Error| {
+                ErrorCode::StorageUnavailable.caused_by(format_args!("{}: {error}", path.display()))
+            };
+            let mut file = std::fs::File::open(&path).map_err(unavailable)?;
+            if file.metadata().map_err(unavailable)?.len() != bytes {
+                return Err(ErrorCode::InvalidPrefillBundle.into());
+            }
+            file.seek(SeekFrom::Start(q.offset)).map_err(unavailable)?;
+            let mut buffer = vec![0; q.length as usize];
+            file.read_exact(&mut buffer).map_err(unavailable)?;
+            Ok(buffer)
+        })
+        .await
+        .unwrap_or(Err(ErrorCode::StorageUnavailable.into()))
+    }
+    .await;
     match result {
         Ok(bytes) => (
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -792,29 +759,21 @@ async fn http_read(
     Path(path): Path<String>,
     Query(q): Query<ReadQuery>,
 ) -> Response {
-    let permit = match rt.slots.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return response(Err(Error("ServerBusy"))),
-    };
     let worker = rt.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        // Followers poll headers and accounts here: wait out a momentary
-        // holder instead of refusing them.
-        let node = worker.read_node()?;
-        read(&node, &path, &q)
-    })
-    .await
-    .unwrap_or(Err(Error("StorageUnavailable")));
-    respond(&rt, result)
-}
-
-async fn parse<T: serde::de::DeserializeOwned>(body: Body, cap: usize) -> Result<T> {
-    let bytes = tokio::time::timeout(Duration::from_secs(5), to_bytes(body, cap))
+    let result: Result<Json> = async {
+        let permit = admit(&rt.slots)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            // Followers poll headers and accounts here: wait out a momentary
+            // holder instead of refusing them.
+            let node = worker.read_node()?;
+            read(&node, &path, &q)
+        })
         .await
-        .map_err(|_| Error("InvalidRequest"))?
-        .map_err(|_| Error("InvalidRequest"))?;
-    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
+        .unwrap_or(Err(ErrorCode::StorageUnavailable.into()))
+    }
+    .await;
+    response(result)
 }
 
 #[derive(Deserialize)]
@@ -854,9 +813,9 @@ struct TextQuery {
 }
 
 async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Body) -> Response {
-    let admission = match rt.slots.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return response(Err(Error("ServerBusy"))),
+    let admission = match admit(&rt.slots) {
+        Ok(permit) => permit,
+        Err(busy) => return response(Err(busy)),
     };
     // Detached reads hold their admission permit only while the body is
     // read; they are then evaluated under a read permit, outside the lock.
@@ -866,10 +825,9 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
             "query/range" => range_api::proof(rt.clone(), body, admission).await,
             _ => eq_proof(rt.clone(), body, admission).await,
         };
-        return respond(&rt, result);
+        return response(result);
     }
     let permit = Arc::new(admission);
-    let shared = rt.clone();
     let result: Result<Json> = async {
         if matches!(
             path.as_str(),
@@ -878,15 +836,15 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
             return range_api::handle(rt.clone(), &path, body, permit.clone()).await;
         }
         if path == "query/account" {
-            let request: AccountQuery = parse(body, REQUEST_CAP).await?;
+            let request: AccountQuery = json_body(body, REQUEST_CAP).await?;
             return verified_account(rt.clone(), request, permit.clone()).await;
         }
         if path == "query/classify" {
-            let r: Classify = parse(body, REQUEST_CAP).await?;
+            let r: Classify = json_body(body, REQUEST_CAP).await?;
             return Ok(json!(query_language::classify(&r.query)));
         }
         if path == "query/text" {
-            let r: TextQuery = parse(body, REQUEST_CAP).await?;
+            let r: TextQuery = json_body(body, REQUEST_CAP).await?;
             let classification = query_language::classify(&r.query);
             let fail = if classification.language.status != "valid" {
                 Some("QueryLanguageError")
@@ -908,7 +866,7 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
             let s = classification
                 .selection
                 .as_ref()
-                .ok_or(Error("UnsupportedQueryExecution"))?;
+                .ok_or(ErrorCode::UnsupportedQueryExecution)?;
             let request = VerifiedRequest {
                 height: r.height,
                 namespace: r.namespace,
@@ -926,13 +884,16 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
                     Ok(result)
                 }
                 Err(e) => {
-                    let status = if matches!(e.0, "ProofLimitExceeded" | "BudgetExceeded") {
+                    let status = if matches!(
+                        e.code,
+                        ErrorCode::ProofLimitExceeded | ErrorCode::BudgetExceeded
+                    ) {
                         "resource_limit"
                     } else {
                         "failed"
                     };
                     Ok(json!({
-                        "error": e.0,
+                        "error": e.code.as_str(),
                         "queryText": r.query,
                         "classification": classification,
                         "verificationStatus": {"status": status},
@@ -941,7 +902,7 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
             };
         }
         if path == "query/verified" || path == "query/inspect" {
-            let request = parse(body, REQUEST_CAP).await?;
+            let request = json_body(body, REQUEST_CAP).await?;
             return verified(rt.clone(), request, path == "query/inspect", permit.clone()).await;
         }
         let cap = if path == "transactions" {
@@ -951,42 +912,42 @@ async fn http_post(State(rt): State<Shared>, Path(path): Path<String>, body: Bod
         };
         let bytes = tokio::time::timeout(Duration::from_secs(5), to_bytes(body, cap))
             .await
-            .map_err(|_| Error("InvalidRequest"))?
-            .map_err(|_| Error("InvalidRequest"))?;
+            .map_err(|_| ErrorCode::InvalidRequest)?
+            .map_err(|_| ErrorCode::InvalidRequest)?;
         let worker_permit = permit.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = worker_permit;
             if path == "transactions" {
                 let r: Submission =
-                    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))?;
+                    serde_json::from_slice(&bytes).map_err(|_| ErrorCode::InvalidRequest)?;
                 let tx: SignedTx = unpack(&r.transaction_bytes, super::protocol::TX_CAP as usize)?;
                 let genesis = rt.read_node()?.genesis().clone();
-                tx.validate(&genesis)?;
+                let tx = ValidTx::new(tx, &genesis)?;
                 let mut node = rt.read_node()?;
                 let Node::Full(h) = &mut *node else {
-                    return Err(Error("ProducerOnly"));
+                    return Err(ErrorCode::ProducerOnly.into());
                 };
-                return h.submit(tx);
+                return h.admit(tx);
             }
             if path == "query/resolve" {
                 let r: VerifiedRequest =
-                    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))?;
+                    serde_json::from_slice(&bytes).map_err(|_| ErrorCode::InvalidRequest)?;
                 if r.cursor.is_some() {
-                    return Err(Error("CursorMismatch"));
+                    return Err(ErrorCode::CursorMismatch.into());
                 }
                 let node = rt.read_node()?;
                 let header = node.certificate(number(&r.height)?)?.header;
                 let request = resolve(node.identity(), &header, &r)?;
                 return Ok(json!({"request": pack(&request)}));
             }
-            Err(Error("InvalidRequest"))
+            Err(ErrorCode::InvalidRequest.into())
         })
         .await
-        .map_err(|_| Error("StorageUnavailable"))?
+        .map_err(|_| ErrorCode::StorageUnavailable)?
     }
     .await;
     drop(permit);
-    respond(&shared, result)
+    response(result)
 }
 
 /// `query/eq` on a full node, a detached read (see [`super::reads`]).
@@ -995,7 +956,7 @@ async fn eq_proof(
     body: Body,
     admission: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Json> {
-    let r: ProofRequest = parse(body, REQUEST_CAP).await?;
+    let r: ProofRequest = json_body(body, REQUEST_CAP).await?;
     let request: EqRequest = unpack(&r.request, 4096)?;
     let admitted = rt.reads.admit()?;
     drop(admission);
@@ -1004,9 +965,9 @@ async fn eq_proof(
             let state = {
                 let node = rt.read_node()?;
                 let Node::Full(h) = &*node else {
-                    return Err(Error("UnsupportedNodeRole"));
+                    return Err(ErrorCode::UnsupportedNodeRole.into());
                 };
-                h.proof_state(&request.snapshot, "CursorMismatch")?
+                h.proof_state(&request.snapshot, ErrorCode::CursorMismatch)?
             };
             Ok(json!({"proof":hex(&super::host::eq_proof_bytes(&state, &request)?)}))
         })
@@ -1022,14 +983,14 @@ async fn verified_account(
     let height = number(&request.height)?;
     let (genesis, header) = with_node(&rt, &permit, move |node| {
         let Node::Light { light, .. } = node else {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         };
         Ok((light.genesis.clone(), light.header(height)?.header))
     })
     .await?;
     let reply: Json = fetch(
         &rt.client,
-        rt.peer.as_deref().ok_or(Error("InvalidRequest"))?,
+        rt.peer.as_deref().ok_or(ErrorCode::InvalidRequest)?,
         &format!(
             "/signed/v1/accounts/{}/proof?height={height}",
             hex(actor.as_bytes())
@@ -1042,11 +1003,13 @@ async fn verified_account(
     let account_proof = unhex(
         reply["accountProof"]
             .as_str()
-            .ok_or(Error("InvalidProof"))?,
+            .ok_or(ErrorCode::InvalidProof)?,
         arkiv_db::proof::HOST_PROOF_CAP,
     )?;
     let supply_proof = unhex(
-        reply["supplyProof"].as_str().ok_or(Error("InvalidProof"))?,
+        reply["supplyProof"]
+            .as_str()
+            .ok_or(ErrorCode::InvalidProof)?,
         arkiv_db::proof::HOST_PROOF_CAP,
     )?;
     let (account, burned, initial) =
@@ -1056,7 +1019,7 @@ async fn verified_account(
         Ok(node.certificate(height)?.header)
     });
     if accepted.await? != header {
-        return Err(Error("ChainConflict"));
+        return Err(ErrorCode::ChainConflict.into());
     }
     Ok(json!({
         "actor": hex(actor.as_bytes()),
@@ -1081,7 +1044,7 @@ async fn verified(
     let selection = r.clone();
     let (mut request, identity, genesis, certificate) = with_node(&rt, &permit, move |node| {
         if !matches!(node, Node::Light { .. }) {
-            return Err(Error("UnsupportedNodeRole"));
+            return Err(ErrorCode::UnsupportedNodeRole.into());
         }
         let certificate = node.certificate(number(&selection.height)?)?;
         Ok((
@@ -1097,16 +1060,16 @@ async fn verified(
         let cache = rt
             .continuations
             .lock()
-            .map_err(|_| Error("StorageUnavailable"))?;
+            .map_err(|_| ErrorCode::StorageUnavailable)?;
         let (_, prior, token) = cache
             .iter()
             .find(|(c, _, _)| c == cursor)
-            .ok_or(Error("CursorMismatch"))?;
+            .ok_or(ErrorCode::CursorMismatch)?;
         if prior.snapshot != request.snapshot
             || prior.query != request.query
             || prior.limit != request.limit
         {
-            return Err(Error("CursorMismatch"));
+            return Err(ErrorCode::CursorMismatch.into());
         }
         request.continuation = Some(token.cursor().clone());
         Some(token.clone())
@@ -1115,7 +1078,7 @@ async fn verified(
     };
     let reply: Json = fetch(
         &rt.client,
-        rt.peer.as_deref().ok_or(Error("InvalidRequest"))?,
+        rt.peer.as_deref().ok_or(ErrorCode::InvalidRequest)?,
         "/signed/v1/query/eq",
         Some(json!({"request":pack(&request)})),
         None,
@@ -1123,7 +1086,7 @@ async fn verified(
     )
     .await?;
     let bytes = unhex(
-        reply["proof"].as_str().ok_or(Error("InvalidRequest"))?,
+        reply["proof"].as_str().ok_or(ErrorCode::InvalidRequest)?,
         if inspect {
             crate::simulator::inspection::INSPECT_PROOF_CAP
         } else {
@@ -1137,10 +1100,10 @@ async fn verified(
         let verified =
             super::light::verify_eq_at(&genesis, &header, &request, previous.as_ref(), &bytes)?;
         if rt.read_node()?.certificate(header.height)?.header != header {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let VerifiedEq::Page(page) = verified else {
-            return Err(Error("NamespaceNotFound"));
+            return Err(ErrorCode::NamespaceNotFound.into());
         };
         let rows = page
             .rows
@@ -1151,29 +1114,7 @@ async fn verified(
         let entities = if request.query.namespace.ordinal() == 1 {
             page.rows
                 .iter()
-                .map(|row| {
-                    let p = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
-                    if p.created_at > header.height
-                        || p.updated_at > header.height
-                        || (p.expires_at != u64::MAX && p.expires_at <= header.height)
-                    {
-                        return Err(Error("InvalidProof"));
-                    }
-                    Ok(json!({
-                        "key": hex(&p.key),
-                        "owner": hex(&p.owner),
-                        "creator": hex(&p.creator),
-                        "creationFlags": {
-                            "raw": p.creation_flags,
-                            "readonly": p.creation_flags & 1 != 0,
-                            "permissionlessExtension": p.creation_flags & 2 != 0,
-                        },
-                        "createdAt": p.created_at.to_string(),
-                        "updatedAt": p.updated_at.to_string(),
-                        "expiresAt": p.expires_at.to_string(),
-                        "attributes": super::rpc_reads::verified_attributes(&p)?,
-                    }))
-                })
+                .map(|row| crate::entity_json::verified(row, header.height))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -1185,7 +1126,7 @@ async fn verified(
             let mut cache = rt
                 .continuations
                 .lock()
-                .map_err(|_| Error("StorageUnavailable"))?;
+                .map_err(|_| ErrorCode::StorageUnavailable)?;
             if cache.len() >= 64 {
                 cache.pop_front();
             }
@@ -1229,7 +1170,7 @@ async fn verified(
         Ok(result)
     })
     .await
-    .map_err(|_| Error("StorageUnavailable"))?
+    .map_err(|_| ErrorCode::StorageUnavailable)?
 }
 
 fn authorized(rt: &Runtime, headers: &HeaderMap) -> bool {
@@ -1245,16 +1186,13 @@ async fn private(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !authorized(&rt, &headers) {
-        return response(Err(Error("Unauthorized")));
-    }
-    let permit = match rt.slots.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return response(Err(Error("ServerBusy"))),
-    };
     let result = async {
+        if !authorized(&rt, &headers) {
+            return Err(ErrorCode::Unauthorized.into());
+        }
+        let permit = admit(&rt.slots)?;
         let control: Option<Control> = if path == "control" {
-            Some(parse(body, REQUEST_CAP).await?)
+            Some(json_body(body, REQUEST_CAP).await?)
         } else {
             None
         };
@@ -1262,7 +1200,7 @@ async fn private(
             let _permit = permit;
             let mut node = rt.read_node()?;
             let Node::Full(h) = &mut *node else {
-                return Err(Error("UnsupportedNodeRole"));
+                return Err(ErrorCode::UnsupportedNodeRole.into());
             };
             if let Some(height) = path.strip_prefix("replication/blocks/") {
                 return Ok(json!({"blockBytes":pack(&h.block(number(height)?)?)}));
@@ -1274,24 +1212,28 @@ async fn private(
                     }
                     Some("pause" | "resume") => {
                         if !h.is_producer() {
-                            return Err(Error("ProducerOnly"));
+                            return Err(ErrorCode::ProducerOnly.into());
                         }
                         h.paused = control.as_ref().is_some_and(|c| c.action == "pause");
-                        if !matches!(h.health, "storage-fenced" | "chain-conflict") {
-                            h.health = if h.paused { "paused" } else { "running" };
+                        if !matches!(h.health, Health::StorageFenced | Health::ChainConflict) {
+                            h.health = if h.paused {
+                                Health::Paused
+                            } else {
+                                Health::Running
+                            };
                         }
                     }
                     Some("retry") => {
                         h.retry_pending()?;
                     }
-                    _ => return Err(Error("InvalidRequest")),
+                    _ => return Err(ErrorCode::InvalidRequest.into()),
                 }
                 return Ok(status(&node));
             }
-            Err(Error("InvalidRequest"))
+            Err(ErrorCode::InvalidRequest.into())
         })
         .await
-        .map_err(|_| Error("StorageUnavailable"))?
+        .map_err(|_| ErrorCode::StorageUnavailable)?
     }
     .await;
     response(result)
@@ -1333,16 +1275,19 @@ pub async fn fetch<T: serde::de::DeserializeOwned>(
     tokio::time::timeout(Duration::from_secs(5), async {
         for attempt in 0..10 {
             match fetch_once(client, peer, path, None, token, cap).await {
-                Err(Error("ServerBusy")) if attempt < 9 => {
+                Err(Error {
+                    code: ErrorCode::ServerBusy,
+                    ..
+                }) if attempt < 9 => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 result => return result,
             }
         }
-        Err(Error("ServerBusy"))
+        Err(ErrorCode::ServerBusy.into())
     })
     .await
-    .map_err(|_| Error("StorageUnavailable"))?
+    .map_err(|_| ErrorCode::StorageUnavailable)?
 }
 
 async fn fetch_once<T: serde::de::DeserializeOwned>(
@@ -1365,37 +1310,32 @@ async fn fetch_once<T: serde::de::DeserializeOwned>(
     } else {
         request
     };
-    let mut response = request
-        .send()
-        .await
-        .map_err(|_| Error("StorageUnavailable"))?;
+    let unreachable = |error: reqwest::Error| ErrorCode::StorageUnavailable.caused_by(error);
+    let mut response = request.send().await.map_err(unreachable)?;
     let status = response.status();
     let success = status.is_success();
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| Error("StorageUnavailable"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
         if chunk.len() > cap.saturating_sub(bytes.len()) {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         bytes.extend_from_slice(&chunk);
     }
     if !success {
         let value: Json =
-            serde_json::from_slice(&bytes).map_err(|_| Error("StorageUnavailable"))?;
-        return Err(Error(match value["error"].as_str() {
-            Some("ChainConflict") => "ChainConflict",
-            Some("ProofLimitExceeded") => "ProofLimitExceeded",
-            Some("BudgetExceeded") => "BudgetExceeded",
-            Some("CursorMismatch") => "CursorMismatch",
-            Some("HistoryPruned") if status == StatusCode::GONE => "HistoryPruned",
-            Some("ServerBusy") if status == StatusCode::TOO_MANY_REQUESTS => "ServerBusy",
-            _ => "PeerUnavailable",
-        }));
+            serde_json::from_slice(&bytes).map_err(|_| ErrorCode::StorageUnavailable)?;
+        use ErrorCode::*;
+        return Err(match value["error"].as_str().and_then(ErrorCode::parse) {
+            Some(code @ (ChainConflict | ProofLimitExceeded | BudgetExceeded | CursorMismatch)) => {
+                code
+            }
+            Some(HistoryPruned) if status == StatusCode::GONE => HistoryPruned,
+            Some(ServerBusy) if status == StatusCode::TOO_MANY_REQUESTS => ServerBusy,
+            _ => PeerUnavailable,
+        }
+        .into());
     }
-    serde_json::from_slice(&bytes).map_err(|_| Error("InvalidRequest"))
+    serde_json::from_slice(&bytes).map_err(|_| Error::from(ErrorCode::InvalidRequest))
 }
 
 /// One follower poll. Its lock sections are writes ([`Runtime::write_node`]):
@@ -1410,7 +1350,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
         ))
     })
     .await?;
-    let peer = rt.peer.as_deref().ok_or(Error("InvalidRequest"))?;
+    let peer = rt.peer.as_deref().ok_or(ErrorCode::InvalidRequest)?;
     let response: Headers = fetch(
         &rt.client,
         peer,
@@ -1428,7 +1368,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
     if response.identity != identity
         || response.certificates.len() > if is_light { HEADER_BATCH } else { 1 }
     {
-        return Err(Error("IdentityMismatch"));
+        return Err(ErrorCode::IdentityMismatch.into());
     }
     let sampled: SignedHeader = unpack(&response.sampled, 512)?;
     sampled.authenticate(&genesis)?;
@@ -1443,7 +1383,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
     if is_light {
         return writing(&rt, move |node| {
             let Node::Light { light, .. } = node else {
-                return Err(Error("InvalidRequest"));
+                return Err(ErrorCode::InvalidRequest.into());
             };
             light.append(&headers, &sampled)
         })
@@ -1467,7 +1407,7 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
             &rt.client,
             rt.replication_peer
                 .as_deref()
-                .ok_or(Error("InvalidRequest"))?,
+                .ok_or(ErrorCode::InvalidRequest)?,
             &format!(
                 "/signed/v1/replication/blocks/{}",
                 certificate.header.height
@@ -1480,16 +1420,16 @@ pub async fn sync_once(rt: Shared) -> Result<()> {
         let block: SignedBlock = unpack(
             reply["blockBytes"]
                 .as_str()
-                .ok_or(Error("InvalidRequest"))?,
+                .ok_or(ErrorCode::InvalidRequest)?,
             super::protocol::BODY_CAP as usize,
         )?;
         writing(&rt, move |node| {
             let Node::Full(host) = node else {
-                return Err(Error("InvalidRequest"));
+                return Err(ErrorCode::InvalidRequest.into());
             };
             host.observe_pair(&certificate, &block.header)?;
             if block.header.header != certificate.header {
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
             host.import(block)
         })
@@ -1540,7 +1480,7 @@ mod fetch_retry_tests {
             1024,
         )
         .await;
-        assert_eq!(result, Err(Error("ServerBusy")));
+        assert_eq!(result, Err(ErrorCode::ServerBusy.into()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         task.abort();
     }

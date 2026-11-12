@@ -4,14 +4,12 @@
 use std::{collections::BTreeSet, path::Path};
 
 use arkiv_db_redb::{
-    RedbConfig, RedbStore, initialization_path,
+    RedbStore, initialization_path,
     testing::{CrashDisk, CrashMode, Granularity},
 };
 use arkiv_db_storage::versioned::{StorageErrorKind, VersionedStore};
 
-pub fn config() -> RedbConfig {
-    RedbConfig::with_cache_size(64 << 10)
-}
+use super::small_cache_config;
 
 fn modes() -> Vec<CrashMode> {
     let mut modes = vec![CrashMode::DurableOnly, CrashMode::AllUnsynced];
@@ -44,7 +42,8 @@ pub fn creation_images() -> CreationImages {
     let disk = CrashDisk::new();
     let complete = {
         let open = disk.clone();
-        let store = RedbStore::with_backend(move || Ok(open.backend()), config()).unwrap();
+        let store =
+            RedbStore::with_backend(move || Ok(open.backend()), small_cache_config()).unwrap();
         disk.crash(store, CrashMode::DurableOnly)
     };
     let calls = disk.counters().mutating_calls;
@@ -55,7 +54,7 @@ pub fn creation_images() -> CreationImages {
         let disk = CrashDisk::new();
         disk.crash_after(k);
         let open = disk.clone();
-        let created = RedbStore::with_backend(move || Ok(open.backend()), config());
+        let created = RedbStore::with_backend(move || Ok(open.backend()), small_cache_config());
         assert_eq!(created.is_ok(), k == calls, "crash point {k} of {calls}");
         disk.cut_off();
         drop(created);
@@ -86,7 +85,7 @@ pub fn reopen_in_place(images: &BTreeSet<Vec<u8>>) -> InPlace {
     let mut counts = InPlace::default();
     for image in images {
         let disk = CrashDisk::from_image(image.clone());
-        match RedbStore::with_backend(move || Ok(disk.backend()), config()) {
+        match RedbStore::with_backend(move || Ok(disk.backend()), small_cache_config()) {
             Ok(store) if store.last_open().initialized => counts.initialized += 1,
             Ok(_) => counts.opened += 1,
             Err(error) => {
@@ -113,7 +112,7 @@ pub fn create_over_leftovers(dir: &Path, images: &BTreeSet<Vec<u8>>) -> usize {
             std::fs::write(&path, b"").unwrap();
         }
 
-        let store = RedbStore::create(&path, config())
+        let store = RedbStore::create(&path, small_cache_config())
             .unwrap_or_else(|error| panic!("image {index} ({} bytes): {error}", image.len()));
         assert!(store.last_open().initialized);
         assert_eq!(store.head().unwrap(), None);
@@ -121,7 +120,7 @@ pub fn create_over_leftovers(dir: &Path, images: &BTreeSet<Vec<u8>>) -> usize {
         let id = store.database_id();
         drop(store);
 
-        let reopened = RedbStore::open(&path, config()).unwrap();
+        let reopened = RedbStore::open(&path, small_cache_config()).unwrap();
         assert_eq!(reopened.database_id(), id);
         assert!(!reopened.last_open().initialized);
         drop(reopened);

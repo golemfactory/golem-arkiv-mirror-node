@@ -221,7 +221,7 @@ from the tests, on 2026-09-23:
   page counts are identical to those of the first run (20:09 UTC) that this
   document reported before review; timings differ slightly;
 - tests: `cargo test -p arkiv-db-redb --offline` (debug profile), heavy
-  variants `cargo test --release -p arkiv-db-redb --test atomicity -- --ignored`
+  variants `cargo test --release -p arkiv-db-redb --test it atomicity:: -- --ignored`
   (3 tests, passed in 785 s);
 - machine: 13th Gen Intel Core i9-13900 (32 hardware threads), 62 GiB RAM,
   Linux 7.0.0-31-generic, files on ext4 over an NVMe RAID1 array
@@ -583,7 +583,7 @@ claim.
 ```sh
 cargo fetch
 cargo test -p arkiv-db-redb --offline
-cargo test --release -p arkiv-db-redb --offline --test atomicity -- --ignored
+cargo test --release -p arkiv-db-redb --offline --test it atomicity:: -- --ignored
 cargo run --release -p arkiv-db-redb --offline --example redb_experiment
 cargo run --release -p arkiv-db-redb --offline --example redb_experiment -- --quick
 cargo +1.90.0 check --workspace --all-targets --offline

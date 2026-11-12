@@ -1,27 +1,24 @@
+mod signed_support;
+
 use alloy_primitives::U256;
 use arkiv_db::{
     Budget, CellName, OwnerId, Projection, SnapshotId, Value, decode_exact, durable::Options,
-    encode,
 };
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::{
-    Expiry, OpOutcome, TxEnvelope, TxOp, TxStatus,
+    Expiry, OpOutcome, TxOp, TxStatus,
     accounts::{self, AccountConfig, AccountFault},
     arkiv::{self, ArkivOperation},
     gas,
     signed::{
-        crypto::Signer,
         history::History,
-        host::Host,
+        host::{Host, Prefill},
         light::{Light, verify_account},
         protocol::*,
     },
 };
+use signed_support::{launch, sign_tx, signer};
 use std::sync::Arc;
-
-fn signer(n: u8) -> Signer {
-    Signer::from_bytes([n; 32]).unwrap()
-}
 
 fn glm(n: u64) -> U256 {
     U256::from(n) * U256::from(1_000_000_000_000_000_000u64)
@@ -48,17 +45,8 @@ fn create_host(
     state: Arc<MemoryVersionedStore>,
     history: Arc<MemoryVersionedStore>,
 ) -> Host {
-    let cert = SignedHeader::sign(g, g.header(), &signer(1)).unwrap();
-    Host::create(
-        state,
-        History::create(history, g.hash()).unwrap(),
-        g.clone(),
-        [3; 16],
-        cert,
-        p.then(|| signer(1)),
-        Options::default(),
-    )
-    .unwrap()
+    let launch = launch(g, signer(1), [3; 16], history, p);
+    Host::create(state, Options::default(), launch, Prefill::None).unwrap()
 }
 
 fn host(g: &SignedGenesis, p: bool) -> Host {
@@ -73,19 +61,7 @@ fn host(g: &SignedGenesis, p: bool) -> Host {
 fn tx(g: &SignedGenesis, who: u8, nonce: u64, budget: u64, ops: Vec<TxOp>) -> SignedTx {
     let mut request = [who; 32];
     request[24..].copy_from_slice(&nonce.to_be_bytes());
-    SignedTx::sign(
-        g,
-        nonce,
-        TxEnvelope {
-            chain_id: g.genesis.chain_id,
-            actor: signer(who).address(),
-            request_id: request,
-            tx_budget: budget,
-            ops,
-        },
-        &signer(who),
-    )
-    .unwrap()
+    sign_tx(g, &signer(who), nonce, request, budget, ops)
 }
 
 fn transfer(who: u8, amount: U256) -> TxOp {
@@ -239,7 +215,8 @@ fn insufficient_funds_pending_reservation_and_exact_zero_balance() {
     assert_eq!(
         p.submit(tx(&g, 3, 0, 21_000, vec![transfer(2, U256::ZERO)]))
             .unwrap_err()
-            .0,
+            .code
+            .as_str(),
         "InsufficientBalance"
     );
     assert_eq!(p.head, head);
@@ -250,7 +227,8 @@ fn insufficient_funds_pending_reservation_and_exact_zero_balance() {
     assert_eq!(
         p.submit(tx(&g, 2, 1, 21_000, vec![transfer(3, glm(1))]))
             .unwrap_err()
-            .0,
+            .code
+            .as_str(),
         "InsufficientBalance"
     );
     // Gap transactions also reserve fees and outgoing value.
@@ -387,17 +365,20 @@ fn failed_operations_rollback_value_and_entities_but_pay_and_consume_nonce() {
 #[test]
 fn genesis_and_signature_commit_accounts() {
     let g = genesis();
-    let bytes = encode(&g);
-    assert_eq!(&bytes[..4], &VERSION.to_be_bytes());
-    assert_eq!(decode_exact::<SignedGenesis>(&bytes).unwrap(), g);
     let signed = tx(&g, 2, 0, 21_000, vec![transfer(3, U256::from(1))]);
     let mut changed = g.clone();
     changed.accounts.allocations[0].1 += U256::from(1);
     assert_ne!(changed.hash(), g.hash());
-    assert_eq!(signed.validate(&changed).unwrap_err().0, "IdentityMismatch");
+    assert_eq!(
+        signed.validate(&changed).unwrap_err().code.as_str(),
+        "IdentityMismatch"
+    );
     let mut signed = signed;
     signed.tx.ops = vec![transfer(3, U256::from(2))];
-    assert_eq!(signed.validate(&g).unwrap_err().0, "InvalidSignature");
+    assert_eq!(
+        signed.validate(&g).unwrap_err().code.as_str(),
+        "InvalidSignature"
+    );
     assert!(
         AccountConfig::new(vec![
             (signer(2).address(), U256::MAX),
@@ -417,7 +398,10 @@ fn genesis_and_signature_commit_accounts() {
     assert!(bad.validate().is_err());
     let mut bad = g;
     bad.accounts = AccountConfig::new(vec![(signer(2).address(), glm(1))]).unwrap();
-    assert_eq!(bad.validate().unwrap_err().0, "UnfundedBootstrap");
+    assert_eq!(
+        bad.validate().unwrap_err().code.as_str(),
+        "UnfundedBootstrap"
+    );
 }
 
 #[test]
@@ -528,17 +512,8 @@ fn publication_retry_and_lost_ack_charge_fee_once() {
         let g = genesis();
         let state = Arc::new(FaultyStore::latching(MemoryVersionedStore::new()));
         let hs = Arc::new(MemoryVersionedStore::new());
-        let cert = SignedHeader::sign(&g, g.header(), &signer(1)).unwrap();
-        let mut p = Host::create(
-            state.clone(),
-            History::create(hs.clone(), g.hash()).unwrap(),
-            g.clone(),
-            [3; 16],
-            cert,
-            Some(signer(1)),
-            Options::default(),
-        )
-        .unwrap();
+        let launch = launch(&g, signer(1), [3; 16], hs.clone(), true);
+        let mut p = Host::create(state.clone(), Options::default(), launch, Prefill::None).unwrap();
         p.produce().unwrap();
         let signed = tx(&g, 2, 0, 100_000, vec![transfer(3, glm(1))]);
         p.submit(signed.clone()).unwrap();
@@ -674,16 +649,5 @@ fn named_namespace_charges_fees_replays_and_rolls_back_on_low_budget() {
     assert_eq!(
         p.engine.head_snapshot().try_record_count(ns).unwrap(),
         Some(0)
-    );
-    // This does not admit generic data writes without Arkiv storage rent.
-    let mut envelope = tx(&g, 2, 2, 1_000_000, vec![create_namespace()]).tx;
-    envelope.ops = vec![TxOp::Put {
-        namespace: ns,
-        key: b"brick".to_vec(),
-        value: b"red".to_vec(),
-    }];
-    assert_eq!(
-        SignedTx::sign(&g, 2, envelope, &signer(2)).unwrap_err().0,
-        "UnsupportedGasOperation"
     );
 }

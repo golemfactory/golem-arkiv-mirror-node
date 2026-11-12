@@ -552,6 +552,21 @@ pub(crate) struct NamespaceState {
     pub(crate) typed: TypedState,
 }
 
+impl NamespaceState {
+    /// The record allocator and the root and size of each map, as the
+    /// catalog leaf records them.
+    pub(crate) fn roots(&self) -> crate::state::NamespaceRoots {
+        let typed = &self.typed;
+        crate::state::NamespaceRoots {
+            next_record: typed.next_record,
+            records: (self.records.root_hash(), self.records.len()),
+            keys: (typed.keys.root_hash(), typed.keys.len()),
+            rows: (typed.rows.root_hash(), typed.rows.len()),
+            terms: (typed.terms.root_hash(), typed.terms.len()),
+        }
+    }
+}
+
 /// `descriptor ‖ next_record u64 ‖ records ‖ keys ‖ rows ‖ terms`, each map
 /// as `root ‖ len u64`.
 impl TrieValue for NamespaceState {

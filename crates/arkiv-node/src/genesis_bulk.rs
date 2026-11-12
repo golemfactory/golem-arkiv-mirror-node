@@ -5,10 +5,9 @@ use crate::{
     accounts, arkiv,
     genesis_bundle::PrefillLimits,
     genesis_streaming::{
-        Progress, StreamReader, StreamSummary, audit_file, check_disk, import_identity,
+        PrefillImport, Progress, StreamReader, StreamSummary, audit_file, check_disk,
         import_redb_config, validate_limits,
     },
-    signed::protocol::SignedGenesis,
 };
 use alloy_primitives::U256;
 use arkiv_db::{
@@ -25,16 +24,18 @@ use std::{
     sync::Arc,
 };
 
-type Result<T> = std::result::Result<T, String>;
+use crate::{fsutil, genesis_error::GenesisToolError};
+
+type Result<T> = std::result::Result<T, GenesisToolError>;
 const SORT_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const DISK_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 
-fn err(e: impl std::fmt::Display) -> String {
-    format!("bulk prefill: {e}")
+fn err(e: impl std::fmt::Display) -> GenesisToolError {
+    format!("bulk prefill: {e}").into()
 }
 
-fn debug_err(e: impl std::fmt::Debug) -> String {
-    format!("bulk prefill: {e:?}")
+fn debug_err(e: impl std::fmt::Debug) -> GenesisToolError {
+    format!("bulk prefill: {e:?}").into()
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -48,22 +49,6 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
         return Err("bulk metadata grew beyond size cap".into());
     }
     Ok(bytes)
-}
-
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(err)?;
-    file.write_all(bytes).map_err(err)?;
-    file.sync_all().map_err(err)
-}
-
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(err)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -118,22 +103,22 @@ fn open_complete(
     Ok((engine, burn, complete.units))
 }
 
-/// `permanent` selects the permanent-prefill contract (launch version 4): a row
-/// whose expiry is `u64::MAX` is created permanent, is not scheduled for expiry
-/// (no due/total counts, so the per-height capacity does not apply) and adds
-/// storage units but no rent. Finite rows are unaffected by the policy.
-#[allow(clippy::too_many_arguments)]
+/// Builds the state of `import` from its stream `file` in private scratch
+/// under `work_dir`: the engine, the rent burned and the storage units.
 pub(crate) fn build_file(
-    base: &SignedGenesis,
-    limits: PrefillLimits,
-    sponsor: [u8; 20],
+    import: PrefillImport<'_>,
     file: &mut File,
     work_dir: &Path,
     options: Options,
     ingestion_bytes: usize,
-    summary: &StreamSummary,
-    permanent: bool,
 ) -> Result<(DurableEngine, U256, u64)> {
+    let PrefillImport {
+        base,
+        limits,
+        sponsor,
+        summary,
+        permanent,
+    } = import;
     if ingestion_bytes == 0 || ingestion_bytes > 4 * 1024 * 1024 {
         return Err("batch bytes must be 1..=4194304".into());
     }
@@ -142,7 +127,7 @@ pub(crate) fn build_file(
     if base.genesis.pricing != crate::gas::schedule() {
         return Err("streaming prefill requires GLM pricing".into());
     }
-    let identity = import_identity(base, limits, sponsor, summary, permanent);
+    let identity = import.identity();
     let mut genesis = EngineGenesis::new(identity.0, base.genesis.pricing.clone());
     genesis.limits = base.genesis.limits;
     genesis.validate().map_err(err)?;
@@ -171,9 +156,9 @@ pub(crate) fn build_file(
         if next.exists() {
             fs::remove_file(&next).map_err(err)?;
         }
-        write_new(&next, identity.as_slice())?;
+        fsutil::write_new(&next, identity.as_slice()).map_err(err)?;
         fs::rename(next, &identity_path).map_err(err)?;
-        sync_dir(&bulk)?;
+        fsutil::sync_dir(&bulk).map_err(err)?;
     }
     let ready = bulk.join("complete");
     let pending = bulk.join("pending");
@@ -189,7 +174,7 @@ pub(crate) fn build_file(
         fs::remove_dir_all(&pending).map_err(err)?;
     }
     fs::create_dir(&pending).map_err(err)?;
-    sync_dir(&bulk)?;
+    fsutil::sync_dir(&bulk).map_err(err)?;
     let scratch = pending.join("sort");
     let mut builder = BulkGenesisBuilder::new(
         &scratch,
@@ -205,7 +190,7 @@ pub(crate) fn build_file(
     .map_err(err)?;
     let disk_path = pending.clone();
     builder.set_disk_check(Box::new(move || {
-        check_disk(&disk_path, DISK_CHECK_INTERVAL)
+        check_disk(&disk_path, DISK_CHECK_INTERVAL).map_err(|e| e.to_string())
     }));
     builder.set_progress(|phase, count| {
         let record =
@@ -356,8 +341,8 @@ pub(crate) fn build_file(
     // The complete directory is the atomic selection point. No stage has a
     // durable chain-visible head, and an unselected stage is safe to discard.
     fs::remove_dir_all(&scratch).map_err(err)?;
-    write_new(&pending.join("genesis.bin"), &encode(&genesis))?;
-    write_new(
+    fsutil::write_new(&pending.join("genesis.bin"), &encode(&genesis)).map_err(err)?;
+    fsutil::write_new(
         &pending.join("complete.json"),
         &serde_json::to_vec(&Complete {
             version: 1,
@@ -368,9 +353,10 @@ pub(crate) fn build_file(
             checksum: receipt_hash(&genesis, summary.rows, units, burn),
         })
         .map_err(err)?,
-    )?;
-    sync_dir(&pending)?;
+    )
+    .map_err(err)?;
+    fsutil::sync_dir(&pending).map_err(err)?;
     fs::rename(&pending, &ready).map_err(err)?;
-    sync_dir(&bulk)?;
+    fsutil::sync_dir(&bulk).map_err(err)?;
     open_complete(&ready, &genesis, summary, limits, balance, options)
 }

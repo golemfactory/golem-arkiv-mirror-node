@@ -62,10 +62,6 @@ pub const CODEC_VERSION: u32 = 1;
 // Enum tags. Every table is documented in docs/block-format.md; a tag is
 // never reused and never derived from a Rust discriminant.
 
-// CellKind.
-const KIND_ATTRIBUTE: u8 = 1;
-const KIND_FIELD: u8 = 2;
-
 // WriteOp.
 const OP_CREATE_NAMESPACE: u8 = 1;
 const OP_TRANSFER_NAMESPACE: u8 = 2;
@@ -84,29 +80,6 @@ const EFFECT_RECORD_CREATED: u8 = 5;
 const EFFECT_RECORD_PATCHED: u8 = 6;
 const EFFECT_RECORD_DELETED: u8 = 7;
 const EFFECT_BALANCE_TRANSFERRED: u8 = 8;
-
-// ArgumentFault.
-const ARGUMENT_KEY_TOO_LONG: u8 = 1;
-const ARGUMENT_TOO_MANY_CELLS: u8 = 2;
-const ARGUMENT_DUPLICATE_CELL: u8 = 3;
-const ARGUMENT_SET_AND_REMOVE_OVERLAP: u8 = 4;
-const ARGUMENT_VALUE_TOO_LARGE: u8 = 5;
-const ARGUMENT_BYTES_NOT_INDEXABLE: u8 = 6;
-const ARGUMENT_NOT_HOST_OPERATION: u8 = 7;
-const ARGUMENT_NAME_TOO_LONG: u8 = 8;
-
-// QueryFault.
-const QUERY_NO_GROUPS: u8 = 1;
-const QUERY_TOO_MANY_GROUPS: u8 = 2;
-const QUERY_TOO_MANY_LITERALS: u8 = 3;
-const QUERY_ZERO_LIMIT: u8 = 4;
-const QUERY_LIMIT_TOO_LARGE: u8 = 5;
-const QUERY_NOT_INDEXABLE: u8 = 6;
-const QUERY_VALUE_TOO_LARGE: u8 = 7;
-const QUERY_UNBOUNDED_RANGE: u8 = 8;
-const QUERY_MIXED_BOUNDS: u8 = 9;
-const QUERY_NOT_ORDERED: u8 = 10;
-const QUERY_PROJECTION_TOO_LARGE: u8 = 11;
 
 // Rejection.
 const REJECT_UNKNOWN_NAMESPACE: u8 = 1;
@@ -127,10 +100,6 @@ const REJECT_CURSOR_MISMATCH: u8 = 14;
 // Outcome.
 const OUTCOME_APPLIED: u8 = 1;
 const OUTCOME_REJECTED: u8 = 2;
-
-// ReceiptKind.
-const RECEIPT_WRITE: u8 = 1;
-const RECEIPT_READ: u8 = 2;
 
 /// Why bytes are not a canonical encoding. Decoding stops at the first
 /// violation and returns no partial value.
@@ -496,70 +465,51 @@ pub fn digest(domain: &str, bytes: &[u8]) -> B256 {
     hasher.finalize()
 }
 
-impl Encode for u8 {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u8(*self);
-    }
+/// The fixed-width primitives, each with its encoded length.
+macro_rules! primitive_codec {
+    ($($ty:ident: $len:literal),* $(,)?) => {$(
+        impl Encode for $ty {
+            fn encode_to(&self, encoder: &mut Encoder) {
+                encoder.$ty(*self);
+            }
+        }
+
+        impl Decode for $ty {
+            const MIN_ENCODED_LEN: usize = $len;
+
+            fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+                decoder.$ty()
+            }
+        }
+    )*};
 }
 
-impl Decode for u8 {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decoder.u8()
-    }
-}
+primitive_codec!(u8: 1, u32: 4, u64: 8, i64: 8, bool: 1);
 
-impl Encode for u32 {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u32(*self);
-    }
-}
+/// An enum without fields is one tag byte. Each variant's tag is written
+/// once, so encoding and decoding cannot disagree.
+macro_rules! tag_codec {
+    ($ty:ident { $($variant:ident = $tag:literal),* $(,)? }) => {
+        impl Encode for $ty {
+            fn encode_to(&self, encoder: &mut Encoder) {
+                encoder.u8(match self {
+                    $(Self::$variant => $tag,)*
+                });
+            }
+        }
 
-impl Decode for u32 {
-    const MIN_ENCODED_LEN: usize = 4;
-
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decoder.u32()
-    }
-}
-
-impl Encode for u64 {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u64(*self);
-    }
-}
-
-impl Decode for u64 {
-    const MIN_ENCODED_LEN: usize = 8;
-
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decoder.u64()
-    }
-}
-
-impl Encode for i64 {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.i64(*self);
-    }
-}
-
-impl Decode for i64 {
-    const MIN_ENCODED_LEN: usize = 8;
-
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decoder.i64()
-    }
-}
-
-impl Encode for bool {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.bool(*self);
-    }
-}
-
-impl Decode for bool {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        decoder.bool()
-    }
+        impl Decode for $ty {
+            fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+                match decoder.u8()? {
+                    $($tag => Ok(Self::$variant),)*
+                    tag => Err(DecodeError::UnknownTag {
+                        kind: stringify!($ty),
+                        tag,
+                    }),
+                }
+            }
+        }
+    };
 }
 
 /// Raw bytes, no length: fixed-width identifiers such as 32-byte request ids.
@@ -884,28 +834,10 @@ impl Decode for Value {
     }
 }
 
-/// One byte: attribute 1, field 2.
-impl Encode for CellKind {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::Attribute => KIND_ATTRIBUTE,
-            Self::Field => KIND_FIELD,
-        });
-    }
-}
-
-impl Decode for CellKind {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        match decoder.u8()? {
-            KIND_ATTRIBUTE => Ok(Self::Attribute),
-            KIND_FIELD => Ok(Self::Field),
-            tag => Err(DecodeError::UnknownTag {
-                kind: "CellKind",
-                tag,
-            }),
-        }
-    }
-}
+tag_codec!(CellKind {
+    Attribute = 1,
+    Field = 2,
+});
 
 /// `kind ‖ value`.
 impl Encode for Cell {
@@ -1116,81 +1048,30 @@ impl Decode for Effect {
     }
 }
 
-/// One tag byte.
-impl Encode for ArgumentFault {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::KeyTooLong => ARGUMENT_KEY_TOO_LONG,
-            Self::TooManyCells => ARGUMENT_TOO_MANY_CELLS,
-            Self::DuplicateCell => ARGUMENT_DUPLICATE_CELL,
-            Self::SetAndRemoveOverlap => ARGUMENT_SET_AND_REMOVE_OVERLAP,
-            Self::ValueTooLarge => ARGUMENT_VALUE_TOO_LARGE,
-            Self::BytesNotIndexable => ARGUMENT_BYTES_NOT_INDEXABLE,
-            Self::NotHostOperation => ARGUMENT_NOT_HOST_OPERATION,
-            Self::NameTooLong => ARGUMENT_NAME_TOO_LONG,
-        });
-    }
-}
+tag_codec!(ArgumentFault {
+    KeyTooLong = 1,
+    TooManyCells = 2,
+    DuplicateCell = 3,
+    SetAndRemoveOverlap = 4,
+    ValueTooLarge = 5,
+    BytesNotIndexable = 6,
+    NotHostOperation = 7,
+    NameTooLong = 8,
+});
 
-impl Decode for ArgumentFault {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        match decoder.u8()? {
-            ARGUMENT_KEY_TOO_LONG => Ok(Self::KeyTooLong),
-            ARGUMENT_TOO_MANY_CELLS => Ok(Self::TooManyCells),
-            ARGUMENT_DUPLICATE_CELL => Ok(Self::DuplicateCell),
-            ARGUMENT_SET_AND_REMOVE_OVERLAP => Ok(Self::SetAndRemoveOverlap),
-            ARGUMENT_VALUE_TOO_LARGE => Ok(Self::ValueTooLarge),
-            ARGUMENT_BYTES_NOT_INDEXABLE => Ok(Self::BytesNotIndexable),
-            ARGUMENT_NOT_HOST_OPERATION => Ok(Self::NotHostOperation),
-            ARGUMENT_NAME_TOO_LONG => Ok(Self::NameTooLong),
-            tag => Err(DecodeError::UnknownTag {
-                kind: "ArgumentFault",
-                tag,
-            }),
-        }
-    }
-}
-
-/// One tag byte.
-impl Encode for QueryFault {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::NoGroups => QUERY_NO_GROUPS,
-            Self::TooManyGroups => QUERY_TOO_MANY_GROUPS,
-            Self::TooManyLiterals => QUERY_TOO_MANY_LITERALS,
-            Self::ZeroLimit => QUERY_ZERO_LIMIT,
-            Self::LimitTooLarge => QUERY_LIMIT_TOO_LARGE,
-            Self::NotIndexable => QUERY_NOT_INDEXABLE,
-            Self::ValueTooLarge => QUERY_VALUE_TOO_LARGE,
-            Self::UnboundedRange => QUERY_UNBOUNDED_RANGE,
-            Self::MixedBounds => QUERY_MIXED_BOUNDS,
-            Self::NotOrdered => QUERY_NOT_ORDERED,
-            Self::ProjectionTooLarge => QUERY_PROJECTION_TOO_LARGE,
-        });
-    }
-}
-
-impl Decode for QueryFault {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        match decoder.u8()? {
-            QUERY_NO_GROUPS => Ok(Self::NoGroups),
-            QUERY_TOO_MANY_GROUPS => Ok(Self::TooManyGroups),
-            QUERY_TOO_MANY_LITERALS => Ok(Self::TooManyLiterals),
-            QUERY_ZERO_LIMIT => Ok(Self::ZeroLimit),
-            QUERY_LIMIT_TOO_LARGE => Ok(Self::LimitTooLarge),
-            QUERY_NOT_INDEXABLE => Ok(Self::NotIndexable),
-            QUERY_VALUE_TOO_LARGE => Ok(Self::ValueTooLarge),
-            QUERY_UNBOUNDED_RANGE => Ok(Self::UnboundedRange),
-            QUERY_MIXED_BOUNDS => Ok(Self::MixedBounds),
-            QUERY_NOT_ORDERED => Ok(Self::NotOrdered),
-            QUERY_PROJECTION_TOO_LARGE => Ok(Self::ProjectionTooLarge),
-            tag => Err(DecodeError::UnknownTag {
-                kind: "QueryFault",
-                tag,
-            }),
-        }
-    }
-}
+tag_codec!(QueryFault {
+    NoGroups = 1,
+    TooManyGroups = 2,
+    TooManyLiterals = 3,
+    ZeroLimit = 4,
+    LimitTooLarge = 5,
+    NotIndexable = 6,
+    ValueTooLarge = 7,
+    UnboundedRange = 8,
+    MixedBounds = 9,
+    NotOrdered = 10,
+    ProjectionTooLarge = 11,
+});
 
 /// `u64` units.
 impl Encode for Cost {
@@ -1301,28 +1182,7 @@ impl Decode for Outcome {
     }
 }
 
-/// One byte: write 1, read 2.
-impl Encode for ReceiptKind {
-    fn encode_to(&self, encoder: &mut Encoder) {
-        encoder.u8(match self {
-            Self::Write => RECEIPT_WRITE,
-            Self::Read => RECEIPT_READ,
-        });
-    }
-}
-
-impl Decode for ReceiptKind {
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        match decoder.u8()? {
-            RECEIPT_WRITE => Ok(Self::Write),
-            RECEIPT_READ => Ok(Self::Read),
-            tag => Err(DecodeError::UnknownTag {
-                kind: "ReceiptKind",
-                tag,
-            }),
-        }
-    }
-}
+tag_codec!(ReceiptKind { Write = 1, Read = 2 });
 
 /// `kind ‖ model_version u32 ‖ schedule_id u32 ‖ spent u64 ‖ outcome`.
 ///

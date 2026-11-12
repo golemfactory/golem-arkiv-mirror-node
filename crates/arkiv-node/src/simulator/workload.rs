@@ -1,7 +1,7 @@
 //! Reproducible Arkiv entity trace with a configurable size of its unindexed
 //! `bytes` column (`payload_bytes`, kept as the workload's knob name).
 
-use super::{Error, Result};
+use super::{Error, ErrorCode, Result};
 use arkiv_db::{
     Cell, CellName, Decode, DecodeError, Decoder, Encode, Encoder, RecordKey, Value, digest,
 };
@@ -31,7 +31,7 @@ impl Workload {
     /// Finite, reproducible Arkiv fixture followed by empty advancing blocks.
     /// Fixed history makes samples repeatable while headers continue to advance.
     pub fn inputs(&self, chain: u64, height: u64) -> Result<crate::BlockInputs> {
-        use crate::demo::workload::{ALICE, BOB};
+        use crate::dev::{ALICE, BOB};
         use crate::{Expiry, TxOp, arkiv::ArkivOperation as A};
         self.validate()?;
         let ns = crate::arkiv::entity_namespace();
@@ -147,7 +147,7 @@ impl Workload {
             || super::wire::number(&self.block_period_ms)? == 0
             || self.payload_bytes > 131072
         {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         super::wire::number(&self.seed)?;
         Ok(())
@@ -158,7 +158,7 @@ impl Workload {
         if (self.version, &self.seed, &self.block_period_ms)
             != (next.version, &next.seed, &next.block_period_ms)
         {
-            return Err(Error("RequestConflict"));
+            return Err(ErrorCode::RequestConflict.into());
         }
         Ok(())
     }
@@ -167,7 +167,7 @@ impl Workload {
         super::wire::number(&self.block_period_ms)?
             .checked_mul(height)
             .and_then(|n| n.checked_add(genesis))
-            .ok_or(Error("CapacityReached"))
+            .ok_or(Error::from(ErrorCode::CapacityReached))
     }
 }
 

@@ -206,11 +206,11 @@ bindings). Fixed-width keys (`NamespaceId`,
 ## Evidence
 
 See `docs/state-trie.md` (contract, verifier, intervals),
-`crates/arkiv-db-trie/tests/variable_keys.rs` (BTreeMap differential tests
+`crates/arkiv-db-trie/tests/it/variable_keys.rs` (BTreeMap differential tests
 with variable keys), the `layout.rs` unit tests (order, prefix-freeness,
-golden vectors, malformed keys) and `crates/arkiv-db/tests/prefix_free_terms.rs`
+golden vectors, malformed keys) and `crates/arkiv-db/tests/it/prefix_free_terms.rs`
 (engine-level queries and proofs). The independent root models in
-`crates/arkiv-db/tests/roots.rs` and `crates/arkiv-node/tests/support/block_roots.rs`
+`crates/arkiv-db/tests/it/roots.rs` and `crates/arkiv-node/tests/support/block_roots.rs`
 (200-block continuous demo) were rewritten for layout 2 from the byte
 layout alone and match the engine. Benchmarks:
 `docs/benchmarks/2026-10-11-prekucki-v1.md`.

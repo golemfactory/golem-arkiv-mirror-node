@@ -67,7 +67,7 @@ impl EngineGenesis {
             .ok_or_else(|| incompatible("row size arithmetic overflow"))?;
         if let Some(header) = &self.initial_state {
             decode_exact::<StateHeader>(&encode(header))
-                .map_err(|_| incompatible("invalid initial state header"))?;
+                .map_err(|e| incompatible(format!("invalid initial state header: {e}")))?;
             if header.pricing != self.pricing {
                 return Err(incompatible("initial state pricing does not match genesis"));
             }
@@ -194,6 +194,16 @@ pub struct EngineManifest {
 }
 
 impl EngineManifest {
+    /// The height-zero publication of `state`.
+    pub(crate) fn genesis(genesis: &EngineGenesis, state: StateHeader) -> Self {
+        Self {
+            genesis: genesis.id(),
+            sequence: 0,
+            parent: None,
+            state_root: state.root(),
+            state,
+        }
+    }
     pub fn id(&self) -> B256 {
         digest("arkiv/engine-manifest/v1", &encode(self))
     }

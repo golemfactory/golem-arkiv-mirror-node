@@ -2,7 +2,7 @@
 //! The original signed bytes are retained and rechecked by every replaying node.
 
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     crypto::recover,
     protocol::{SignedGenesis, SignedTx, TX_CAP},
 };
@@ -50,7 +50,7 @@ pub struct EthereumTransaction {
 }
 
 fn bad() -> Error {
-    Error("InvalidEthereumTransaction")
+    Error::from(ErrorCode::InvalidEthereumTransaction)
 }
 
 struct Item<'a> {
@@ -101,7 +101,7 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
     }
     let typed = raw[0] == 2;
     if raw[0] < 0xc0 && !typed {
-        return Err(Error("UnsupportedEthereumTransactionType"));
+        return Err(ErrorCode::UnsupportedEthereumTransactionType.into());
     }
     let mut cursor = if typed { &raw[1..] } else { raw };
     let root = take(&mut cursor)?;
@@ -148,7 +148,7 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
     } else {
         let v = u64_value(&fields[6])?;
         if v < 35 {
-            return Err(Error("UnprotectedEthereumTransaction"));
+            return Err(ErrorCode::UnprotectedEthereumTransaction.into());
         }
         let chain_id = (v - 35) / 2;
         let parity = (v - 35) % 2;
@@ -171,12 +171,15 @@ pub fn parse(raw: &[u8]) -> Result<EthereumTransaction> {
             list_bytes(&payload),
         )
     };
-    if parity > 1 || max_fee < U256::from(crate::accounts::GAS_PRICE_WEI) {
-        return Err(Error("GasPriceBelowMinimum"));
+    if parity > 1 {
+        return Err(bad());
+    }
+    if max_fee < U256::from(crate::accounts::GAS_PRICE_WEI) {
+        return Err(ErrorCode::GasPriceBelowMinimum.into());
     }
     let to = &fields[to_idx];
     if to.list || to.payload.len() != 20 {
-        return Err(Error("UnsupportedContractCreation"));
+        return Err(ErrorCode::UnsupportedContractCreation.into());
     }
     if fields[to_idx + 2].list {
         return Err(bad());
@@ -216,7 +219,8 @@ fn triples(
             value: a.value.to_vec(),
         })
         .collect::<Vec<_>>();
-    arkiv::decode_protocol_triples(&attrs, patch).map_err(|_| Error("InvalidArkivAttribute"))
+    arkiv::decode_protocol_triples(&attrs, patch)
+        .map_err(|_| Error::from(ErrorCode::InvalidArkivAttribute))
 }
 
 fn key(bytes: alloy_primitives::B256) -> Result<RecordKey> {
@@ -236,10 +240,10 @@ pub fn operations(input: &[u8]) -> Result<Vec<ArkivOperation>> {
         return Err(bad());
     }
     let call = executeCall::abi_decode_with_config(input, abi_config())
-        .map_err(|_| Error("InvalidArkivCalldata"))?;
+        .map_err(|_| ErrorCode::InvalidArkivCalldata)?;
     // Reject offset aliases, trailing data and noncanonical padding.
     if call.abi_encode() != input || call.ops.is_empty() || call.ops.len() > 128 {
-        return Err(Error("InvalidArkivCalldata"));
+        return Err(ErrorCode::InvalidArkivCalldata.into());
     }
     call.ops
         .into_iter()
@@ -248,9 +252,9 @@ pub fn operations(input: &[u8]) -> Result<Vec<ArkivOperation>> {
             macro_rules! decode {
                 ($ty:ty) => {{
                     let v = <$ty>::abi_decode_with_config(bytes, abi_config())
-                        .map_err(|_| Error("InvalidArkivCalldata"))?;
+                        .map_err(|_| ErrorCode::InvalidArkivCalldata)?;
                     if v.abi_encode() != bytes {
-                        return Err(Error("InvalidArkivCalldata"));
+                        return Err(ErrorCode::InvalidArkivCalldata.into());
                     }
                     v
                 }};
@@ -311,11 +315,11 @@ pub fn operations(input: &[u8]) -> Result<Vec<ArkivOperation>> {
                         key: key(v.entityKey)?,
                     }
                 }
-                _ => return Err(Error("UnsupportedArkivOperation")),
+                _ => return Err(ErrorCode::UnsupportedArkivOperation.into()),
             };
             value
                 .validate()
-                .map_err(|_| Error("InvalidArkivOperation"))?;
+                .map_err(|_| ErrorCode::InvalidArkivOperation)?;
             Ok(value)
         })
         .collect()
@@ -333,16 +337,16 @@ pub fn call_ops(calldata: &[u8]) -> Result<Vec<TxOp>> {
 
 pub fn make_envelope(genesis: &SignedGenesis, tx: &EthereumTransaction) -> Result<TxEnvelope> {
     if tx.chain_id != genesis.genesis.chain_id {
-        return Err(Error("IdentityMismatch"));
+        return Err(ErrorCode::IdentityMismatch.into());
     }
     let ops = if tx.to == arkiv::ARKIV_ADDRESS {
         if !tx.value.is_zero() {
-            return Err(Error("NonzeroArkivValue"));
+            return Err(ErrorCode::NonzeroArkivValue.into());
         }
         call_ops(&tx.input)?
     } else {
         if !tx.input.is_empty() {
-            return Err(Error("UnsupportedEthereumCall"));
+            return Err(ErrorCode::UnsupportedEthereumCall.into());
         }
         vec![TxOp::Transfer {
             to: OwnerId::new(tx.to),

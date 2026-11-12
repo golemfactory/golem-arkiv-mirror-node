@@ -4,7 +4,7 @@
 //! remembered in a bounded [`Dropped`] registry with its reason.
 
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     protocol::{SignedGenesis, SignedInputs, SignedLimits, SignedTx},
 };
 use crate::{ChainParams, RequestId};
@@ -25,18 +25,34 @@ pub const RENT_QUOTE_MARGIN_BLOCKS: u64 = 64;
 /// Evicted transactions remembered for status and receipt lookups.
 pub const DROPPED_CAP: usize = 1024;
 
+/// Why a pending transaction left the pool without a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    InsufficientBalance,
+    ExceedsStorageCap,
+}
+
+impl DropReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientBalance => "InsufficientBalance",
+            Self::ExceedsStorageCap => "ExceedsStorageCap",
+        }
+    }
+}
+
 /// Transactions that left the pool without a block, newest last: bounded and
 /// volatile, so a client polling for one gets a definite refusal instead of
 /// silence.
 #[derive(Debug, Default)]
 pub struct Dropped {
     order: std::collections::VecDeque<String>,
-    by_hash: BTreeMap<String, (OwnerId, RequestId, &'static str)>,
+    by_hash: BTreeMap<String, (OwnerId, RequestId, DropReason)>,
     by_request: BTreeMap<(OwnerId, RequestId), String>,
 }
 
 impl Dropped {
-    fn record(&mut self, tx: &SignedTx, reason: &'static str) {
+    fn record(&mut self, tx: &SignedTx, reason: DropReason) {
         let hash = crate::simulator::wire::hex(tx.hash().as_slice());
         let request = (tx.tx.actor, tx.tx.request_id);
         if self
@@ -66,14 +82,14 @@ impl Dropped {
     }
 
     /// Why the transaction with this hash was dropped.
-    pub fn reason(&self, hash: &str) -> Option<&'static str> {
+    pub fn reason(&self, hash: &str) -> Option<DropReason> {
         self.by_hash
             .get(&hash.to_ascii_lowercase())
             .map(|(_, _, reason)| *reason)
     }
 
     /// The hash and reason of a dropped request.
-    pub fn request(&self, actor: OwnerId, request: RequestId) -> Option<(&str, &'static str)> {
+    pub fn request(&self, actor: OwnerId, request: RequestId) -> Option<(&str, DropReason)> {
         let hash = self.by_request.get(&(actor, request))?;
         Some((hash, self.by_hash.get(hash)?.2))
     }
@@ -148,7 +164,7 @@ impl Pool {
             || limits.max_per_sender == 0
             || limits.max_per_sender > MAX_PER_SENDER
         {
-            return Err(Error("InvalidPoolLimits"));
+            return Err(ErrorCode::InvalidPoolLimits.into());
         }
         Ok(Self {
             limits,
@@ -218,10 +234,10 @@ impl Pool {
             .try_fold(alloy_primitives::U256::ZERO, |sum, entry| {
                 sum.checked_add(
                     crate::accounts::reservation(&entry.tx.tx)
-                        .map_err(|_| Error("BalanceOverflow"))?,
+                        .map_err(|_| ErrorCode::BalanceOverflow)?,
                 )
                 .and_then(|sum| sum.checked_add(entry.rent))
-                .ok_or(Error("BalanceOverflow"))
+                .ok_or(Error::from(ErrorCode::BalanceOverflow))
             })
     }
 
@@ -274,12 +290,12 @@ impl Pool {
         let need = self
             .reserved(tx.tx.actor)?
             .checked_add(
-                crate::accounts::reservation(&tx.tx).map_err(|_| Error("BalanceOverflow"))?,
+                crate::accounts::reservation(&tx.tx).map_err(|_| ErrorCode::BalanceOverflow)?,
             )
             .and_then(|need| need.checked_add(rent))
-            .ok_or(Error("BalanceOverflow"))?;
+            .ok_or(ErrorCode::BalanceOverflow)?;
         if need > balance {
-            return Err(Error("InsufficientBalance"));
+            return Err(ErrorCode::InsufficientBalance.into());
         }
         Ok(())
     }
@@ -288,7 +304,7 @@ impl Pool {
     /// dropped for `reason`: the one at `nonce` can never be included, and
     /// its successors cannot run before it. Never called for a transaction of
     /// a block awaiting commit.
-    pub fn evict_from(&mut self, actor: OwnerId, nonce: u64, reason: &'static str) -> usize {
+    pub fn evict_from(&mut self, actor: OwnerId, nonce: u64, reason: DropReason) -> usize {
         let Some(entries) = self.senders.get_mut(&actor) else {
             return 0;
         };
@@ -334,7 +350,7 @@ impl Pool {
         }
         Ok(cut
             .into_iter()
-            .map(|(actor, nonce)| self.evict_from(actor, nonce, "InsufficientBalance"))
+            .map(|(actor, nonce)| self.evict_from(actor, nonce, DropReason::InsufficientBalance))
             .sum())
     }
 
@@ -342,7 +358,7 @@ impl Pool {
     /// retry.
     fn check(&self, tx: &SignedTx, committed_next: u64) -> Result<Option<Admission>> {
         if tx.genesis_hash != self.genesis_hash || tx.tx.chain_id != self.chain_id {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let hash = tx.hash();
         let actor = tx.tx.actor;
@@ -351,7 +367,7 @@ impl Pool {
             return if existing.hash() == hash {
                 Ok(Some(Admission::Duplicate))
             } else {
-                Err(Error("RequestConflict"))
+                Err(ErrorCode::RequestConflict.into())
             };
         }
         if self
@@ -359,16 +375,16 @@ impl Pool {
             .get(&actor)
             .is_some_and(|entries| entries.contains_key(&tx.nonce))
         {
-            return Err(Error("NonceConflict"));
+            return Err(ErrorCode::NonceConflict.into());
         }
         if tx.nonce == u64::MAX {
-            return Err(Error("NonceExhausted"));
+            return Err(ErrorCode::NonceExhausted.into());
         }
         if tx.nonce < committed_next {
-            return Err(Error("NonceTooLow"));
+            return Err(ErrorCode::NonceTooLow.into());
         }
         if tx.nonce > committed_next.saturating_add(NONCE_WINDOW - 1) {
-            return Err(Error("NonceTooHigh"));
+            return Err(ErrorCode::NonceTooHigh.into());
         }
         let bytes = encode(tx).len();
         let native_bytes = encode(&tx.tx).len();
@@ -382,7 +398,7 @@ impl Pool {
             || tx.tx.tx_budget == 0
             || tx.tx.tx_budget > self.params.user_budget
         {
-            return Err(Error("TransactionDoesNotFit"));
+            return Err(ErrorCode::TransactionDoesNotFit.into());
         }
         if self.count >= self.limits.max_entries
             || self
@@ -395,11 +411,11 @@ impl Pool {
                 .is_some_and(|entries| entries.len() >= self.limits.max_per_sender)
             || (!self.senders.contains_key(&actor) && self.senders.len() >= self.limits.max_senders)
         {
-            return Err(Error("PoolFull"));
+            return Err(ErrorCode::PoolFull.into());
         }
         self.arrival
             .checked_add(1)
-            .ok_or(Error("ArrivalExhausted"))?;
+            .ok_or(ErrorCode::ArrivalExhausted)?;
         Ok(None)
     }
 

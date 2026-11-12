@@ -168,15 +168,7 @@ impl<K: TrieKey> SortedTrieBuilder<K> {
             // The next key seals the previous leaf and every deeper branch.
             // Set the poison flag before mutating the frontier or sink.
             self.failed = true;
-            let depth = self.branches.last().map_or(common, |b| b.depth.max(common));
-            let mut child = self.seal_leaf(depth + 1, sink)?;
-            while self.branches.last().is_some_and(|b| b.depth > common) {
-                let branch = self.branches.pop().expect("branch was checked");
-                let depth = branch.depth;
-                child = self.seal_branch(branch, child, sink)?;
-                let start = self.branches.last().map_or(common, |b| b.depth.max(common)) + 1;
-                child = self.seal_extension(start, depth, child, sink)?;
-            }
+            let child = self.seal_down_to(common + 1, sink)?;
             if self.branches.last().is_none_or(|b| b.depth < common) {
                 self.branches.push(Branch {
                     depth: common,
@@ -208,14 +200,7 @@ impl<K: TrieKey> SortedTrieBuilder<K> {
         if self.len == 0 {
             return Ok((EMPTY_ROOT_HASH, 0));
         }
-        let start = self.branches.last().map_or(0, |b| b.depth + 1);
-        let mut child = self.seal_leaf(start, sink)?;
-        while let Some(branch) = self.branches.pop() {
-            let depth = branch.depth;
-            child = self.seal_branch(branch, child, sink)?;
-            let start = self.branches.last().map_or(0, |b| b.depth + 1);
-            child = self.seal_extension(start, depth, child, sink)?;
-        }
+        let child = self.seal_down_to(0, sink)?;
         let root = match child.as_hash() {
             Some(id) => id, // Already emitted by `emit`.
             None => {
@@ -226,6 +211,27 @@ impl<K: TrieKey> SortedTrieBuilder<K> {
             }
         };
         Ok((root, self.len))
+    }
+
+    /// Seals the previous leaf and every branch at depth `floor` or below
+    /// it, returning the reference to the topmost sealed node.
+    fn seal_down_to<S: TryObjectSink + ?Sized>(
+        &mut self,
+        floor: usize,
+        sink: &mut S,
+    ) -> Result<RlpNode, SortedTrieError<S::Error>> {
+        let start = |branches: &[Branch]| {
+            branches
+                .last()
+                .map_or(floor, |branch| (branch.depth + 1).max(floor))
+        };
+        let mut child = self.seal_leaf(start(&self.branches), sink)?;
+        while let Some(branch) = self.branches.pop_if(|branch| branch.depth >= floor) {
+            let depth = branch.depth;
+            child = self.seal_branch(branch, child, sink)?;
+            child = self.seal_extension(start(&self.branches), depth, child, sink)?;
+        }
+        Ok(child)
     }
 
     fn seal_leaf<S: TryObjectSink + ?Sized>(

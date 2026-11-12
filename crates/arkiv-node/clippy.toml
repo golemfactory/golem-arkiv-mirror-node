@@ -1,7 +1,8 @@
 # The node reaches the engine only through its fallible `try_` API: a
 # storage error of the persistent engine must abort the candidate block,
 # never be unwrapped into a panic, a rejection or an empty read. These are
-# the infallible forms of every Branch/Snapshot method that walks state,
+# the infallible forms of every Branch/Snapshot method that walks state or
+# panics on a poisoned branch,
 # and the infallible expiry sweep.
 disallowed-methods = [
     { path = "arkiv_db::engine::Branch::execute", reason = "use try_execute" },
@@ -20,6 +21,8 @@ disallowed-methods = [
     { path = "arkiv_db::engine::Branch::typed_record_count", reason = "use try_typed_record_count" },
     { path = "arkiv_db::engine::Branch::term_count", reason = "use try_term_count" },
     { path = "arkiv_db::engine::Branch::index_consistent", reason = "use try_index_consistent" },
+    { path = "arkiv_db::engine::Branch::checkpoint", reason = "use try_checkpoint" },
+    { path = "arkiv_db::engine::Branch::seal", reason = "use try_seal" },
     { path = "arkiv_db::engine::Snapshot::get", reason = "use try_get" },
     { path = "arkiv_db::engine::Snapshot::scan_prefix", reason = "use try_scan_prefix" },
     { path = "arkiv_db::engine::Snapshot::descriptor", reason = "use try_descriptor" },

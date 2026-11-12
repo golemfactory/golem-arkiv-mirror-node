@@ -8,7 +8,7 @@ compares between runs. It has two parts:
 1. **The canonical codec, version 1** (implemented in `arkiv_db::codec`): the encoding rules, the layout and tag table of every
    engine type the node will put into blocks, receipts and state, and the
    domain-separated digest. Golden vectors are in
-   [`crates/arkiv-db/tests/codec.rs`](../crates/arkiv-db/tests/codec.rs).
+   [`crates/arkiv-db/tests/it/codec.rs`](../crates/arkiv-db/tests/it/codec.rs).
 2. **The block format (version 5) and block execution** (implemented in the
    `arkiv-node` library): genesis, headers, block
    inputs, transaction envelopes and outcomes built from the codec in
@@ -248,10 +248,10 @@ bytes, including strings that contain `\0`. `Str` also supports prefix predicate
 of different types never compare: a range is typed by its bounds and
 matches only attributes of that type.
 
-Golden vectors: `crates/arkiv-db/tests/codec.rs` (`type_tags_and_values`)
-for the encoding, `crates/arkiv-db/tests/golem_types.rs`
+Golden vectors: `crates/arkiv-db/tests/it/codec.rs` (`type_tags_and_values`)
+for the encoding, `crates/arkiv-db/tests/it/golem_types.rs`
 (`term_bytes_are_golem_stored_forms`) against golem's own vectors, and
-`crates/arkiv-db/tests/ordered_ranges.rs` for the order of the byte-ordered
+`crates/arkiv-db/tests/it/ordered_ranges.rs` for the order of the byte-ordered
 types. The Arkiv entity namespace (`arkiv/schema.rs`, signed JSON-RPC)
 admits only the ten Arkiv SDK types (`bool`, `i32`, `u64`, `u256`, `dec`,
 `bytes32`, `bytes`, `str`, `addr`, `key`); `bytes` only as an unindexed field.
@@ -380,7 +380,7 @@ Only canonical codec bytes are hashed.
 
 ### Evidence
 
-`cargo test -p arkiv-db --test codec --offline` runs the golden vectors:
+`cargo test -p arkiv-db --test it --offline codec::` runs the golden vectors:
 for every covered type the expected bytes are written in the test from the
 pieces above (never produced by the codec), decode back to the value,
 re-encode identically and are rejected with one trailing byte and at every
@@ -757,7 +757,7 @@ transactions may add at most `max_new_storage_units_per_block` storage units
 `ExecError::StorageCapExceeded`). A block breaking either is invalid.
 
 A producer **builds** a block from candidate inputs with the same executor
-(`build_block_hooked`): a candidate whose sender cannot cover its reservation,
+(`execute_block_hooked` in `Mode::Build`): a candidate whose sender cannot cover its reservation,
 or that would take the block past the storage cap (estimated on the state it
 would see, never below what it adds), is left out with its sender's later
 candidates, and the header, outcomes and published inputs cover the included
@@ -920,7 +920,8 @@ hand-derived or come from an independent oracle; see the
   outcomes, replayed on a fresh engine to identical bytes, and pinned by
   golden block hashes (which pin determinism, not correctness).
 - `block_model.rs`: 4 seeds × 60 generated blocks predicted in full by an
-  independent oracle.
+  oracle with its own charge table, expiry resolution and state root; it
+  calls the node only for `params::check_reservation`.
 - `exec.rs`, `genesis.rs`, `validation.rs`, `selection.rs`, `identity.rs`:
   the failure paths, invariants and rules above.
 

@@ -4,16 +4,15 @@
 //! commits to each block's whole state.
 
 use arkiv_db::{
-    BlockMap, BlockNumber, Budget, Cost, Engine, EngineError, OwnerId, PriceSchedule, Rejection,
-    Revision, WriteOp,
+    Budget, Cost, Engine, EngineError, OwnerId, PriceSchedule, Rejection, Revision, WriteOp,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alice = OwnerId::new([0xa1; 20]);
     let bob = OwnerId::new([0xb0; 20]);
     let mut engine = Engine::new(PriceSchedule::FIXTURE);
-    let mut blocks = BlockMap::new();
-    blocks.record(BlockNumber(0), engine.head())?;
+    // The host maps block numbers to snapshots: block `n` is `blocks[n]`.
+    let mut blocks = vec![engine.head()];
 
     // Block 1: create two namespaces.
     let mut branch = engine.begin(engine.head(), Some(Cost::new(1_000)))?;
@@ -39,8 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("block 1: created {shop} for alice and {blog} for bob");
     let sealed = branch.seal();
-    let snapshot = engine.publish(&sealed)?;
-    blocks.record(BlockNumber(1), snapshot)?;
+    blocks.push(engine.publish(&sealed)?);
 
     // Block 2: ordered operations on the same key, with receipts.
     let mut branch = engine.begin(engine.head(), Some(Cost::new(1_000)))?;
@@ -65,8 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let sealed = branch.seal();
     println!("block 2: aggregate write cost {}", sealed.spent());
-    blocks.record(BlockNumber(2), engine.publish(&sealed)?)?;
-    let after_block_2 = blocks.at(&engine, BlockNumber(2))?;
+    blocks.push(engine.publish(&sealed)?);
+    let after_block_2 = engine.snapshot(blocks[2])?;
 
     // Block 3: transfer the shop to bob without touching its records.
     let mut branch = engine.begin(engine.head(), Some(Cost::new(1_000)))?;
@@ -103,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("block 3: bob's underfunded put rejected: {rejected}");
     assert_eq!(rejected.reason, Rejection::OutOfBudget);
     let sealed = branch.seal();
-    blocks.record(BlockNumber(3), engine.publish(&sealed)?)?;
+    blocks.push(engine.publish(&sealed)?);
 
     // Historical read: block 2 still shows alice as owner and the old data.
     let owner_then = after_block_2.descriptor(shop, Budget::unlimited())?.value;
@@ -142,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sealed = branch.seal();
     // A competing candidate built on the same base loses once this publishes.
     let competitor = engine.begin(engine.head(), None)?.seal();
-    blocks.record(BlockNumber(4), engine.publish(&sealed)?)?;
+    blocks.push(engine.publish(&sealed)?);
     match engine.publish(&competitor) {
         Err(EngineError::StaleHead { .. }) => println!("block 4: competing candidate rejected"),
         other => panic!("unexpected {other:?}"),
@@ -164,15 +162,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "blocks 0..=4 map to snapshots {:?}",
-        (0..=4)
-            .map(|block| blocks.resolve(BlockNumber(block)).unwrap().sequence())
-            .collect::<Vec<_>>()
+        blocks.iter().map(|id| id.sequence()).collect::<Vec<_>>()
     );
 
     // State roots: each block's root commits to its whole logical state and
     // never changes; the empty competing candidate has its base's root.
-    for block in 0..=4 {
-        let root = blocks.at(&engine, BlockNumber(block))?.state_root();
+    for (block, id) in blocks.iter().enumerate() {
+        let root = engine.snapshot(*id)?.state_root();
         println!("block {block}: state root {root}");
     }
     assert_eq!(competitor.state_root(), before.state_root());

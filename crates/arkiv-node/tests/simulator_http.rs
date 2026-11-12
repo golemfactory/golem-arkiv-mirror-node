@@ -3,7 +3,7 @@
 use arkiv_db::durable::Options;
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::simulator::{
-    host::{Host, RunConfig},
+    host::{Host, Role, RunConfig},
     light::Light,
     runtime::{self, Node, Runtime, Shared},
     wire::*,
@@ -25,29 +25,19 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct Server {
-    url: String,
-    task: tokio::task::JoinHandle<()>,
-}
+mod cli_support;
+use cli_support::{Child, free_port};
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn serve(router: Router) -> Server {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    Server { url, task }
-}
+#[path = "signed_support/http.rs"]
+#[allow(dead_code)]
+mod http_support;
+use http_support::serve;
 
 fn host() -> Host {
     Host::create(
         Arc::new(MemoryVersionedStore::new()),
         RunConfig {
-            genesis: arkiv_node::demo::workload::genesis(9001, 1700000000000),
+            genesis: arkiv_node::dev::genesis(9001, 1700000000000),
             workload: Workload::default(),
         },
         [1; 16],
@@ -284,7 +274,7 @@ async fn full_and_light_use_disjoint_endpoints_control_auth_and_chunked_limit() 
     assert_eq!(count, 3);
     assert_eq!(bodies.load(Ordering::SeqCst), 0);
     let mut follower = host();
-    follower.role = "full";
+    follower.role = Role::Full;
     follower.paused = false;
     let mut full = Runtime::new(
         Node::Full(Box::new(follower)),
@@ -392,18 +382,8 @@ async fn response_mutation_and_dropped_body_never_produce_verified_rows() {
     }
 }
 
-struct Child(std::process::Child);
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn free_address() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().to_string()
+    format!("127.0.0.1:{}", free_port())
 }
 
 #[test]
@@ -426,6 +406,9 @@ fn private_network_http_is_explicit_and_unknown_configuration_fails_closed() {
     assert!(runtime::parse_private_http(Some("1")).is_err());
     assert!(runtime::parse_private_http(Some("TRUE")).is_err());
 }
+
+/// A minute of 20 ms polls for a child process to start, or to give up.
+const STARTUP_POLLS: u32 = 3_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_and_busy_bootstrap_does_not_poison_directory_and_reopen_needs_no_genesis_fetch() {
@@ -502,7 +485,7 @@ async fn failed_and_busy_bootstrap_does_not_poison_directory_and_reopen_needs_no
     };
     let mut child = spawn();
     let mut ended = false;
-    for _ in 0..100 {
+    for _ in 0..STARTUP_POLLS {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(!status.success());
             ended = true;
@@ -529,7 +512,7 @@ async fn failed_and_busy_bootstrap_does_not_poison_directory_and_reopen_needs_no
         .unwrap();
     let url = format!("http://{listen}");
     let mut ready = false;
-    for _ in 0..150 {
+    for _ in 0..STARTUP_POLLS {
         if let Ok(response) = client.get(format!("{url}/sim/v1/status")).send().await
             && response.status().is_success()
         {
@@ -545,7 +528,7 @@ async fn failed_and_busy_bootstrap_does_not_poison_directory_and_reopen_needs_no
     mode.store(0, Ordering::SeqCst);
     let child = spawn();
     let mut ready = false;
-    for _ in 0..150 {
+    for _ in 0..STARTUP_POLLS {
         if let Ok(response) = client.get(format!("{url}/sim/v1/status")).send().await
             && response.status().is_success()
         {
@@ -755,7 +738,7 @@ async fn state_retention_refuses_pruned_proofs_with_410_on_full_and_light() {
     let mut h = Host::create(
         Arc::new(MemoryVersionedStore::new()),
         RunConfig {
-            genesis: arkiv_node::demo::workload::genesis(9001, 1700000000000),
+            genesis: arkiv_node::dev::genesis(9001, 1700000000000),
             workload: Workload::default(),
         },
         [1; 16],

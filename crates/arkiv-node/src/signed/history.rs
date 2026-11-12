@@ -3,7 +3,7 @@
 //! This store has its own profile and storage sequence, independent of chain
 //! height. Callers publish engine references only after `persist` succeeds.
 
-use super::{Error, Result, protocol::SignedHeader};
+use super::{ErrorCode, Result, protocol::SignedHeader};
 use alloy_primitives::keccak256;
 use arkiv_db::{B256, Decode, DecodeError, Decoder, Encode, Encoder, decode_exact, digest, encode};
 use arkiv_db_storage::versioned::{
@@ -78,8 +78,8 @@ impl History {
             .put_record(Table::Manifests, 0u64.to_be_bytes(), vec![0]);
         match store.commit(&batch) {
             CommitOutcome::Committed => {}
-            CommitOutcome::NotCommitted(_) => return Err(Error("StorageUnavailable")),
-            CommitOutcome::Indeterminate(_) => return Err(Error("CommitUncertain")),
+            CommitOutcome::NotCommitted(_) => return Err(ErrorCode::StorageUnavailable.into()),
+            CommitOutcome::Indeterminate(_) => return Err(ErrorCode::CommitUncertain.into()),
         }
         Ok(Self {
             store,
@@ -99,14 +99,14 @@ impl History {
             .read_record_bounded(Table::Meta, CONFLICT_KEY, CONFLICT_CAP)?
             .is_some()
         {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
-        let head = store.head()?.ok_or(Error("StorageCorrupt"))?;
+        let head = store.head()?.ok_or(ErrorCode::StorageCorrupt)?;
         let entry = store
             .read_record_bounded(Table::Manifests, &head.height.to_be_bytes(), ENTRY_CAP)?
-            .ok_or(Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
         if entry_head(genesis_hash, head.height, &entry) != head {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         let history = Self {
             store,
@@ -119,21 +119,23 @@ impl History {
         match entry.as_slice() {
             [0] if head.height == 0 => {}
             [1, bytes @ ..] if head.height > 0 => {
-                let reference: BodyRef =
-                    decode_exact(bytes).map_err(|_| Error("StorageCorrupt"))?;
+                let reference: BodyRef = decode_exact(bytes).map_err(|e| {
+                    ErrorCode::StorageCorrupt.caused_by(format_args!("history head: {e}"))
+                })?;
                 history.read(&reference)?;
             }
             [3, bytes @ ..] if head.height > 0 => {
-                let (height, hash): (u64, B256) =
-                    decode_exact(bytes).map_err(|_| Error("StorageCorrupt"))?;
+                let (height, hash): (u64, B256) = decode_exact(bytes).map_err(|e| {
+                    ErrorCode::StorageCorrupt.caused_by(format_args!("history head: {e}"))
+                })?;
                 let certificate = history
                     .observation(height)?
-                    .ok_or(Error("StorageCorrupt"))?;
+                    .ok_or(ErrorCode::StorageCorrupt)?;
                 if certificate.header.hash() != hash {
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
             }
-            _ => return Err(Error("StorageCorrupt")),
+            _ => return Err(ErrorCode::StorageCorrupt.into()),
         }
         Ok(history)
     }
@@ -152,7 +154,7 @@ impl History {
         let (reference, frame) = self.frame(bytes)?;
         if self.store.head()? != Some(self.head) {
             self.frozen = true;
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         if let Some(existing) =
             self.store
@@ -160,7 +162,7 @@ impl History {
         {
             self.unframe(&reference, &existing)?;
             if existing != frame {
-                return Err(Error("StorageCorrupt"));
+                return Err(ErrorCode::StorageCorrupt.into());
             }
             return Ok(reference);
         }
@@ -170,7 +172,7 @@ impl History {
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         let mut batch = CommitBatch::new(
             Some(self.head),
             entry_head(self.genesis_hash, sequence, &entry),
@@ -187,12 +189,12 @@ impl History {
     /// durability-unknown; it cannot authorize engine publication.
     pub fn retry_pending(&mut self) -> Result<BodyRef> {
         if self.frozen {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         if self.observation_failed {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
-        let pending = self.pending.as_ref().ok_or(Error("NoPendingHistory"))?;
+        let pending = self.pending.as_ref().ok_or(ErrorCode::NoPendingHistory)?;
         let actual = self.store.recover()?;
         check_identity(self.store.as_ref(), self.genesis_hash)?;
         if actual == Some(pending.batch.new_head) {
@@ -204,7 +206,7 @@ impl History {
                     != Some(value.as_slice())
                 {
                     self.frozen = true;
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
             }
             let frame = self
@@ -214,13 +216,13 @@ impl History {
                     &pending.reference.id.0,
                     pending.reference.len as usize + FRAME_OVERHEAD,
                 )?
-                .ok_or(Error("HistoryUnavailable"))?;
+                .ok_or(ErrorCode::HistoryUnavailable)?;
             self.unframe(&pending.reference, &frame)?;
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         if actual != pending.batch.expected_head {
             self.frozen = true;
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         for (table, key, value) in &pending.batch.records {
             if self
@@ -229,7 +231,7 @@ impl History {
                 .is_some()
             {
                 self.frozen = true;
-                return Err(Error("StorageCorrupt"));
+                return Err(ErrorCode::StorageCorrupt.into());
             }
         }
         if self
@@ -242,7 +244,7 @@ impl History {
             .is_some()
         {
             self.frozen = true;
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         self.commit_pending()
     }
@@ -252,10 +254,10 @@ impl History {
     /// recovered store must still have exactly the acknowledged head.
     pub fn retry_exact(&mut self, bytes: &[u8]) -> Result<BodyRef> {
         if self.frozen {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         if self.observation_failed {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         let (reference, frame) = self.frame(bytes)?;
         if let Some(pending) = &self.pending {
@@ -267,7 +269,7 @@ impl History {
                     .map(|(_, _, bytes)| bytes.as_slice())
                     != Some(frame.as_slice())
             {
-                return Err(Error("PendingHistoryMismatch"));
+                return Err(ErrorCode::PendingHistoryMismatch.into());
             }
             return self.retry_pending();
         }
@@ -275,7 +277,7 @@ impl History {
         check_identity(self.store.as_ref(), self.genesis_hash)?;
         if actual != Some(self.head) {
             self.frozen = true;
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         self.persist(bytes)
     }
@@ -287,7 +289,7 @@ impl History {
     pub fn remember_header(&mut self, certificate: &SignedHeader) -> Result<Option<SignedHeader>> {
         self.ready()?;
         if certificate.genesis_hash != self.genesis_hash {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if let Some(prior) = self.observation(certificate.header.height)? {
             return Ok((prior.header.hash() != certificate.header.hash()).then_some(prior));
@@ -296,7 +298,7 @@ impl History {
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         let mut entry = vec![3];
         entry.extend_from_slice(&encode(&(
             certificate.header.height,
@@ -318,11 +320,11 @@ impl History {
             }
             CommitOutcome::NotCommitted(_) => {
                 self.observation_failed = true;
-                Err(Error("StorageUnavailable"))
+                Err(ErrorCode::StorageUnavailable.into())
             }
             CommitOutcome::Indeterminate(_) => {
                 self.observation_failed = true;
-                Err(Error("CommitUncertain"))
+                Err(ErrorCode::CommitUncertain.into())
             }
         }
     }
@@ -331,12 +333,14 @@ impl History {
         self.store
             .read_record_bounded(Table::Inclusions, &height.to_be_bytes(), CERTIFICATE_LEN)?
             .map(|bytes| {
-                let certificate: SignedHeader =
-                    decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
+                let certificate: SignedHeader = decode_exact(&bytes).map_err(|e| {
+                    ErrorCode::StorageCorrupt
+                        .caused_by(format_args!("observed header {height}: {e}"))
+                })?;
                 if certificate.genesis_hash != self.genesis_hash
                     || certificate.header.height != height
                 {
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 Ok(certificate)
             })
@@ -344,22 +348,22 @@ impl History {
     }
 
     fn commit_pending(&mut self) -> Result<BodyRef> {
-        let pending = self.pending.as_ref().ok_or(Error("NoPendingHistory"))?;
+        let pending = self.pending.as_ref().ok_or(ErrorCode::NoPendingHistory)?;
         match self.store.commit(&pending.batch) {
             CommitOutcome::Committed => {
                 let pending = self.pending.take().expect("pending checked");
                 self.head = pending.batch.new_head;
                 Ok(pending.reference)
             }
-            CommitOutcome::NotCommitted(_) => Err(Error("StorageUnavailable")),
-            CommitOutcome::Indeterminate(_) => Err(Error("CommitUncertain")),
+            CommitOutcome::NotCommitted(_) => Err(ErrorCode::StorageUnavailable.into()),
+            CommitOutcome::Indeterminate(_) => Err(ErrorCode::CommitUncertain.into()),
         }
     }
 
     pub fn read(&self, reference: &BodyRef) -> Result<Vec<u8>> {
         self.ready()?;
         if reference.len as usize > BODY_CAP {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         let frame = self
             .store
@@ -368,7 +372,7 @@ impl History {
                 &reference.id.0,
                 reference.len as usize + FRAME_OVERHEAD,
             )?
-            .ok_or(Error("HistoryUnavailable"))?;
+            .ok_or(ErrorCode::HistoryUnavailable)?;
         Ok(self.unframe(reference, &frame)?.to_vec())
     }
 
@@ -376,22 +380,22 @@ impl History {
     /// A failure still fences this handle; a durable marker fences reopen.
     pub fn freeze_conflict(&mut self, evidence: &[u8]) -> Result<()> {
         if evidence.is_empty() || evidence.len() > CONFLICT_CAP {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         if self.frozen {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         self.frozen = true;
         // The pending body may already have committed. Never publish another
         // sequence or resume its publication after authentic equivocation.
         if self.pending.is_some() {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         let sequence = self
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         let mut entry = vec![2];
         entry.extend_from_slice(digest("arkiv/signed-conflict/v1", evidence).as_slice());
         let next = entry_head(self.genesis_hash, sequence, &entry);
@@ -404,16 +408,16 @@ impl History {
                 self.head = next;
                 Ok(())
             }
-            CommitOutcome::NotCommitted(_) => Err(Error("StorageUnavailable")),
-            CommitOutcome::Indeterminate(_) => Err(Error("CommitUncertain")),
+            CommitOutcome::NotCommitted(_) => Err(ErrorCode::StorageUnavailable.into()),
+            CommitOutcome::Indeterminate(_) => Err(ErrorCode::CommitUncertain.into()),
         }
     }
 
     fn ready(&self) -> Result<()> {
         if self.frozen {
-            Err(Error("ChainConflict"))
+            Err(ErrorCode::ChainConflict.into())
         } else if self.pending.is_some() || self.observation_failed {
-            Err(Error("CommitUncertain"))
+            Err(ErrorCode::CommitUncertain.into())
         } else {
             Ok(())
         }
@@ -421,7 +425,7 @@ impl History {
 
     fn frame(&self, bytes: &[u8]) -> Result<(BodyRef, Vec<u8>)> {
         if bytes.len() > BODY_CAP {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         let len = bytes.len() as u32;
         let mut frame = Vec::with_capacity(FRAME_OVERHEAD + bytes.len());
@@ -446,7 +450,7 @@ impl History {
             || frame.get(FRAME.len() + 32..FRAME_OVERHEAD)
                 != Some(reference.len.to_be_bytes().as_slice())
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(&frame[FRAME_OVERHEAD..])
     }
@@ -464,7 +468,7 @@ fn check_identity(store: &dyn VersionedStore, genesis_hash: B256) -> Result<()> 
             .as_deref()
             != Some(identity.as_slice())
     {
-        return Err(Error("IdentityMismatch"));
+        return Err(ErrorCode::IdentityMismatch.into());
     }
     Ok(())
 }

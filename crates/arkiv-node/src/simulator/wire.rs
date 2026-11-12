@@ -1,6 +1,6 @@
 //! Closed, payload-free explorer DTOs. Canonical bodies and proofs use separate endpoints.
 
-use super::{Error, Result};
+use super::{Error, ErrorCode, Result};
 use arkiv_db::{B256, Decode, Encode, decode_exact, encode};
 use serde::{Deserialize, Serialize};
 
@@ -11,16 +11,14 @@ pub const ENVELOPE_CAP: usize = RESPONSE_CAP - 1024;
 pub const HEADER_BATCH: usize = 64;
 pub const READ_CONCURRENCY: usize = 4;
 
-pub fn hex(bytes: &[u8]) -> String {
-    crate::demo::wire::hex(bytes)
-}
+pub use crate::text::hex;
 
 pub fn unhex(s: &str, cap: usize) -> Result<Vec<u8>> {
-    crate::demo::wire::unhex(s, cap).map_err(|_| Error("InvalidRequest"))
+    crate::text::unhex(s, cap).ok_or(ErrorCode::InvalidRequest.into())
 }
 
 pub fn number(s: &str) -> Result<u64> {
-    crate::demo::wire::number(s).map_err(|_| Error("InvalidRequest"))
+    crate::text::decimal(s).ok_or(ErrorCode::InvalidRequest.into())
 }
 
 pub fn pack(v: &impl Encode) -> String {
@@ -29,20 +27,17 @@ pub fn pack(v: &impl Encode) -> String {
 
 pub fn unpack<T: Decode>(s: &str, cap: usize) -> Result<T> {
     decode_exact(&unhex(s, cap)?).map_err(|e| {
-        Error(
-            if matches!(e, arkiv_db::DecodeError::UnsupportedVersion { .. }) {
-                "UnsupportedVersion"
-            } else {
-                "InvalidRequest"
-            },
-        )
+        Error::from(match e {
+            arkiv_db::DecodeError::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
+            _ => ErrorCode::InvalidRequest,
+        })
     })
 }
 
 pub fn hash(s: &str) -> Result<B256> {
     let b = unhex(s, 32)?;
     if b.len() != 32 {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     Ok(B256::from_slice(&b))
 }
@@ -70,7 +65,7 @@ pub fn json_bytes(v: &impl Serialize, cap: usize) -> Result<Vec<u8>> {
         bytes: Vec::new(),
         cap,
     };
-    serde_json::to_writer(&mut sink, v).map_err(|_| Error("CapacityReached"))?;
+    serde_json::to_writer(&mut sink, v).map_err(|_| ErrorCode::CapacityReached)?;
     Ok(sink.bytes)
 }
 
@@ -113,7 +108,7 @@ impl HeaderDto {
     pub fn validate(&self, chain_id: u64) -> Result<crate::Header> {
         let h: crate::Header = unpack(&self.header_bytes, 156)?;
         if h.chain_id != chain_id || Self::new(&h)? != *self {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         Ok(h)
     }
@@ -265,17 +260,17 @@ impl FeedBlock {
     }
 
     pub fn digest(&self) -> Result<B256> {
-        let mut value = serde_json::to_value(self).map_err(|_| Error("InvalidRequest"))?;
+        let mut value = serde_json::to_value(self).map_err(|_| ErrorCode::InvalidRequest)?;
         value
             .as_object_mut()
-            .ok_or(Error("InvalidRequest"))?
+            .ok_or(ErrorCode::InvalidRequest)?
             .remove("feedDigest");
         metadata_digest(&value)
     }
 
     pub fn validate_digest(&self) -> Result<()> {
         if hash(&self.feed_digest)? != self.digest()? {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         Ok(())
     }
@@ -286,7 +281,7 @@ impl FeedBlock {
 pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
         if bytes.len() > (8 * 1024 * 1024usize).saturating_sub(out.len()) {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         out.extend_from_slice(bytes);
         Ok(())
@@ -294,7 +289,7 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
 
     fn string(out: &mut Vec<u8>, s: &str) -> Result<()> {
         put(out, &[4])?;
-        let n = u32::try_from(s.len()).map_err(|_| Error("CapacityReached"))?;
+        let n = u32::try_from(s.len()).map_err(|_| ErrorCode::CapacityReached)?;
         put(out, &n.to_be_bytes())?;
         put(out, s.as_bytes())
     }
@@ -308,15 +303,15 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
         use serde_json::Value::*;
         *nodes += 1;
         if depth > 64 || *nodes > 1_048_576 {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         match v {
             Null => put(out, &[0]),
             Bool(false) => put(out, &[1]),
             Bool(true) => put(out, &[2]),
             Number(n) => {
-                let n = u32::try_from(n.as_u64().ok_or(Error("InvalidRequest"))?)
-                    .map_err(|_| Error("InvalidRequest"))?;
+                let n = u32::try_from(n.as_u64().ok_or(ErrorCode::InvalidRequest)?)
+                    .map_err(|_| ErrorCode::InvalidRequest)?;
                 put(out, &[3])?;
                 put(out, &n.to_be_bytes())
             }
@@ -326,7 +321,7 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
                 put(
                     out,
                     &u32::try_from(items.len())
-                        .map_err(|_| Error("CapacityReached"))?
+                        .map_err(|_| ErrorCode::CapacityReached)?
                         .to_be_bytes(),
                 )?;
                 for item in items {
@@ -339,7 +334,7 @@ pub fn metadata_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
                 put(
                     out,
                     &u32::try_from(items.len())
-                        .map_err(|_| Error("CapacityReached"))?
+                        .map_err(|_| ErrorCode::CapacityReached)?
                         .to_be_bytes(),
                 )?;
                 let mut entries = items.iter().collect::<Vec<_>>();
@@ -404,7 +399,7 @@ fn range_limits_with(
                 .parse()
                 .ok()
                 .filter(|v| *v > 0)
-                .ok_or(Error("InvalidRangeLimits"))?;
+                .ok_or(ErrorCode::InvalidRangeLimits)?;
         }
     }
     if let Some(raw) = get("ARKIV_RANGE_MAX_VERIFICATION_WORK") {
@@ -412,7 +407,7 @@ fn range_limits_with(
             .parse()
             .ok()
             .filter(|v| *v > 0)
-            .ok_or(Error("InvalidRangeLimits"))?;
+            .ok_or(ErrorCode::InvalidRangeLimits)?;
     }
     Ok(caps)
 }

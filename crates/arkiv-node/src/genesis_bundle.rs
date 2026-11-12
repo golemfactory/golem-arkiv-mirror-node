@@ -27,7 +27,9 @@ pub const MAX_ROW_ATTRIBUTES: u32 = arkiv::MAX_ATTRIBUTES as u32;
 /// executor stores for a permanent `$expiresAt` ([`crate::Expiry::PERMANENT`]).
 /// Only a permanent-prefill launch ([`PrefillLaunch::permanent_prefill`]) admits it.
 pub const PERMANENT_EXPIRY: u64 = u64::MAX;
-type Result<T> = std::result::Result<T, String>;
+use crate::genesis_error::GenesisToolError;
+
+type Result<T> = std::result::Result<T, GenesisToolError>;
 
 fn invalid(reason: &'static str) -> DecodeError {
     DecodeError::Invalid {
@@ -36,8 +38,8 @@ fn invalid(reason: &'static str) -> DecodeError {
     }
 }
 
-fn err(e: impl std::fmt::Debug) -> String {
-    format!("prefill: {e:?}")
+fn err(e: impl std::fmt::Debug) -> GenesisToolError {
+    format!("prefill: {e:?}").into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,7 +615,7 @@ fn construct(
             .map_err(err)?;
     }
     Ok(Constructed {
-        candidate: branch.seal(),
+        candidate: branch.try_seal().map_err(err)?,
         burn,
         units,
         rows: reports,
@@ -696,7 +698,7 @@ pub fn report(g: &SignedGenesis, stream: &[u8]) -> serde_json::Value {
     };
     let built = match construct(g, p.limits, p.sponsor, stream, p.permanent_prefill()) {
         Ok(v) => v,
-        Err(e) => return serde_json::json!({"error":e}),
+        Err(e) => return serde_json::json!({"error":e.to_string()}),
     };
     let a = &g.accounts;
     let mut report = serde_json::json!({

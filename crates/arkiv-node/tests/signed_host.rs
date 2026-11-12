@@ -12,19 +12,19 @@ use arkiv_db_storage::{
     versioned::{ObjectReader, SpaceId, StorageErrorKind, VersionedStore},
 };
 use arkiv_node::{
-    Expiry, HostFault, OpOutcome, TxEnvelope, TxOp, TxStatus,
+    Expiry, HostFault, OpOutcome, TxOp, TxStatus,
     arkiv::{self, ArkivFault, ArkivOperation},
     signed::{
         history::History,
-        host::{HeaderRecord, Host},
+        host::{HeaderRecord, Host, Prefill},
         light::Light,
-        protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedTx},
+        protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedTx, ValidTx},
     },
 };
 use std::sync::Arc;
 
 mod signed_support;
-use signed_support::signer;
+use signed_support::{arkiv_ops, launch, memory_host, sign_tx, signer};
 
 fn genesis() -> SignedGenesis {
     signed_support::genesis(9100, 1000, [7; 16], 1, 100, &[1, 2, 3])
@@ -35,26 +35,16 @@ fn create(
     history: Arc<dyn VersionedStore>,
     producer: bool,
 ) -> Host {
-    let genesis = genesis();
-    let certificate = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
-    Host::create(
-        state,
-        History::create(history, genesis.hash()).unwrap(),
-        genesis,
-        [3; 16],
-        certificate,
-        producer.then(|| signer(1)),
-        Options::default(),
-    )
-    .unwrap()
+    let launch = launch(&genesis(), signer(1), [3; 16], history, producer);
+    Host::create(state, Options::default(), launch, Prefill::None).unwrap()
 }
 
 fn memory(producer: bool) -> Host {
-    create(
-        Arc::new(MemoryVersionedStore::new()),
-        Arc::new(MemoryVersionedStore::new()),
-        producer,
-    )
+    chain(&genesis(), producer)
+}
+
+fn chain(genesis: &SignedGenesis, producer: bool) -> Host {
+    memory_host(genesis, signer(1), [3; 16], producer)
 }
 
 fn reopen(
@@ -74,26 +64,27 @@ fn reopen(
 }
 
 fn tx(key: u8, nonce: u64, request: u8, operations: Vec<ArkivOperation>) -> SignedTx {
-    let signer = signer(key);
-    SignedTx::sign(
+    let ops = arkiv_ops(operations);
+    sign_tx(
         &genesis(),
+        &signer(key),
         nonce,
-        TxEnvelope {
-            chain_id: genesis().genesis.chain_id,
-            actor: signer.address(),
-            request_id: [request; 32],
-            tx_budget: 10_000_000,
-            ops: operations
-                .into_iter()
-                .map(|operation| TxOp::Arkiv {
-                    namespace: arkiv::entity_namespace(),
-                    operation,
-                })
-                .collect(),
-        },
-        &signer,
+        [request; 32],
+        10_000_000,
+        ops,
     )
-    .unwrap()
+}
+
+fn tx_on(
+    genesis: &SignedGenesis,
+    key: u8,
+    nonce: u64,
+    operations: Vec<ArkivOperation>,
+) -> SignedTx {
+    let mut request_id = [key; 32];
+    request_id[..8].copy_from_slice(&nonce.to_be_bytes());
+    let ops = arkiv_ops(operations);
+    sign_tx(genesis, &signer(key), nonce, request_id, 10_000_000, ops)
 }
 
 /// An entity with an indexed `group` and its data in an unindexed `body`.
@@ -159,7 +150,7 @@ fn creation_nonce(host: &Host, actor: OwnerId) -> u64 {
 }
 
 fn message<T>(result: arkiv_node::signed::Result<T>) -> &'static str {
-    result.err().expect("expected rejection").0
+    result.err().expect("expected rejection").code.as_str()
 }
 
 fn relay(producer: &Host, full: &mut Host, light: &mut Light) {
@@ -544,6 +535,23 @@ fn full_replay_rejects_authenticated_but_invalid_body_nonce_root_outcomes_and_pa
 }
 
 #[test]
+fn admission_takes_only_a_validated_transaction() {
+    let mut producer = memory(true);
+    producer.produce().unwrap();
+    let signed = tx(2, 0, 1, vec![create_entity(10, b"zero")]);
+    let mut forged = signed.clone();
+    forged.nonce += 1;
+    assert_eq!(
+        message(ValidTx::new(forged, &producer.genesis)),
+        "InvalidSignature"
+    );
+    let valid = ValidTx::new(signed.clone(), &producer.genesis).unwrap();
+    assert_eq!(producer.admit(valid).unwrap()["status"], "pending");
+    producer.produce().unwrap();
+    assert_eq!(producer.block(2).unwrap().inputs.txs, vec![signed]);
+}
+
+#[test]
 fn pool_gaps_wait_and_contiguous_nonces_execute_in_one_block() {
     let mut producer = memory(true);
     producer.produce().unwrap();
@@ -661,9 +669,9 @@ fn full_authentic_equivocation_freezes_history_and_changed_signer_cannot_reopen(
     let mut forged = other.clone();
     forged.header.signature = [0; 65];
     assert!(full.import(forged).is_err());
-    assert_ne!(full.health, "chain-conflict");
+    assert_ne!(full.health.as_str(), "chain-conflict");
     assert_eq!(message(full.import(other)), "ChainConflict");
-    assert_eq!(full.health, "chain-conflict");
+    assert_eq!(full.health.as_str(), "chain-conflict");
     producer.produce().unwrap();
     assert_eq!(
         message(full.import(producer.block(3).unwrap())),
@@ -904,50 +912,6 @@ fn create_until(salt: u128, height: u64) -> ArkivOperation {
     }
 }
 
-fn chain(genesis: &SignedGenesis, producer: bool) -> Host {
-    let certificate = SignedHeader::sign(genesis, genesis.header(), &signer(1)).unwrap();
-    Host::create(
-        Arc::new(MemoryVersionedStore::new()),
-        History::create(Arc::new(MemoryVersionedStore::new()), genesis.hash()).unwrap(),
-        genesis.clone(),
-        [3; 16],
-        certificate,
-        producer.then(|| signer(1)),
-        Options::default(),
-    )
-    .unwrap()
-}
-
-fn tx_on(
-    genesis: &SignedGenesis,
-    key: u8,
-    nonce: u64,
-    operations: Vec<ArkivOperation>,
-) -> SignedTx {
-    let signer = signer(key);
-    let mut request_id = [key; 32];
-    request_id[..8].copy_from_slice(&nonce.to_be_bytes());
-    SignedTx::sign(
-        genesis,
-        nonce,
-        TxEnvelope {
-            chain_id: genesis.genesis.chain_id,
-            actor: signer.address(),
-            request_id,
-            tx_budget: 10_000_000,
-            ops: operations
-                .into_iter()
-                .map(|operation| TxOp::Arkiv {
-                    namespace: arkiv::entity_namespace(),
-                    operation,
-                })
-                .collect(),
-        },
-        &signer,
-    )
-    .unwrap()
-}
-
 fn expiry_total(host: &Host, height: u64) -> u64 {
     host.engine
         .head_snapshot()
@@ -959,7 +923,7 @@ fn expiry_total(host: &Host, height: u64) -> u64 {
 /// The expiry height each `EntityCreated`/`ExpiryExtended` event of a block
 /// reports, by entity key.
 fn logged_expiries(host: &Host, height: u64) -> Vec<(String, String, u64)> {
-    let created = arkiv_node::signed::rpc::hex(
+    let created = arkiv_node::text::hex(
         alloy_primitives::keccak256(b"EntityCreated(bytes32,address,uint64,uint8)").as_slice(),
     );
     arkiv_node::signed::rpc::block_logs(host, height)
@@ -1088,7 +1052,7 @@ fn creates_sharing_a_lifetime_fill_a_height_and_spill_to_the_next() {
             assert_eq!(logs.len(), 128);
             assert!(logs.iter().all(|(_, _, expiry)| *expiry == expected));
         }
-        let key_hex = |key: &RecordKey| arkiv_node::signed::rpc::hex(key.as_bytes());
+        let key_hex = |key: &RecordKey| arkiv_node::text::hex(key.as_bytes());
         assert_eq!(
             logged_expiries(host, 4),
             vec![
@@ -1308,15 +1272,12 @@ fn expiry_sweep_timing() {
             let store = |name: &str| -> Arc<dyn VersionedStore> {
                 Arc::new(RedbStore::create(dir.join(name), RedbConfig::default()).unwrap())
             };
-            let certificate = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
+            let launch = launch(&genesis, signer(1), [3; 16], store("history.redb"), true);
             let mut producer = Host::create(
                 store("node.redb"),
-                History::create(store("history.redb"), genesis.hash()).unwrap(),
-                genesis.clone(),
-                [3; 16],
-                certificate,
-                Some(signer(1)),
                 Options::default(),
+                launch,
+                Prefill::None,
             )
             .unwrap();
             producer.produce().unwrap();
@@ -1333,26 +1294,21 @@ fn expiry_sweep_timing() {
                 while in_block < per_block && made < u64::from(capacity) {
                     let count = per_tx.min(u64::from(capacity) - made);
                     let ops = (made..made + count).map(|n| entity(kind, n)).collect();
-                    let signer = signer(2);
                     let mut request_id = [9; 32];
                     request_id[..8].copy_from_slice(&nonce.to_be_bytes());
-                    let tx = SignedTx::sign(
+                    let budget = if kind == "typical" {
+                        10_000_000
+                    } else {
+                        20_000_000
+                    };
+                    let tx = sign_tx(
                         &genesis,
+                        &signer(2),
                         nonce,
-                        TxEnvelope {
-                            chain_id: genesis.genesis.chain_id,
-                            actor: signer.address(),
-                            request_id,
-                            tx_budget: if kind == "typical" {
-                                10_000_000
-                            } else {
-                                20_000_000
-                            },
-                            ops: ops_of(ops),
-                        },
-                        &signer,
-                    )
-                    .unwrap();
+                        request_id,
+                        budget,
+                        arkiv_ops(ops),
+                    );
                     producer.submit(tx).unwrap();
                     nonce += 1;
                     made += count;
@@ -1398,14 +1354,4 @@ fn expiry_sweep_timing() {
         }
     }
     std::fs::remove_dir_all(&root).unwrap();
-}
-
-fn ops_of(operations: Vec<ArkivOperation>) -> Vec<TxOp> {
-    operations
-        .into_iter()
-        .map(|operation| TxOp::Arkiv {
-            namespace: arkiv::entity_namespace(),
-            operation,
-        })
-        .collect()
 }

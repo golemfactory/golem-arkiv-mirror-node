@@ -133,13 +133,15 @@ pub enum DeferReason {
 
 /// How a block's transactions are executed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     /// A given block: every transaction must fit, or the block is invalid.
     Strict,
     /// One disposable transaction without affordability or settlement.
     Estimate,
-    /// A producer's candidate: transactions that cannot be included are
-    /// left out ([`Deferred`]) instead of invalidating the block.
+    /// A producer's candidate: a transaction whose sender cannot cover its
+    /// gas reservation, or that would take the block past its storage cap,
+    /// is left out with its sender's later candidates ([`Deferred`])
+    /// instead of invalidating the block.
     Build,
 }
 
@@ -320,25 +322,42 @@ pub(crate) fn spill_expiry<E>(
 /// A record's lifetime. `Until(E)` expires (is deleted) in block `E`.
 /// Ordered with every finite height before `Permanent`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Lifetime {
+pub(crate) enum Lifetime {
     Until(u64),
     Permanent,
 }
 
 impl Lifetime {
-    /// The stored `$expiresAt` value; permanent is `U64(u64::MAX)`.
-    const fn stored(self) -> Value {
-        match self {
-            Self::Until(height) => Value::U64(height),
-            Self::Permanent => Value::U64(u64::MAX),
+    /// The lifetime an expiry height names; `u64::MAX` is permanent.
+    pub(crate) const fn expiring_at(height: u64) -> Self {
+        match height {
+            u64::MAX => Self::Permanent,
+            height => Self::Until(height),
         }
+    }
+
+    /// The expiry height; permanent is `u64::MAX`.
+    pub(crate) const fn expires_at(self) -> u64 {
+        match self {
+            Self::Until(height) => height,
+            Self::Permanent => u64::MAX,
+        }
+    }
+
+    /// The stored `$expiresAt` value.
+    const fn stored(self) -> Value {
+        Value::U64(self.expires_at())
     }
 }
 
 /// Resolves an expiry pair at `height`: `E = max(expires_at, height +
 /// min_lifetime)`; `E == u64::MAX` is permanent; otherwise `E` must be after
 /// this block and at most `max_lifetime` blocks away.
-fn resolve(expiry: &Expiry, height: u64, max_lifetime: u64) -> Result<Lifetime, ExpiryFault> {
+pub(crate) fn resolve(
+    expiry: &Expiry,
+    height: u64,
+    max_lifetime: u64,
+) -> Result<Lifetime, ExpiryFault> {
     let floor = height
         .checked_add(expiry.min_lifetime)
         .ok_or(ExpiryFault::Overflow)?;
@@ -358,8 +377,82 @@ fn resolve(expiry: &Expiry, height: u64, max_lifetime: u64) -> Result<Lifetime, 
     Ok(Lifetime::Until(resolved))
 }
 
+pub(crate) fn read_count(branch: &Branch, key: &HostKey) -> Result<u64, ExecError> {
+    match branch.try_host_get(key)? {
+        None => Ok(0),
+        Some(value) => parse_count(key, &value),
+    }
+}
+
+fn write_count(branch: &mut Branch, key: HostKey, count: u64) -> Result<(), ExecError> {
+    if count == 0 {
+        branch.try_host_remove(&key)?;
+    } else {
+        branch
+            .try_host_put(key, &count.to_be_bytes())?
+            .map_err(|_| ExecError::Invariant(Invariant::HostValue))?;
+    }
+    Ok(())
+}
+
+/// Adds one record due at `height` in `namespace`.
+fn schedule(branch: &mut Branch, height: u64, namespace: NamespaceId) -> Result<(), ExecError> {
+    for key in [due_key(height, namespace), total_key(height)] {
+        let count = read_count(branch, &key)?
+            .checked_add(1)
+            .ok_or(ExecError::ScheduleInconsistent(ScheduleFault::Overflow))?;
+        write_count(branch, key, count)?;
+    }
+    Ok(())
+}
+
+/// Removes one record due at `height` in `namespace`.
+fn unschedule(branch: &mut Branch, height: u64, namespace: NamespaceId) -> Result<(), ExecError> {
+    for key in [due_key(height, namespace), total_key(height)] {
+        let count =
+            read_count(branch, &key)?
+                .checked_sub(1)
+                .ok_or(ExecError::ScheduleInconsistent(ScheduleFault::Underflow {
+                    height,
+                    namespace,
+                }))?;
+        write_count(branch, key, count)?;
+    }
+    Ok(())
+}
+
+/// Maintains the due schedule for a record of `namespace` whose lifetime
+/// went from `before` to `after`; `None` is no record. Permanent records are
+/// not scheduled.
+pub(crate) fn reschedule(
+    branch: &mut Branch,
+    namespace: NamespaceId,
+    before: Option<Lifetime>,
+    after: Option<Lifetime>,
+) -> Result<(), ExecError> {
+    if before == after {
+        return Ok(());
+    }
+    if let Some(Lifetime::Until(height)) = before {
+        unschedule(branch, height, namespace)?;
+    }
+    if let Some(Lifetime::Until(height)) = after {
+        schedule(branch, height, namespace)?;
+    }
+    Ok(())
+}
+
 fn position(index: usize) -> u32 {
     u32::try_from(index).expect("block counts fit in u32")
+}
+
+/// The block being executed: its chain, its parent and its place after it.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockEnv<'a> {
+    pub spec: &'a ChainSpec,
+    pub parent: &'a Header,
+    pub height: u64,
+    pub timestamp_ms: u64,
 }
 
 /// Executes `inputs` as the block at `height` on `branch`, which must have
@@ -374,15 +467,13 @@ pub fn execute_block(
     timestamp_ms: u64,
     inputs: &BlockInputs,
 ) -> Result<ExecutedBlock, ExecError> {
-    execute_block_observed(
+    let env = BlockEnv {
         spec,
-        branch,
         parent,
         height,
         timestamp_ms,
-        inputs,
-        |_, _, _, _| Ok(()),
-    )
+    };
+    execute_block_observed(env, branch, inputs, |_, _, _, _| Ok(()))
 }
 
 /// A successful expiry deletion's key, observed without additional state reads.
@@ -395,13 +486,9 @@ pub struct ExpiredRecord {
 
 /// Executes once, then lets a bounded metadata collector inspect terminal state
 /// before sealing. Observer reads are noncanonical and do not alter receipts.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_block_observed(
-    spec: &ChainSpec,
+    env: BlockEnv<'_>,
     branch: Branch,
-    parent: &Header,
-    height: u64,
-    timestamp_ms: u64,
     inputs: &BlockInputs,
     observer: impl FnMut(
         &Branch,
@@ -411,86 +498,12 @@ pub fn execute_block_observed(
     ) -> Result<(), StorageError>,
 ) -> Result<ExecutedBlock, ExecError> {
     execute_block_hooked(
-        spec,
+        env,
         branch,
-        parent,
-        height,
-        timestamp_ms,
         inputs,
         None,
-        |_, _, _| Ok(()),
-        observer,
-    )
-}
-
-/// [`execute_block_observed`] with host bookkeeping: `after_tx` runs after
-/// each transaction's rollback decision. Unsigned chains pass a no-op; signed
-/// hosts advance the account nonce.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_block_hooked(
-    spec: &ChainSpec,
-    branch: Branch,
-    parent: &Header,
-    height: u64,
-    timestamp_ms: u64,
-    inputs: &BlockInputs,
-    accounts: Option<&crate::accounts::AccountConfig>,
-    after_tx: impl FnMut(&mut Branch, usize, &TxEnvelope) -> Result<(), StorageError>,
-    observer: impl FnMut(
-        &Branch,
-        &BlockInputs,
-        &BlockOutcomes,
-        &[ExpiredRecord],
-    ) -> Result<(), StorageError>,
-) -> Result<ExecutedBlock, ExecError> {
-    execute_block_inner(
-        spec,
-        branch,
-        parent,
-        height,
-        timestamp_ms,
-        inputs,
-        accounts,
         Mode::Strict,
-        after_tx,
-        observer,
-    )
-}
-
-/// [`execute_block_hooked`] for a producer building a block from candidate
-/// `inputs`: a transaction whose sender cannot cover its gas reservation, or
-/// that would take the block past its storage cap, is left out with its
-/// sender's later candidates instead of invalidating the block. The header
-/// and outcomes cover the included transactions only, in order; `after_tx`
-/// and the observer see candidate indexes and the included inputs. Each
-/// candidate executes at most once.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_block_hooked(
-    spec: &ChainSpec,
-    branch: Branch,
-    parent: &Header,
-    height: u64,
-    timestamp_ms: u64,
-    inputs: &BlockInputs,
-    accounts: Option<&crate::accounts::AccountConfig>,
-    after_tx: impl FnMut(&mut Branch, usize, &TxEnvelope) -> Result<(), StorageError>,
-    observer: impl FnMut(
-        &Branch,
-        &BlockInputs,
-        &BlockOutcomes,
-        &[ExpiredRecord],
-    ) -> Result<(), StorageError>,
-) -> Result<ExecutedBlock, ExecError> {
-    execute_block_inner(
-        spec,
-        branch,
-        parent,
-        height,
-        timestamp_ms,
-        inputs,
-        accounts,
-        Mode::Build,
-        after_tx,
+        |_, _, _| Ok(()),
         observer,
     )
 }
@@ -499,20 +512,14 @@ pub(crate) fn build_block_hooked(
 /// affordability or fee settlement. The candidate is discarded here so this
 /// path cannot publish its synthetic account state as a real block.
 pub(crate) fn estimate_transaction(
-    spec: &ChainSpec,
+    env: BlockEnv<'_>,
     branch: Branch,
-    parent: &Header,
-    height: u64,
-    timestamp_ms: u64,
     tx: TxEnvelope,
     accounts: Option<&crate::accounts::AccountConfig>,
 ) -> Result<TxOutcome, ExecError> {
-    let executed = execute_block_inner(
-        spec,
+    let executed = execute_block_hooked(
+        env,
         branch,
-        parent,
-        height,
-        timestamp_ms,
         &BlockInputs {
             admin: vec![],
             txs: vec![tx],
@@ -530,13 +537,16 @@ pub(crate) fn estimate_transaction(
         .expect("one estimated transaction"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_block_inner(
-    spec: &ChainSpec,
+/// [`execute_block_observed`] in a given [`Mode`] and with host bookkeeping:
+/// `after_tx` runs after each transaction's rollback decision. Unsigned
+/// chains pass a no-op; signed hosts advance the account nonce.
+///
+/// In [`Mode::Build`] the header and outcomes cover the included
+/// transactions only, in order; `after_tx` and the observer see candidate
+/// indexes and the included inputs. Each candidate executes at most once.
+pub(crate) fn execute_block_hooked(
+    env: BlockEnv<'_>,
     branch: Branch,
-    parent: &Header,
-    height: u64,
-    timestamp_ms: u64,
     inputs: &BlockInputs,
     accounts: Option<&crate::accounts::AccountConfig>,
     mode: Mode,
@@ -548,6 +558,12 @@ fn execute_block_inner(
         &[ExpiredRecord],
     ) -> Result<(), StorageError>,
 ) -> Result<ExecutedBlock, ExecError> {
+    let BlockEnv {
+        spec,
+        parent,
+        height,
+        timestamp_ms,
+    } = env;
     validate::check_successor(spec, parent, height, timestamp_ms)
         .map_err(|fault| ExecError::InvalidBlock(BlockFault::Successor(fault)))?;
     let fresh = branch.block_limit() == Cost::new(spec.params().block_budget)
@@ -713,51 +729,6 @@ impl<'s> Executor<'s> {
         }
     }
 
-    fn read_count(&self, key: &HostKey) -> Result<u64, ExecError> {
-        match self.branch.try_host_get(key)? {
-            None => Ok(0),
-            Some(value) => parse_count(key, &value),
-        }
-    }
-
-    fn write_count(&mut self, key: HostKey, count: u64) -> Result<(), ExecError> {
-        if count == 0 {
-            self.branch.try_host_remove(&key)?;
-        } else {
-            self.branch
-                .try_host_put(key, &count.to_be_bytes())?
-                .map_err(|_| ExecError::Invariant(Invariant::HostValue))?;
-        }
-        Ok(())
-    }
-
-    /// Adds one record due at `height` in `namespace`.
-    fn schedule(&mut self, height: u64, namespace: NamespaceId) -> Result<(), ExecError> {
-        for key in [due_key(height, namespace), total_key(height)] {
-            let count = self
-                .read_count(&key)?
-                .checked_add(1)
-                .ok_or(ExecError::ScheduleInconsistent(ScheduleFault::Overflow))?;
-            self.write_count(key, count)?;
-        }
-        Ok(())
-    }
-
-    /// Removes one record due at `height` in `namespace`.
-    fn unschedule(&mut self, height: u64, namespace: NamespaceId) -> Result<(), ExecError> {
-        for key in [due_key(height, namespace), total_key(height)] {
-            let count =
-                self.read_count(&key)?
-                    .checked_sub(1)
-                    .ok_or(ExecError::ScheduleInconsistent(ScheduleFault::Underflow {
-                        height,
-                        namespace,
-                    }))?;
-            self.write_count(key, count)?;
-        }
-        Ok(())
-    }
-
     fn sweep(&mut self) -> Result<Vec<ExpiryDeletion>, ExecError> {
         let bound = sweep_read_bound(self.branch.pricing(), self.spec.limits())
             .ok_or(ExecError::Invariant(Invariant::SweepBound))?;
@@ -846,7 +817,7 @@ impl<'s> Executor<'s> {
         }
         for (height, due) in swept {
             let key = total_key(height);
-            let total = self.read_count(&key)?;
+            let total = read_count(&self.branch, &key)?;
             if total != due {
                 return Err(ExecError::ScheduleInconsistent(
                     ScheduleFault::TotalMismatch { height, total, due },
@@ -919,7 +890,10 @@ impl<'s> Executor<'s> {
                     other => other,
                 })?;
         }
-        let checkpoint = self.branch.checkpoint();
+        let checkpoint = self
+            .branch
+            .try_checkpoint()
+            .map_err(|e| ExecError::Invariant(Invariant::Engine(e)))?;
         let mut ops = Vec::with_capacity(tx.ops.len());
         let mut spent = 0u64;
         let mut failed = None;
@@ -1171,19 +1145,11 @@ impl<'s> Executor<'s> {
         };
         // Maintain the due schedule for the applied change.
         if let Some(namespace) = op.namespace() {
-            let changed = match op {
-                TxOp::DeleteRecord { .. } => Some((old, None)),
-                _ if new.is_some() && new != old => Some((old, new)),
-                _ => None,
+            let after = match op {
+                TxOp::DeleteRecord { .. } => None,
+                _ => new.or(old),
             };
-            if let Some((before, after)) = changed {
-                if let Some(Lifetime::Until(height)) = before {
-                    self.unschedule(height, namespace)?;
-                }
-                if let Some(Lifetime::Until(height)) = after {
-                    self.schedule(height, namespace)?;
-                }
-            }
+            reschedule(&mut self.branch, namespace, old, after)?;
         }
         Ok(Step::Applied(
             OpOutcome::Applied {
@@ -1226,7 +1192,7 @@ impl<'s> Executor<'s> {
                     EXPIRY_SPILL_WINDOW,
                     self.height.saturating_add(params.max_lifetime),
                     params.expiry_per_block,
-                    |height| self.read_count(&total_key(height)),
+                    |height| read_count(&self.branch, &total_key(height)),
                 )? {
                     Some(height) => Ok(Lifetime::Until(height)),
                     None => Err(HostFault::ExpiryCapacityFull),

@@ -1,6 +1,6 @@
 //! Signed-chain security checks with real independent keys and explicit preimages.
 
-use alloy_primitives::{Keccak256, Signature, U256};
+use alloy_primitives::{Keccak256, Signature, U256, hex};
 use arkiv_db::{
     B256, CellName, Decode, Encode, NamespaceName, OwnerId, Value, decode_exact, encode,
 };
@@ -123,17 +123,8 @@ fn independent_digest(domain: &str, bytes: &[u8]) -> B256 {
     h.finalize()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn unhex<const N: usize>(s: &str) -> [u8; N] {
-    assert_eq!(s.len(), N * 2);
-    let mut out = [0; N];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
-    }
-    out
+    hex::decode(s).unwrap().try_into().unwrap()
 }
 
 #[test]
@@ -165,7 +156,7 @@ fn preimages_are_explicit_and_golden() {
     );
     assert_ne!(g.hash(), g.genesis.hash());
     assert_eq!(
-        hex(signer(1).address().as_bytes()),
+        hex::encode(signer(1).address().as_bytes()),
         "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
     );
     let mut intent = 1u32.to_be_bytes().to_vec();
@@ -217,31 +208,31 @@ fn preimages_are_explicit_and_golden() {
     assert_eq!(signed(), tx); // deterministic RFC6979
     // Explicit byte-layout vectors pinned across dependency changes.
     assert_eq!(
-        hex(g.hash().as_slice()),
+        hex::encode(g.hash().as_slice()),
         "abcd7ff7bbffb39ba38c7425b7e1bc62067f43b91337f932fa5c1b30f56aa1e4"
     );
     assert_eq!(
-        hex(tx.intent_digest().as_slice()),
+        hex::encode(tx.intent_digest().as_slice()),
         "86593c2439e228a69b2d932d0aabb10993bd645c8a094860c2c126504a5a243c"
     );
     assert_eq!(
-        hex(tx.hash().as_slice()),
+        hex::encode(tx.hash().as_slice()),
         "df0b6f89a7f62cf57c39d80b5b02ef229eb5cb8332a82daeda288499ac097077"
     );
     assert_eq!(
-        hex(inputs.digest().as_slice()),
+        hex::encode(inputs.digest().as_slice()),
         "8d65882c69b36e646014d841631a1487f9cc1f37d35da8f13cde0a4e59e2973b"
     );
     assert_eq!(
-        hex(header.intent_digest().as_slice()),
+        hex::encode(header.intent_digest().as_slice()),
         "9dbada0df4eadbed5c827cbb4b20403b8dcecce9c0123b1296398af79d2f1dfe"
     );
     assert_eq!(
-        hex(&tx.signature),
+        hex::encode(tx.signature),
         "8d0dd98ccc63db4657452f56570bda52b59f5cb93a102f7b6d17761c4a1a157c5711e6a10ad898e6afee151858a2e3f27255694f1fa658787b46066f66c527ef01"
     );
     assert_eq!(
-        hex(&header.signature),
+        hex::encode(header.signature),
         "fbeae3e8d997fc820d9e423c6129586b50b90ee5bb84ff745d7a33f0caae65d3132235c22dd3a0b3d7d549a0a1c50322d69b1c5bcdc4e89335c15abd451e200d01"
     );
 }
@@ -287,11 +278,9 @@ fn exact_decoding_versions_truncations_and_hostile_counts() {
     }
     let mut ops = encode(&signed());
     ops[112..116].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert!(SignedTx::from_bytes(&ops).is_err());
+    assert!(decode_exact::<SignedTx>(&ops).is_err());
     assert!(decode_exact::<SignedTx>(&encode(&signed().tx)).is_err());
     assert!(decode_exact::<SignedGenesis>(&encode(&g.genesis)).is_err());
-    assert!(SignedTx::from_bytes(&vec![0; TX_CAP as usize + 1]).is_err());
-    assert!(SignedBlock::from_bytes(&vec![0; BODY_CAP as usize + 1]).is_err());
 }
 
 #[test]
@@ -333,7 +322,7 @@ fn strict_parity_scalars_and_high_s_are_checked_before_recovery() {
         let mut bytes = encode(&tx);
         bytes.truncate(bytes.len() - 65);
         bytes.extend(vec![1; length]);
-        assert!(SignedTx::from_bytes(&bytes).is_err());
+        assert!(decode_exact::<SignedTx>(&bytes).is_err());
     }
     assert!(Signer::from_bytes([0; 32]).is_err());
     assert!(Signer::from_bytes([255; 32]).is_err());

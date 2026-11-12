@@ -2,12 +2,55 @@
 
 ## Unreleased
 
+### Stricter requests and typed errors
+
+- **A y-parity above 1 is `InvalidEthereumTransaction`**; it was reported as
+  `GasPriceBelowMinimum`.
+- **Quantities are minimal `0x` hex.** `"0x+1"` was accepted; a sign, an
+  empty `"0x"` and leading zeros are refused. `"0x0"` is valid.
+- **`arkiv-proposer` subcommands take only their own flags.** `keygen --out k
+  --peer x` wrote a key; it is refused with `InvalidRequest` before any side
+  effect.
+- **A submitted transaction is validated once**, outside the node lock
+  (`protocol::ValidTx`); it was validated again under the lock.
+- The demo runtime answers 500 when a response cannot be serialized, not an
+  empty 200. `Branch::checkpoint` and `Branch::seal` are banned in
+  `arkiv-node`; the fallible forms are used.
+- Error codes are a closed `ErrorCode` enum rendering the same strings;
+  `HistoryPruned` details travel in the error. Durable-engine messages name
+  the admission fault ("genesis row fails admission: ..") where they said
+  "row exceeds admission limits".
+
+### Structure
+
+- Test support (`arkiv_db_storage::testing`, `arkiv_db_redb::testing`) is
+  behind a `testing` feature and is not compiled into the node. The durable
+  import entry points nothing called (`prepare_import`, `import_checkpoint`,
+  `initialize_from_staged`) are removed.
+- `arkiv-node`: `signed/rpc` and `signed/rpc_reads` are module trees with one
+  function per JSON-RPC method; the due schedule, expiry resolution and
+  account debit exist once; `exec` takes a `BlockEnv` and a `Mode`. A failing
+  CLI prints the underlying cause on stderr before its final code line;
+  response bodies are unchanged.
+- `arkiv-db`: `engine.rs` is the `engine/` module tree; proofs, durable
+  publication and the codec share helpers; integration tests are one binary
+  (`tests/it`) over `tests/support`.
+- `arkiv-node`: `signed` no longer imports from `demo` (`text`, `dev`,
+  `http`, `entity_json`, `fsutil`, `error` modules); `Host::create` takes a
+  `Launch` and a `Prefill`; the proposer has one function per subcommand.
+
 ### Cleanup
 
+- **Licence: GPL-3.0-or-later** (root `LICENSE`, every crate manifest).
+  `vendor/alloy-trie` keeps MIT OR Apache-2.0.
+- Removed code that only its own tests used: the raw key-value facade
+  (`Database`, `KvStore`, `MemoryStore`, `WriteBatch`), `KeyWriter` and
+  `KeyReader`, `arkiv::execute_batch`, `SignedTx::from_bytes`,
+  `SignedBlock::from_bytes`, and the unused `vendor/reth-trie`.
 - Removed `arkiv_db_memory::persistent` (unused), about thirty unused public
   items, duplicate runs of the storage contract suite, tests that compared a
   method with its own wrapper, and charge vectors pinned in two files. The
-  workspace runs 1,194 tests, was 1,319; no pinned vector changed.
+  workspace runs 1,167 tests, was 1,319; no pinned vector changed.
 - `FaultyStore` forwards `stage_objects` and `relabel`, as documented. A
   panicking adoption worker no longer leaves the others waiting.
 - Documentation states the current formats and limits; finished plans, run

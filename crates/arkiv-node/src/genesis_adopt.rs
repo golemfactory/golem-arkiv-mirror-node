@@ -34,10 +34,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-type Result<T> = std::result::Result<T, String>;
+use crate::{fsutil, genesis_error::GenesisToolError};
 
-fn err(e: impl std::fmt::Display) -> String {
-    format!("genesis adoption: {e}")
+type Result<T> = std::result::Result<T, GenesisToolError>;
+
+fn err(e: impl std::fmt::Display) -> GenesisToolError {
+    format!("genesis adoption: {e}").into()
 }
 
 /// The staged store inside a run directory's import scratch (`prefill-work`).
@@ -82,24 +84,12 @@ pub fn inspect(staged: &Path) -> Result<Staged> {
     }
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(err)
-}
-
-fn parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-}
-
 /// Refuse before relabelling if the staged store could not later be renamed
 /// to `node`: a relabelled store cannot be installed by the copy path.
 pub fn check_rename(staged: &Path, node: &Path) -> Result<()> {
     let id = std::process::id();
-    let from = parent(staged).join(format!(".adopt-probe-{id}"));
-    let to = parent(node).join(format!(".adopt-probe-{id}.to"));
+    let from = fsutil::parent(staged).join(format!(".adopt-probe-{id}"));
+    let to = fsutil::parent(node).join(format!(".adopt-probe-{id}.to"));
     for stale in [&from, &to] {
         if fs::symlink_metadata(stale).is_ok() {
             fs::remove_file(stale).map_err(err)?;
@@ -115,7 +105,7 @@ pub fn check_rename(staged: &Path, node: &Path) -> Result<()> {
         ))
     })?;
     // Only a few pages are rewritten in place; keep the operator's reserve.
-    check_disk(parent(node), 0)
+    check_disk(fsutil::parent(node), 0)
 }
 
 /// Move a relabelled staged store over the node database. `held` is this
@@ -128,6 +118,6 @@ pub fn publish(staged: &Path, node: &Path, held: &dyn VersionedStore) -> Result<
     // An atomic replacement: `node` names the headless file or the complete
     // adopted database, never neither and never a partial one.
     fs::rename(staged, node).map_err(err)?;
-    sync_dir(parent(node))?;
-    sync_dir(parent(staged))
+    fsutil::sync_dir(fsutil::parent(node)).map_err(err)?;
+    fsutil::sync_dir(fsutil::parent(staged)).map_err(err)
 }

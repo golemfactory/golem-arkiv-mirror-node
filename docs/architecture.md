@@ -9,11 +9,10 @@ here. The engine prioritizes Arkiv's block workload and deterministic
 execution; block-facing APIs map block numbers to internal snapshots.
 Consensus and authorization are host responsibilities.
 
-The raw KV facade (`Database`) implements byte-key operations. The block
-engine above it adds project namespaces, immutable snapshots with branches,
-checkpoints and atomic publication, deterministic metering, typed records
-with per-namespace term indexes, and a declared query subset with keyset
-pagination pinned to one snapshot. The engine keeps its state in Merkle
+The block engine provides project namespaces, each with a raw byte map and
+typed records, immutable snapshots with branches, checkpoints and atomic
+publication, deterministic metering, per-namespace term indexes, and a
+declared query subset with keyset pagination pinned to one snapshot. The engine keeps its state in Merkle
 Patricia maps (`arkiv-db-trie`) and every state has a logical state root.
 Proofs cover complete [equality pages](eq-proof-charges.md) and
 [bounded complete ranges](range-proofs.md).
@@ -36,14 +35,12 @@ without replay.
 
 ```text
 arkiv-db
-  Database<S: KvStore>  --------> arkiv-db-storage::{KvStore, WriteBatch, Entry}
   Engine / Branch / Snapshot ---> arkiv-db-trie::MerkleMap (every engine map)
                             \---> arkiv-db-storage::Entry   (scan result type)
                             \---> arkiv-db-storage::versioned::{StorageError, ObjectReader, SpaceId}
   DurableEngine ----------------> arkiv-db-storage::versioned::VersionedStore
   codec, state root ------------> alloy-primitives (keccak256, B256)
 arkiv-db-memory
-  MemoryStore (KvStore) --------> arkiv-db-storage
   MemoryVersionedStore ---------> arkiv-db-storage::versioned::VersionedStore
 arkiv-db-redb
   RedbStore --------------------> arkiv-db-storage::versioned::VersionedStore
@@ -64,23 +61,19 @@ arkiv-node
   signed (arkiv-proposer) ------> arkiv-db::durable::DurableEngine, arkiv-db-redb, k256, JSON-RPC/REST
 ```
 
-- `arkiv-db-storage` owns the minimal backend interface and data exchanged
-  through it. Operations use raw bytes; point reads and prefix scans return
-  owned data. The contract is fallible so a file backend can report I/O
-  failures without changing successful return types. Its `versioned` module
-  is the separate durable contract: content-addressed
-  immutable objects per space (catalog, host, one space per namespace),
-  insert-only block/manifest/inclusion/index/metadata records and one head,
+- `arkiv-db-storage` owns the versioned storage contract (`versioned`):
+  content-addressed immutable objects per space (catalog, host, one space
+  per namespace), insert-only block/manifest/inclusion/index/metadata records and one head,
   committed atomically by compare-and-set with the outcomes `Committed`,
   `NotCommitted` or `Indeterminate`, store health that latches failures
   until `recover()`, and `reconcile` for indeterminate commits. Its
-  `testing` module holds `FaultyStore`, whose latching mode follows
+  `testing` module (behind the `testing` feature) holds `FaultyStore`, whose latching mode follows
   `RedbStore`'s rule, and the behavioural suite every implementation runs.
-  Both are standard-library-only.
-- `arkiv-db-memory` implements that contract with `BTreeMap<Vec<u8>, Vec<u8>>`
-  (`MemoryStore`). This crate has no record, cell, query, or host knowledge.
-  `MemoryVersionedStore` is the volatile reference implementation of the
-  versioned contract.
+  The crate root also defines `Entry`, the owned key/value pair a scan
+  returns. The crate is standard-library-only.
+- `arkiv-db-memory` holds `MemoryVersionedStore`, the volatile reference
+  implementation of the versioned contract. It has no record, cell, query,
+  or host knowledge and is standard-library-only.
 - `arkiv-db-redb` implements the versioned contract over one redb file
   (`RedbStore`): one redb transaction per commit with immediate durability
   and quick repair, one object table per namespace, a fresh read transaction
@@ -103,8 +96,7 @@ arkiv-node
   `walk`, and order-preserving fixed-width key encoders. It defines its own
   loader and error types so that it depends on neither the engine nor the
   storage contract. See [the state trie notes](state-trie.md).
-- `arkiv-db` provides the raw embedded facade `Database` over a chosen
-  backend (defaulting to `MemoryStore`), the block engine in the `engine`,
+- `arkiv-db` provides the block engine in the `engine`,
   `meter`, `namespace`, `record`, `query`, `state`, `host` and the private
   `typed`, `layout` (map key and leaf encodings) and `nodes` (the loader
   seam) modules, the canonical binary codec in `codec`,
@@ -142,44 +134,34 @@ is a separate crate because it is the host: consensus-facing formats,
 admission, expiry scheduling and block assembly stay outside the engine,
 which keeps no notion of blocks, requests or time.
 
-## Initial semantics
+## Raw byte map semantics
 
-These are the semantics of the raw KV facade and its backends.
+Each namespace holds a raw byte map beside its typed records.
 
-- Keys and values are arbitrary byte strings, including empty strings and
-  embedded zero bytes. These are **storage keys**, not the fixed-width record
+- Keys and values are byte strings, including empty strings and embedded
+  zero bytes. These are **storage keys**, not the fixed-width record
   identities in the higher-level Golem-DB model.
 - A point read returns `None` for a missing key. An empty value is present.
 - A put inserts or replaces a value; deleting a missing key succeeds.
-- A write batch applies in submission order, so the last operation for a key
-  wins. Readers cannot observe a partially applied batch. A backend returning
-  an error must leave its logical state unchanged.
+- Operations apply in submission order, so the last operation for a key
+  wins.
 - A prefix scan returns only matching keys, sorted by unsigned bytewise
-  lexicographic order. An empty prefix returns the entire store. Results are
-  owned, so subsequent writes do not change an earlier result.
-- Writes require exclusive access. There is no synchronization or concurrent
-  writer API.
+  lexicographic order, up to its budget. An empty prefix matches every key
+  of the namespace. Results are owned, so subsequent writes do not change an
+  earlier result.
+- Keys and scan prefixes have a hard 20-byte local limit; their namespace is
+  a separate fixed-width ID. Oversized inputs fail admission before
+  traversal.
 
-The memory implementation has no recoverable storage errors. Its batch atomicity
-comes from exclusive access and infallible map operations; it promises no
-recovery from allocation failure, panic, or process termination. Its scans
-collect all matches into memory and have no pagination or budget. This is a
-small functional baseline, not a production capacity claim. The engine's
-raw byte maps follow the same key semantics (empty keys and values, bytewise
-order, missing-key delete succeeds), but add namespaces and budgets; the
-engine's typed records have their own key rules (see below). Raw engine keys
-and scan prefixes have a hard 20-byte local limit; their namespace is a
-separate fixed-width ID. Oversized inputs fail admission before traversal.
+The engine's typed records have their own key rules (see below).
 
 ## Engine layer
 
-### Why per-namespace persistent maps instead of the mutable `KvStore`
+### Why per-namespace persistent maps
 
-`KvStore` is a single-version, mutable interface: `write_batch` replaces the
-current state in place, reads return owned copies, and scans collect every
-match. A snapshot layer above it would need a full copy per publication
-(O(database size)) or an overlay plus undo log. The engine instead keeps all
-of its state in `arkiv_db_trie::MerkleMap`:
+A snapshot layer over a single-version, mutable key-value store would need a
+full copy per publication (O(database size)) or an overlay plus undo log.
+The engine instead keeps all of its state in `arkiv_db_trie::MerkleMap`:
 
 - Cloning a map is O(1), so a checkpoint, the per-operation rollback copy, an
   estimation scratch copy and a published snapshot each cost a few pointer
@@ -197,21 +179,10 @@ of its state in `arkiv_db_trie::MerkleMap`:
   contents alone, and every node a lookup reads can be loaded lazily from
   committed storage through a loader.
 
-The engine uses `arkiv_db_storage::Entry` only as the scan result type. It
-never constructs a `MemoryStore` or `Database`, and no engine state is
-reachable through the raw facade.
-
-### What the raw facade is still for
-
-`Database<S: KvStore>` remains the byte-KV storage foundation and the
-contract a raw durable backend would implement; its tests pin down the byte-key
-semantics that the engine's raw byte maps also follow. It is not the data
-plane: it has no namespaces, snapshots or metering, so nothing done through
-it can bypass namespace or metering rules, because the two structures share
-no state. `DurableEngine` places persistence beneath the engine's state.
-Merely implementing a redb `KvStore` does not
-persist `Engine`: durable immutable objects, historical manifests, fallible
-lazy reads and atomic block/head publication require a separate contract.
+The engine uses `arkiv_db_storage::Entry` as the scan result type.
+`DurableEngine` places persistence beneath the engine's state: durable
+immutable objects, historical manifests, fallible lazy reads and atomic
+block/head publication go through the versioned storage contract.
 
 ### State layout
 
@@ -650,19 +621,10 @@ derived by hand from the trie shapes of their fixtures.
 
 ## Block-oriented test workload
 
-The raw KV integration tests group accepted mutations into block packets,
-submitting one `WriteBatch` per block and checking state at block boundaries.
-The model test runs four deterministic chains of 256 blocks, with 0, 1, 2, 8,
-32 or 128 operations per block. Repeated-key changes preserve execution order.
-Backend tests check that a whole packet arrives once and a rejected packet
-leaves the preceding state intact. In those tests heights are labels and the
-database stores only its current state.
-
 The engine tests use real blocks: a `Branch` per block, per-operation budgets,
-checkpoints, seal, publication and a `host::BlockMap` from block numbers to
-terminal snapshots; the typed-record tests add record writes, host expiry and
-queries compared with a full-scan reference at every snapshot. See the
-[testing notes](testing.md).
+checkpoints, seal and publication; the typed-record tests add record writes,
+host expiry and queries compared with a full-scan reference at every
+snapshot. See the [testing notes](testing.md).
 
 ## Project namespaces
 

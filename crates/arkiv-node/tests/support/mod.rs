@@ -285,5 +285,5 @@ pub fn total_key(height: u64) -> [u8; 32] {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    alloy_primitives::hex::encode(bytes)
 }

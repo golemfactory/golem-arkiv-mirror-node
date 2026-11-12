@@ -216,10 +216,46 @@ fn required(
         .read_record_bounded(table, key, cap)?
         .ok_or_else(|| corrupt(format!("required {table:?} record missing")))
 }
+/// Every record of `batch` is stored with the same bytes.
+fn records_present(
+    store: &dyn VersionedStore,
+    batch: &CommitBatch,
+    mismatch: &'static str,
+) -> Result<(), DurableError> {
+    for (table, key, bytes) in &batch.records {
+        if required(store, *table, key, bytes.len())? != *bytes {
+            return Err(corrupt(mismatch));
+        }
+    }
+    Ok(())
+}
+/// No record of `batch` is stored.
+fn records_absent(
+    store: &dyn VersionedStore,
+    batch: &CommitBatch,
+    present: &'static str,
+) -> Result<(), DurableError> {
+    for (table, key, bytes) in &batch.records {
+        if store
+            .read_record_bounded(*table, key, bytes.len())?
+            .is_some()
+        {
+            return Err(corrupt(present));
+        }
+    }
+    Ok(())
+}
 fn head_of(manifest: &EngineManifest) -> Head {
     Head {
         height: manifest.sequence,
         hash: manifest.id().0,
+    }
+}
+fn info_of(manifest: &EngineManifest) -> CommitInfo {
+    CommitInfo {
+        snapshot: SnapshotId::from_sequence(manifest.sequence),
+        commit_id: manifest.id(),
+        state_root: manifest.state_root,
     }
 }
 
@@ -336,6 +372,40 @@ fn manifest_batch(parent: Option<Head>, manifest: &EngineManifest) -> CommitBatc
     batch
 }
 
+/// The records of a height-zero publication, in the order every
+/// initialization path writes them.
+fn genesis_batch(
+    manifest: &EngineManifest,
+    genesis: &EngineGenesis,
+    identity: Option<&simulator::SimulatorIdentity>,
+    packet: Option<&simulator::SimulatorPacket>,
+) -> Result<CommitBatch, DurableError> {
+    let mut batch = manifest_batch(None, manifest);
+    let profile = identity.map_or_else(profile_bytes, |_| simulator::profile_bytes());
+    batch
+        .put_record(Table::Meta, PROFILE_KEY, profile)
+        .put_record(Table::Meta, GENESIS_KEY, genesis.envelope());
+    if let Some(identity) = identity {
+        batch.put_record(Table::Meta, simulator::IDENTITY_KEY, identity.envelope()?);
+    }
+    if let Some(packet) = packet {
+        packet.append(&mut batch, manifest)?;
+    }
+    Ok(batch)
+}
+
+/// Whether a headless store already holds a profile,
+/// genesis or simulator identity record.
+fn has_engine_metadata(store: &dyn VersionedStore) -> Result<bool, DurableError> {
+    for key in [PROFILE_KEY, GENESIS_KEY, simulator::IDENTITY_KEY] {
+        let cap = GENESIS_MAX_BYTES + simulator::IDENTITY_MAX_BYTES + 32;
+        if store.read_record_bounded(Table::Meta, key, cap)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Prove that genesis is self-contained using only staged objects. Normal
 /// commits may stop staging at stored links; an initializer must not inherit
 /// those links from another database. Iteration retains only traversal stacks,
@@ -425,8 +495,9 @@ fn verify_genesis_objects(
             check_map(&leaf.records, &loader, |_, _| Ok(()))?;
             check_map(&leaf.typed.keys, &loader, |_, _| Ok(()))?;
             check_map(&leaf.typed.rows, &loader, |_, row| {
-                crate::typed::validate_create(&genesis.limits, &row.cells)
-                    .map_err(|_| incompatible("genesis row exceeds engine admission limits"))
+                crate::typed::validate_create(&genesis.limits, &row.cells).map_err(|fault| {
+                    incompatible(format!("genesis row fails admission: {fault:?}"))
+                })
             })?;
             check_map(&leaf.typed.terms, &loader, |_, posting| {
                 check_map(&posting.0, &loader, |_, _| Ok(()))
@@ -472,12 +543,8 @@ impl DurableEngine {
                 "simulator initialization requires a host packet",
             ));
         }
-        if let Some(packet) = &packet
-            && packet.reserved_bytes()? > options.prepare_bytes
-        {
-            return Err(DurableError::ResourceLimit(
-                "host packet exceeds preparation cap".into(),
-            ));
+        if let Some(packet) = &packet {
+            packet.check_fits(&options)?;
         }
         if let Some(identity) = &simulator {
             identity.validate(&genesis)?;
@@ -525,27 +592,8 @@ impl DurableEngine {
         } else {
             0
         };
-        let header = genesis.initial_header();
-        let manifest = EngineManifest {
-            genesis: genesis.id(),
-            sequence: 0,
-            parent: None,
-            state_root: header.root(),
-            state: header,
-        };
-        let mut batch = manifest_batch(None, &manifest);
-        let profile = simulator
-            .as_ref()
-            .map_or_else(profile_bytes, |_| simulator::profile_bytes());
-        batch
-            .put_record(Table::Meta, PROFILE_KEY, profile)
-            .put_record(Table::Meta, GENESIS_KEY, genesis.envelope());
-        if let Some(identity) = &simulator {
-            batch.put_record(Table::Meta, simulator::IDENTITY_KEY, identity.envelope()?);
-        }
-        if let Some(packet) = packet {
-            packet.append(&mut batch, &manifest)?;
-        }
+        let manifest = EngineManifest::genesis(&genesis, genesis.initial_header());
+        let mut batch = genesis_batch(&manifest, &genesis, simulator.as_ref(), packet.as_ref())?;
         if batch.logical_bytes() > options.prepare_bytes as u64 {
             return Err(DurableError::ResourceLimit(
                 "genesis preparation bytes".into(),
@@ -568,12 +616,7 @@ impl DurableEngine {
         };
         let mut engine = Self::from_manifest(store, genesis, options, manifest, simulator)?;
         engine.last_preparation = preparation;
-        InitializationPending {
-            engine,
-            batch,
-            retry_allowed: true,
-        }
-        .commit()
+        InitializationPending::first_commit(engine, batch)
     }
 
     /// Reads a bounded set of metadata/manifests/index entries and zero trie
@@ -644,11 +687,7 @@ impl DurableEngine {
         self.head.clone()
     }
     pub fn head_info(&self) -> CommitInfo {
-        CommitInfo {
-            snapshot: self.head(),
-            commit_id: self.manifest.id(),
-            state_root: self.manifest.state_root,
-        }
+        info_of(&self.manifest)
     }
     pub fn writer_state(&self) -> WriterState {
         self.state
@@ -765,7 +804,7 @@ impl DurableEngine {
         candidate: SealedCandidate,
         packet: Option<simulator::SimulatorPacket>,
     ) -> Result<CommitInfo, PrepareFailure> {
-        match self.prepare_inner(&candidate, packet.as_ref(), None) {
+        match self.prepare_inner(&candidate, packet.as_ref()) {
             Ok(prepared) => {
                 let info = prepared.info;
                 self.pending = Some(prepared);
@@ -783,7 +822,6 @@ impl DurableEngine {
         &mut self,
         candidate: &SealedCandidate,
         packet: Option<&simulator::SimulatorPacket>,
-        checkpoint: Option<&[u8]>,
     ) -> Result<Prepared, DurableError> {
         if self.simulator.is_some() != packet.is_some() {
             return Err(incompatible(
@@ -792,11 +830,7 @@ impl DurableEngine {
         }
         if let Some(packet) = packet {
             packet.validate()?;
-            if packet.reserved_bytes()? > self.options.prepare_bytes {
-                return Err(DurableError::ResourceLimit(
-                    "host packet exceeds preparation cap".into(),
-                ));
-            }
+            packet.check_fits(&self.options)?;
         }
         if self.pending.is_some() {
             return Err(DurableError::AlreadyPrepared);
@@ -853,13 +887,6 @@ impl DurableEngine {
         if let Some(packet) = packet {
             packet.append(&mut batch, &manifest)?;
         }
-        if let Some(checkpoint) = checkpoint {
-            batch.put_record(
-                Table::Meta,
-                streaming::checkpoint_key(sequence).into_bytes(),
-                checkpoint.to_vec(),
-            );
-        }
         let staging = prepare::Staging::collect(
             &candidate.state,
             &self.options,
@@ -867,11 +894,7 @@ impl DurableEngine {
             visits,
         )?;
         batch.objects = staging.objects;
-        let info = CommitInfo {
-            snapshot: SnapshotId::from_sequence(sequence),
-            commit_id: manifest.id(),
-            state_root: manifest.state_root,
-        };
+        let info = info_of(&manifest);
         let snapshot = Snapshot::from_header(
             info.snapshot,
             Some(self.head()),
@@ -948,23 +971,18 @@ impl DurableEngine {
             )?;
             let actual = head_of(&manifest);
             if actual == pending.batch.new_head {
-                for (table, key, bytes) in &pending.batch.records {
-                    if required(self.context.store.as_ref(), *table, key, bytes.len())? != *bytes {
-                        return Err(corrupt("pending record mismatch"));
-                    }
-                }
+                records_present(
+                    self.context.store.as_ref(),
+                    &pending.batch,
+                    "pending record mismatch",
+                )?;
                 Ok(true)
             } else if Some(actual) == pending.batch.expected_head && manifest == self.manifest {
-                for (table, key, bytes) in &pending.batch.records {
-                    if self
-                        .context
-                        .store
-                        .read_record_bounded(*table, key, bytes.len())?
-                        .is_some()
-                    {
-                        return Err(corrupt("pending record exists under unchanged parent"));
-                    }
-                }
+                records_absent(
+                    self.context.store.as_ref(),
+                    &pending.batch,
+                    "pending record exists under unchanged parent",
+                )?;
                 if head_of(&pending.manifest) != pending.batch.new_head {
                     return Err(corrupt("prepared identity mismatch"));
                 }
@@ -1044,6 +1062,18 @@ impl fmt::Debug for InitializationPending {
     }
 }
 impl InitializationPending {
+    fn first_commit(
+        engine: DurableEngine,
+        batch: CommitBatch,
+    ) -> Result<Initialization, DurableError> {
+        Self {
+            engine,
+            batch,
+            retry_allowed: true,
+        }
+        .commit()
+    }
+
     pub fn commit(self) -> Result<Initialization, DurableError> {
         if !self.retry_allowed {
             return Err(DurableError::WriterUnavailable);
@@ -1069,55 +1099,46 @@ impl InitializationPending {
     /// returned. A fresh open requires an operational medium/recovery decision.
     pub fn recover(&mut self) -> Result<bool, DurableError> {
         self.retry_allowed = false;
-        let absent = self
-            .engine
-            .context
-            .recover(|| match self.engine.context.store.head()? {
-                None => {
-                    for (table, key, bytes) in &self.batch.records {
-                        if self
-                            .engine
-                            .context
-                            .store
-                            .read_record_bounded(*table, key, bytes.len())?
-                            .is_some()
+        let absent =
+            self.engine
+                .context
+                .recover(|| match self.engine.context.store.head()? {
+                    None => {
+                        records_absent(
+                            self.engine.context.store.as_ref(),
+                            &self.batch,
+                            "partial initialization metadata",
+                        )?;
+                        Ok(true)
+                    }
+                    Some(head) if head == self.batch.new_head => {
+                        if read_open(
+                            self.engine.context.store.as_ref(),
+                            &self.engine.genesis,
+                            self.engine.simulator.as_ref(),
+                        )? != self.engine.manifest
                         {
-                            return Err(corrupt("partial initialization metadata"));
+                            return Err(corrupt("initialization identity mismatch"));
                         }
-                    }
-                    Ok(true)
-                }
-                Some(head) if head == self.batch.new_head => {
-                    if read_open(
-                        self.engine.context.store.as_ref(),
-                        &self.engine.genesis,
-                        self.engine.simulator.as_ref(),
-                    )? != self.engine.manifest
-                    {
-                        return Err(corrupt("initialization identity mismatch"));
-                    }
-                    for (table, key, bytes) in &self.batch.records {
-                        if required(self.engine.context.store.as_ref(), *table, key, bytes.len())?
-                            != *bytes
-                        {
-                            return Err(corrupt("initialization host packet mismatch"));
+                        records_present(
+                            self.engine.context.store.as_ref(),
+                            &self.batch,
+                            "initialization host packet mismatch",
+                        )?;
+                        for (space, id, bytes) in &self.batch.objects {
+                            if self.engine.context.store.load_object_bounded(
+                                *space,
+                                id,
+                                bytes.len(),
+                            )? != *bytes
+                            {
+                                return Err(corrupt("initialization object mismatch"));
+                            }
                         }
+                        Ok(false)
                     }
-                    for (space, id, bytes) in &self.batch.objects {
-                        if self
-                            .engine
-                            .context
-                            .store
-                            .load_object_bounded(*space, id, bytes.len())?
-                            != *bytes
-                        {
-                            return Err(corrupt("initialization object mismatch"));
-                        }
-                    }
-                    Ok(false)
-                }
-                Some(_) => Err(corrupt("unexpected initialization head")),
-            })?;
+                    Some(_) => Err(corrupt("unexpected initialization head")),
+                })?;
         self.retry_allowed = absent;
         Ok(absent)
     }

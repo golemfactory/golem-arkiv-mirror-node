@@ -99,7 +99,7 @@ impl Chain {
             .put_record(Table::BlockIndex, hash, height_key(self.height));
         self.parent = Some(batch.new_head);
         self.height += 1;
-        commit(store, batch);
+        commit(store, &batch);
     }
 }
 

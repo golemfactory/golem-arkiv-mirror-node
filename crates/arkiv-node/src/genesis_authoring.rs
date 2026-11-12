@@ -27,7 +27,9 @@ use crate::{
 };
 
 pub type AuthoringReport = serde_json::Value;
-type Result<T> = std::result::Result<T, String>;
+use crate::genesis_error::GenesisToolError;
+
+type Result<T> = std::result::Result<T, GenesisToolError>;
 const DOCUMENT_CAP: usize = 1024 * 1024;
 const INPUT_CAP: usize = 8 * DOCUMENT_CAP;
 const ROW_CAP: usize = 256;
@@ -292,7 +294,7 @@ struct Compiled {
     lock: Lock,
 }
 
-fn err(e: impl std::fmt::Display) -> String {
+fn err(e: impl std::fmt::Display) -> GenesisToolError {
     let mut message = e.to_string();
     if message.len() > 512 {
         let mut end = 512;
@@ -302,7 +304,7 @@ fn err(e: impl std::fmt::Display) -> String {
         message.truncate(end);
         message.push('…');
     }
-    message
+    message.into()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -313,7 +315,7 @@ fn expect(value: &str, required: &str, field: &str) -> Result<()> {
     if value == required {
         Ok(())
     } else {
-        Err(format!("unsupported {field}: {}", err(value)))
+        Err(format!("unsupported {field}: {}", err(value)).into())
     }
 }
 
@@ -361,23 +363,12 @@ fn uint256(s: &str) -> Result<U256> {
 }
 
 fn fixed_hex<const N: usize>(s: &str) -> Result<[u8; N]> {
-    let s = s.strip_prefix("0x").ok_or("expected lowercase 0x hex")?;
-    if s.len() != N * 2
-        || !s
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(format!("expected {N}-byte lowercase hex"));
+    if !s.starts_with("0x") {
+        return Err("expected lowercase 0x hex".into());
     }
-    let mut out = [0; N];
-    for (byte, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-        *byte = (hex_digit(pair[0]) << 4) | hex_digit(pair[1]);
-    }
-    Ok(out)
-}
-
-fn hex_digit(b: u8) -> u8 {
-    if b <= b'9' { b - b'0' } else { b - b'a' + 10 }
+    crate::text::unhex(s, N)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("expected {N}-byte lowercase hex").into())
 }
 
 fn base64_bytes(s: &str) -> Result<Vec<u8>> {
@@ -478,7 +469,7 @@ fn address(s: &str, aliases: &BTreeMap<String, [u8; 20]>) -> Result<[u8; 20]> {
         Some(label) => aliases
             .get(label)
             .copied()
-            .ok_or_else(|| format!("unknown allocation alias @{}", err(label))),
+            .ok_or_else(|| format!("unknown allocation alias @{}", err(label)).into()),
         None => fixed_hex(s),
     }
 }
@@ -585,11 +576,11 @@ fn utf8(bytes: &[u8]) -> Result<&str> {
 
 fn parse_toml<T: DeserializeOwned>(bytes: &[u8], path: &str) -> Result<T> {
     if bytes.len() > DOCUMENT_CAP {
-        return Err(format!("{path}: document exceeds 1 MiB"));
+        return Err(format!("{path}: document exceeds 1 MiB").into());
     }
     let text = utf8(bytes)?;
     no_multiline(text)?;
-    toml::from_str(text).map_err(|e| format!("{path}: {}", err(e)))
+    toml::from_str(text).map_err(|e| format!("{path}: {}", err(e)).into())
 }
 // serde_json::Value normally silently replaces duplicate object keys. This
 // recursive visitor rejects them before conversion into the typed row schema.
@@ -661,7 +652,7 @@ fn relative(path: &str) -> Result<Vec<&str>> {
             .iter()
             .any(|p| p.is_empty() || *p == "." || *p == "..")
     {
-        return Err(format!("unsafe relative path: {}", err(path)));
+        return Err(format!("unsafe relative path: {}", err(path)).into());
     }
     Ok(parts)
 }
@@ -722,16 +713,14 @@ fn read_relative(root: &File, path: &str, cap: usize) -> Result<Vec<u8>> {
     let file = open_relative(root, path, OFlags::RDONLY)?;
     let meta = file.metadata().map_err(err)?;
     if !meta.is_file() || meta.len() > cap as u64 {
-        return Err(format!(
-            "{path}: requires regular file within {cap}-byte cap"
-        ));
+        return Err(format!("{path}: requires regular file within {cap}-byte cap").into());
     }
     let mut bytes = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(err)?;
     if bytes.len() > cap {
-        return Err(format!("{path}: file exceeds byte cap"));
+        return Err(format!("{path}: file exceeds byte cap").into());
     }
     Ok(bytes)
 }
@@ -750,7 +739,7 @@ impl Inputs {
             return Err("at most 512 source files are supported".into());
         }
         if path.eq_ignore_ascii_case(LOCK_FILE) || !self.paths.insert(path.to_lowercase()) {
-            return Err(format!("duplicate or case-colliding source path: {path}"));
+            return Err(format!("duplicate or case-colliding source path: {path}").into());
         }
         let cap = DOCUMENT_CAP.min(INPUT_CAP - self.total);
         let bytes = read_relative(&self.root, path, cap)?;
@@ -760,7 +749,7 @@ impl Inputs {
             sha256: sha256(&bytes),
         };
         if length.is_some_and(|n| n != pin.bytes) || hash.is_some_and(|h| h != pin.sha256) {
-            return Err(format!("{path}: supplied source pin mismatch"));
+            return Err(format!("{path}: supplied source pin mismatch").into());
         }
         self.total += bytes.len();
         self.pins.push(pin);
@@ -837,7 +826,8 @@ fn rent_cap(p: &Params) -> Result<u64> {
         return Err(format!(
             "max_rent_lifetime_seconds must be 1 to {} (100 years)",
             crate::gas::MAX_RENT_CAP_SECONDS
-        ));
+        )
+        .into());
     }
     Ok(seconds)
 }
@@ -912,9 +902,9 @@ fn compile(path: &Path) -> Result<Compiled> {
             PRESET_ID => parse_toml(PRESET.as_bytes(), PRESET_ID)?,
             PRESET_4_ID => parse_toml(PRESET_4.as_bytes(), PRESET_4_ID)?,
             _ => {
-                return Err(format!(
-                    "unsupported preset: expected {PRESET_ID} or {PRESET_4_ID}"
-                ));
+                return Err(
+                    format!("unsupported preset: expected {PRESET_ID} or {PRESET_4_ID}").into(),
+                );
             }
         },
         (None, Some(path), bytes, hash) => {
@@ -1023,7 +1013,7 @@ fn compile(path: &Path) -> Result<Compiled> {
                 let text = utf8(&bytes)?;
                 for (i, line) in text.lines().enumerate() {
                     if line.is_empty() {
-                        return Err(format!("{}:{}: empty JSONL line", source.path, i + 1));
+                        return Err(format!("{}:{}: empty JSONL line", source.path, i + 1).into());
                     }
                     rows.push(
                         strict_json(line.as_bytes())
@@ -1466,6 +1456,7 @@ mod tests {
         assert!(
             build(&fixture.inline(), &fixture.bundle(), true)
                 .unwrap_err()
+                .to_string()
                 .contains("stale")
         );
         let refreshed = lock(&fixture.inline(), true).unwrap();
@@ -1494,7 +1485,7 @@ mod tests {
             "expires_at_height = \"86400\"",
             "expires_at_height = \"18446744073709551615\"",
         );
-        let error = lock(&fixture.inline(), true).unwrap_err();
+        let error = lock(&fixture.inline(), true).unwrap_err().to_string();
         assert!(error.contains("finite positive expiry"), "{error}");
         fixture.change(
             &fixture.inline(),
@@ -1810,6 +1801,7 @@ mod tests {
         assert!(
             lock(&fixture.chain(), true)
                 .unwrap_err()
+                .to_string()
                 .contains("pin mismatch")
         );
         assert!(!fixture.bundle().exists());
@@ -1846,6 +1838,7 @@ mod tests {
             inputs
                 .read("payloads/Welcome.txt", None, None)
                 .unwrap_err()
+                .to_string()
                 .contains("case-colliding")
         );
         stdfs::write(fixture.0.join("large"), vec![0; DOCUMENT_CAP + 1]).unwrap();
@@ -1865,6 +1858,7 @@ mod tests {
         assert!(
             build(&fixture.inline(), &fixture.bundle(), false)
                 .unwrap_err()
+                .to_string()
                 .contains("canonical byte cap")
         );
         assert!(!fixture.bundle().exists());
@@ -1880,6 +1874,7 @@ mod tests {
         assert!(
             verify(&fixture.bundle())
                 .unwrap_err()
+                .to_string()
                 .contains("report differs")
         );
         stdfs::write(&report, original).unwrap();
@@ -1892,6 +1887,7 @@ mod tests {
         assert!(
             verify(&fixture.bundle())
                 .unwrap_err()
+                .to_string()
                 .contains("profile differs")
         );
     }
@@ -1905,7 +1901,7 @@ mod tests {
         fn unwrap_err_string(self) -> String {
             match self {
                 Ok(_) => panic!("expected error"),
-                Err(e) => e,
+                Err(e) => e.to_string(),
             }
         }
     }

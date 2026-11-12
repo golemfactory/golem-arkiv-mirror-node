@@ -262,7 +262,8 @@ One block may touch several namespaces. The engine publishes all of a
 candidate's accepted namespace mutations, index updates and ownership changes
 together as one snapshot; projects never advance independently. Internal
 snapshot IDs are distinct from block heights as described in the single-block
-contract, and the host's `BlockMap` records only a block's terminal snapshot.
+contract, and the host maps a block number only to that block's terminal
+snapshot.
 
 The composition of the state root, with
 leaves in the canonical codec (see `docs/architecture.md` for the layouts):

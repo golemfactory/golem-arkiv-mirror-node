@@ -18,7 +18,7 @@ use alloy_primitives::{I256, U256};
 use arkiv_db::{Float32, Float64, TypeTag, Value};
 use serde_json::{Value as Json, json};
 
-use crate::demo::wire::hex;
+use crate::text::{hex, unhex};
 
 /// Two's complement big-endian `bytes` as `(negative, magnitude)`.
 fn signed_magnitude(bytes: [u8; 32]) -> (bool, U256) {
@@ -115,26 +115,8 @@ pub fn to_json(value: &Value) -> Json {
     }
 }
 
-/// Lower-case `0x` hexadecimal of any even length.
-fn hex_bytes(text: &str) -> Option<Vec<u8>> {
-    let digits = text.strip_prefix("0x")?;
-    if digits.len() % 2 != 0 {
-        return None;
-    }
-    let nibble = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    };
-    digits
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some(nibble(pair[0])? * 16 + nibble(pair[1])?))
-        .collect()
-}
-
 fn exact_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    hex_bytes(text)?.try_into().ok()
+    unhex(text, usize::MAX)?.try_into().ok()
 }
 
 /// A canonical decimal integer: parses and prints back identically.
@@ -155,7 +137,7 @@ pub fn from_json(type_name: &str, json: &Json) -> Option<Value> {
     Some(match tag {
         TypeTag::Bool => unreachable!("handled above"),
         TypeTag::Str => Value::str(text),
-        TypeTag::Bytes => Value::bytes(&hex_bytes(text)?),
+        TypeTag::Bytes => Value::bytes(&unhex(text, usize::MAX)?),
         TypeTag::I32 => Value::I32(canonical(text)?),
         TypeTag::I64 => Value::I64(canonical(text)?),
         TypeTag::I128 => Value::I128(canonical(text)?),

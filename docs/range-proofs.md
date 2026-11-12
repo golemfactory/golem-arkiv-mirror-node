@@ -54,16 +54,10 @@ The browser accepts the server's complete result without a second hard-coded
 row-count limit. The hosted 8 MiB HTTP envelope, proof-serving budget, and
 inspector's separate 1 MiB raw-proof / 8 MiB JSON limits still apply.
 
-Use the opt-in engine experiment to measure larger proofs independently of
-those transport and inspector limits:
-
-```sh
-RANGE_BENCH_ROWS=10000 cargo test --release -p arkiv-db \
-  --test range_proofs range_scaling_experiment -- --ignored --nocapture
-```
-
-Measured locally on 2026-09-27, one run per case, optimized build, in-memory
-records with one numeric attribute and an 8-byte key (no entity payload):
+Larger proofs, independent of those transport and inspector limits, were
+measured directly on the engine: locally on 2026-09-27, one run per case,
+optimized build, in-memory records with one numeric attribute and an 8-byte
+key (no entity payload):
 
 | Rows | Distinct values | Binary proof bytes | Generate, including internal verification | Verify |
 | ---: | ---: | ---: | ---: | ---: |

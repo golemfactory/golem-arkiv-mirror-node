@@ -1,8 +1,9 @@
 //! Diagnostic full-node tree reads; these responses are not light-node proofs.
 
-use super::{Node, Shared, parse, snapshot};
+use super::{Node, Shared, snapshot};
+use crate::http::json_body;
 use crate::{
-    signed::{Error, Result},
+    signed::{Error, ErrorCode, Result},
     simulator::wire::{REQUEST_CAP, hex, number, pack},
     value_json::to_json,
 };
@@ -48,7 +49,7 @@ pub(super) async fn handle(
     body: Body,
     admission: OwnedSemaphorePermit,
 ) -> Result<Json> {
-    let q: Request = parse(body, REQUEST_CAP).await?;
+    let q: Request = json_body(body, REQUEST_CAP).await?;
     if !matches!(
         q.map.as_str(),
         "catalog" | "records" | "keys" | "rows" | "terms" | "postings"
@@ -58,17 +59,17 @@ pub(super) async fn handle(
         || (q.map != "postings" && !q.term_path.is_empty())
         || (q.map == "catalog" && q.namespace.is_some())
     {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let ns = q
         .namespace
         .as_deref()
         .map(number)
         .transpose()?
-        .map(|n| NamespaceId::from_ordinal(n).ok_or(Error("InvalidRequest")))
+        .map(|n| NamespaceId::from_ordinal(n).ok_or(Error::from(ErrorCode::InvalidRequest)))
         .transpose()?;
     if q.map != "catalog" && ns.is_none() {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let height = number(&q.height)?;
     let admitted = rt.reads.admit()?;
@@ -78,7 +79,7 @@ pub(super) async fn handle(
             let (certificate, s, identity) = {
                 let node = rt.read_node()?;
                 let Node::Full(host) = &*node else {
-                    return Err(Error("UnsupportedNodeRole"));
+                    return Err(ErrorCode::UnsupportedNodeRole.into());
                 };
                 (
                     host.certificate(height)?,
@@ -88,18 +89,18 @@ pub(super) async fn handle(
             };
             let h = s.state_header();
             if h.root() != certificate.header.state_root {
-                return Err(Error("InvalidProof"));
+                return Err(ErrorCode::InvalidProof.into());
             }
             let m = s
                 .explore_tree(&q.map, ns, &q.path, &q.term_path)?
-                .ok_or(Error("TreePathNotFound"))?;
+                .ok_or(ErrorCode::TreePathNotFound)?;
             // Values can carry payloads. Bound bytes before hexadecimal/JSON amplification.
             let node_bytes = m
                 .node
                 .as_ref()
                 .map_or(0, |n| n.rlp.len() + n.value.as_ref().map_or(0, Vec::len));
             if node_bytes > 384 * 1024 {
-                return Err(Error("ResponseTooLarge"));
+                return Err(ErrorCode::ResponseTooLarge.into());
             }
             let decoded = match m.decoded {
                 None => Json::Null,

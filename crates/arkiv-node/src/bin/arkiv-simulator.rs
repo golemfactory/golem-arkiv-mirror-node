@@ -3,9 +3,10 @@
 use arkiv_db::{decode_exact, durable::Options};
 use arkiv_db_redb::{RedbConfig, RedbStore};
 use arkiv_db_storage::versioned::VersionedStore;
+use arkiv_node::health::Health;
 use arkiv_node::simulator::{
-    Error, Result,
-    host::{Host, RunConfig, parse_uuid},
+    Error, ErrorCode, Result,
+    host::{Host, Role, RunConfig, parse_uuid},
     light::Light,
     runtime::{self, GenesisResponse, Node, Runtime},
     wire::{Identity, number},
@@ -21,10 +22,10 @@ fn args() -> Result<(String, BTreeMap<String, String>)> {
         let v = if matches!(k.as_str(), "--unsigned-simulator" | "--resume") {
             "true".into()
         } else {
-            a.next().ok_or(Error("InvalidRequest"))?
+            a.next().ok_or(ErrorCode::InvalidRequest)?
         };
         if out.insert(k, v).is_some() {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
     }
     Ok((role, out))
@@ -33,7 +34,10 @@ fn args() -> Result<(String, BTreeMap<String, String>)> {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("arkiv-simulator: {}", e.0);
+        if let Some(cause) = &e.cause {
+            eprintln!("{cause}");
+        }
+        eprintln!("arkiv-simulator: {e}");
         std::process::exit(1);
     }
 }
@@ -95,11 +99,13 @@ async fn run() -> Result<()> {
             "producer" | "full" | "light" | "inspect" | "inspect-light"
         )
     {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let get = |key: &str, default: &str| args.get(key).cloned().unwrap_or_else(|| default.into());
-    let path = PathBuf::from(args.get("--run-dir").ok_or(Error("InvalidRequest"))?);
-    std::fs::create_dir_all(&path).map_err(|_| Error("StorageUnavailable"))?;
+    let path = PathBuf::from(args.get("--run-dir").ok_or(ErrorCode::InvalidRequest)?);
+    std::fs::create_dir_all(&path).map_err(|e| {
+        ErrorCode::StorageUnavailable.caused_by(format_args!("{}: {e}", path.display()))
+    })?;
     let file = path.join(if matches!(role.as_str(), "light" | "inspect-light") {
         "headers.redb"
     } else {
@@ -107,11 +113,11 @@ async fn run() -> Result<()> {
     });
     let exists = file.exists();
     if matches!(role.as_str(), "inspect" | "inspect-light") && !exists {
-        return Err(Error("UnknownRun"));
+        return Err(ErrorCode::UnknownRun.into());
     }
     let cache = number(&get("--cache-bytes", "8388608"))?;
     if cache > 256 * 1024 * 1024 {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let redb = RedbConfig::default();
     let opened = if exists {
@@ -126,28 +132,31 @@ async fn run() -> Result<()> {
     if matches!(role.as_str(), "light" | "inspect-light") && args.contains_key("--state-retention")
     {
         // A light node keeps headers only; it has no state history to retain.
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let options = Options {
         cache_bytes: cache as usize,
         retention: get("--state-retention", "archive")
             .parse()
-            .map_err(|_| Error("InvalidRequest"))?,
+            .map_err(|_| ErrorCode::InvalidRequest)?,
         ..Default::default()
     };
     if matches!(role.as_str(), "inspect" | "inspect-light") {
-        let store = opened.ok_or(Error("UnknownRun"))?;
+        let store = opened.ok_or(ErrorCode::UnknownRun)?;
         let before = store.stats();
         let opened_node = if role == "inspect-light" {
             let expected = Identity {
                 source_id: args
                     .get("--source-id")
-                    .ok_or(Error("InvalidRequest"))?
+                    .ok_or(ErrorCode::InvalidRequest)?
                     .clone(),
-                run_id: args.get("--run-id").ok_or(Error("InvalidRequest"))?.clone(),
+                run_id: args
+                    .get("--run-id")
+                    .ok_or(ErrorCode::InvalidRequest)?
+                    .clone(),
                 genesis_hash: args
                     .get("--genesis-hash")
-                    .ok_or(Error("InvalidRequest"))?
+                    .ok_or(ErrorCode::InvalidRequest)?
                     .clone(),
                 chain_id: get("--chain-id", "9001"),
             };
@@ -189,11 +198,11 @@ async fn run() -> Result<()> {
                 .collect::<Vec<_>>()
         });
         let file_bytes = std::fs::metadata(&file)
-            .map_err(|_| Error("StorageUnavailable"))?
+            .map_err(|_| ErrorCode::StorageUnavailable)?
             .len();
         report
             .as_object_mut()
-            .ok_or(Error("StorageUnavailable"))?
+            .ok_or(ErrorCode::StorageUnavailable)?
             .extend(
                 serde_json::json!({
                     "coldRecordReads": reads.record_reads,
@@ -204,7 +213,7 @@ async fn run() -> Result<()> {
                     "processMemory": memory,
                 })
                 .as_object()
-                .ok_or(Error("StorageUnavailable"))?
+                .ok_or(ErrorCode::StorageUnavailable)?
                 .clone(),
             );
         println!("{report}");
@@ -213,10 +222,10 @@ async fn run() -> Result<()> {
     let peer = args.get("--peer").cloned();
     let node = if role == "producer" {
         if peer.is_some() {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let mut host = if initialized {
-            let h = Host::open(opened.ok_or(Error("StorageCorrupt"))?, None, options)?;
+            let h = Host::open(opened.ok_or(ErrorCode::StorageCorrupt)?, None, options)?;
             if args
                 .get("--source-id")
                 .is_some_and(|s| s != &h.identity.source_id)
@@ -228,24 +237,22 @@ async fn run() -> Result<()> {
                     .get("--block-period-ms")
                     .is_some_and(|s| s != &h.workload.block_period_ms)
             {
-                return Err(Error("IdentityMismatch"));
+                return Err(ErrorCode::IdentityMismatch.into());
             }
             h
         } else {
             let source = parse_uuid(&get("--source-id", "00000000-0000-4000-8000-000000000001"))?;
             let mut run_id = [0u8; 16];
-            getrandom::fill(&mut run_id).map_err(|_| Error("StorageUnavailable"))?;
+            getrandom::fill(&mut run_id).map_err(|_| ErrorCode::StorageUnavailable)?;
             let workload = Workload {
                 seed: get("--seed", "7"),
                 block_period_ms: get("--block-period-ms", "1000"),
                 payload_bytes: u32::try_from(number(&get("--payload-bytes", "64"))?)
-                    .map_err(|_| Error("InvalidRequest"))?,
+                    .map_err(|_| ErrorCode::InvalidRequest)?,
                 ..Default::default()
             };
-            let genesis = arkiv_node::demo::workload::genesis(
-                number(&get("--chain-id", "9001"))?,
-                1_700_000_000_000,
-            );
+            let genesis =
+                arkiv_node::dev::genesis(number(&get("--chain-id", "9001"))?, 1_700_000_000_000);
             let run = RunConfig { genesis, workload };
             run.validate()?;
             let store = create_store(opened, &file)?;
@@ -257,40 +264,43 @@ async fn run() -> Result<()> {
             None => None,
             Some("paused") => Some(false),
             Some("running") => Some(true),
-            Some(_) => return Err(Error("InvalidRequest")),
+            Some(_) => return Err(ErrorCode::InvalidRequest.into()),
         };
         if args.contains_key("--resume") || start == Some(true) {
             host.paused = false;
-            host.health = "running";
+            host.health = Health::Running;
         }
         Node::Full(Box::new(host))
     } else {
         if args.contains_key("--start") {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let expected = Identity {
             source_id: args
                 .get("--source-id")
-                .ok_or(Error("InvalidRequest"))?
+                .ok_or(ErrorCode::InvalidRequest)?
                 .clone(),
-            run_id: args.get("--run-id").ok_or(Error("InvalidRequest"))?.clone(),
+            run_id: args
+                .get("--run-id")
+                .ok_or(ErrorCode::InvalidRequest)?
+                .clone(),
             genesis_hash: args
                 .get("--genesis-hash")
-                .ok_or(Error("InvalidRequest"))?
+                .ok_or(ErrorCode::InvalidRequest)?
                 .clone(),
             chain_id: get("--chain-id", "9001"),
         };
-        let endpoint = peer.as_deref().ok_or(Error("InvalidRequest"))?;
+        let endpoint = peer.as_deref().ok_or(ErrorCode::InvalidRequest)?;
         runtime::validate_peer_with_policy(endpoint, runtime::private_http_from_env()?)?;
         if initialized {
-            let store = opened.ok_or(Error("StorageCorrupt"))?;
+            let store = opened.ok_or(ErrorCode::StorageCorrupt)?;
             if role == "light" {
                 Node::Light(Box::new(Light::open(store, &expected)?))
             } else {
                 let mut h = Host::open(store, Some(&expected), options)?;
-                h.role = "full";
+                h.role = Role::Full;
                 h.paused = false;
-                h.health = "following";
+                h.health = Health::Following;
                 Node::Full(Box::new(h))
             }
         } else {
@@ -300,36 +310,36 @@ async fn run() -> Result<()> {
                 Node::Light(Box::new(Light::create(store, id)?))
             } else {
                 let run: RunConfig =
-                    decode_exact(&id.metadata).map_err(|_| Error("InvalidRequest"))?;
+                    decode_exact(&id.metadata).map_err(|_| ErrorCode::InvalidRequest)?;
                 let mut h = Host::create(store, run, id.source_id, id.run_id, options)?;
-                h.role = "full";
+                h.role = Role::Full;
                 h.paused = false;
-                h.health = "following";
+                h.health = Health::Following;
                 Node::Full(Box::new(h))
             }
         }
     };
     let mut rt = Runtime::new(node, peer, args.get("--replication-peer").cloned())?;
     Arc::get_mut(&mut rt)
-        .ok_or(Error("StorageUnavailable"))?
+        .ok_or(ErrorCode::StorageUnavailable)?
         .storage_path = Some(file.clone());
     if role == "full"
         && (rt.replication_peer.is_none()
             || rt.replication_token.as_deref().is_none_or(|s| s.len() < 32))
     {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let listen = get("--listen", "127.0.0.1:9400");
     let public = tokio::net::TcpListener::bind(&listen)
         .await
-        .map_err(|_| Error("StorageUnavailable"))?;
+        .map_err(|e| ErrorCode::StorageUnavailable.caused_by(format_args!("{listen}: {e}")))?;
     if let Some(admin) = args.get("--admin-listen") {
         if rt.admin_token.as_deref().is_none_or(|s| s.len() < 32) {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let listener = tokio::net::TcpListener::bind(admin)
             .await
-            .map_err(|_| Error("StorageUnavailable"))?;
+            .map_err(|e| ErrorCode::StorageUnavailable.caused_by(format_args!("{admin}: {e}")))?;
         let router = runtime::control_router(rt.clone());
         tokio::spawn(async move {
             if axum::serve(listener, router).await.is_err() {
@@ -342,13 +352,14 @@ async fn run() -> Result<()> {
         if role == "producer" { "1000" } else { "100" },
     ))?;
     if !(10..=60000).contains(&interval) {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     {
-        let n = rt.node.lock().map_err(|_| Error("StorageUnavailable"))?;
+        let n = rt.node.lock().map_err(|_| ErrorCode::StorageUnavailable)?;
         println!(
             "{}",
-            serde_json::to_string(&runtime::status(&n)).map_err(|_| Error("StorageUnavailable"))?
+            serde_json::to_string(&runtime::status(&n))
+                .map_err(|_| ErrorCode::StorageUnavailable)?
         );
     }
     tokio::spawn(runtime::run_loop(
@@ -357,7 +368,7 @@ async fn run() -> Result<()> {
     ));
     axum::serve(public, runtime::public_router(rt))
         .await
-        .map_err(|_| Error("StorageUnavailable"))
+        .map_err(|_| Error::from(ErrorCode::StorageUnavailable))
 }
 
 fn create_store(opened: Option<Arc<RedbStore>>, file: &std::path::Path) -> Result<Arc<RedbStore>> {
@@ -375,7 +386,7 @@ async fn bootstrap(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|_| Error("StorageUnavailable"))?;
+        .map_err(|_| ErrorCode::StorageUnavailable)?;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let result: Result<GenesisResponse> = runtime::fetch_with_policy(
@@ -389,13 +400,14 @@ async fn bootstrap(
             .await;
             match result {
                 Ok(response) => return response.validate(expected),
-                Err(Error("ServerBusy" | "StorageUnavailable")) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await
-                }
+                Err(Error {
+                    code: ErrorCode::ServerBusy | ErrorCode::StorageUnavailable,
+                    ..
+                }) => tokio::time::sleep(Duration::from_millis(100)).await,
                 Err(e) => return Err(e),
             }
         }
     })
     .await
-    .map_err(|_| Error("StorageUnavailable"))?
+    .map_err(|_| ErrorCode::StorageUnavailable)?
 }

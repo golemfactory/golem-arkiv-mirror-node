@@ -2,60 +2,37 @@
 //! --state-out` keeps the built state and `producer --prebuilt-state` serves it
 //! without rebuilding; the default producer rebuild reaches the same state.
 
+mod cli_support;
+mod signed_support;
+
 use alloy_primitives::U256;
 use arkiv_db::{Cell, CellName, Value, encode};
 use arkiv_node::{
     accounts::AccountConfig,
     genesis_bundle::PrefillEntity,
-    signed::{
-        crypto::Signer,
-        protocol::{SignedGenesis, SignedLimits, default_native_genesis},
-    },
+    signed::protocol::{SignedGenesis, SignedLimits, default_native_genesis},
 };
+use cli_support::{Child, Temp, free_port, ready, refused};
+use signed_support::signer;
 use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_arkiv-proposer");
 const MARKER: &[u8] = b"prebuilt-tamper-marker-5b0c1e7f";
 
-struct Temp(PathBuf);
-
-impl Temp {
-    fn new(tag: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("arkiv-prebuilt-cli-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn signer() -> Signer {
-    Signer::from_bytes([1; 32]).unwrap()
+fn temp(tag: &str) -> Temp {
+    Temp::new(&format!("arkiv-prebuilt-cli-{tag}"))
 }
 
 fn address() -> String {
-    format!("0x{}", hex(signer().address().as_bytes()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    arkiv_node::text::hex(signer(1).address().as_bytes())
 }
 
 /// A funded base genesis and a small canonical stream, as the runner supplies them.
 fn inputs(dir: &Path, run: u8) -> (PathBuf, PathBuf, PathBuf) {
-    let proposer = signer().address();
+    let proposer = signer(1).address();
     let base = SignedGenesis {
         genesis: default_native_genesis(9451, 1000, 1000),
         run_id: [run; 16],
@@ -65,15 +42,12 @@ fn inputs(dir: &Path, run: u8) -> (PathBuf, PathBuf, PathBuf) {
         accounts: AccountConfig::new(vec![(proposer, U256::from(10).pow(U256::from(30)))]).unwrap(),
         prefill: None,
     };
-    let mut stream = b"ARKPFL02".to_vec();
-    stream.extend_from_slice(&arkiv_node::genesis_bundle::ROW_CODEC.to_be_bytes());
-    stream.extend_from_slice(&24u64.to_be_bytes());
-    for n in 0..24u64 {
+    let rows = (0..24u64).map(|n| {
         let mut body = format!("entity {n} ").into_bytes();
         if n == 5 {
             body.extend_from_slice(MARKER);
         }
-        let frame = encode(&PrefillEntity {
+        PrefillEntity {
             creator: [2; 20],
             create_nonce: n,
             salt: n as u128,
@@ -90,10 +64,9 @@ fn inputs(dir: &Path, run: u8) -> (PathBuf, PathBuf, PathBuf) {
                 ),
                 (CellName::new("n").unwrap(), Cell::attribute(Value::U64(n))),
             ],
-        });
-        stream.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-        stream.extend(frame);
-    }
+        }
+    });
+    let stream = arkiv_node::genesis_streaming::write_stream(rows.collect::<Vec<_>>().iter());
     let (base_path, stream_path, key) = (
         dir.join("base.bin"),
         dir.join("input.bin"),
@@ -147,30 +120,8 @@ fn stream_build(
     serde_json::from_slice(&std::fs::read(bundle.join("report.json")).unwrap()).unwrap()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn status(port: u16) -> Option<serde_json::Value> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(
-        stream,
-        "GET /signed/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    let split = response.windows(4).position(|w| w == b"\r\n\r\n")?;
-    serde_json::from_slice(&response[split + 4..]).ok()
-}
-
 struct Producer {
-    child: std::process::Child,
+    child: Child,
     log: PathBuf,
     port: u16,
 }
@@ -201,38 +152,23 @@ impl Producer {
             command.arg("--prebuilt-state").arg(prebuilt);
         }
         let file = std::fs::File::create(&log).unwrap();
-        let child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(file))
-            .spawn()
-            .unwrap();
+        let child = Child(
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+                .unwrap(),
+        );
         Self { child, log, port }
     }
 
     /// The served height-zero status, or the exit status if the producer failed.
     fn ready(&mut self) -> Result<serde_json::Value, std::process::ExitStatus> {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while Instant::now() < deadline {
-            if let Some(code) = self.child.try_wait().unwrap() {
-                return Err(code);
-            }
-            if let Some(status) = status(self.port) {
-                return Ok(status);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("producer readiness timed out: {}", self.log());
+        ready(&mut self.child, self.port, "/signed/v1/status", &self.log)
     }
 
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
-    }
-}
-
-impl Drop for Producer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -245,7 +181,7 @@ fn assert_genesis_head(status: &serde_json::Value, report: &serde_json::Value) {
 
 #[test]
 fn producer_serves_the_prebuilt_state_without_rebuilding_and_the_default_rebuild_agrees() {
-    let tmp = Temp::new("once");
+    let tmp = temp("once");
     let (base, input, key) = inputs(&tmp.0, 7);
     let (bundle, state) = (tmp.0.join("bundle"), tmp.0.join("genesis-state"));
     let report = stream_build(&tmp.0, &base, &input, &bundle, Some(&state));
@@ -298,8 +234,34 @@ fn producer_serves_the_prebuilt_state_without_rebuilding_and_the_default_rebuild
 }
 
 #[test]
+fn a_flag_of_another_subcommand_is_refused() {
+    let tmp = temp("foreign-flag");
+    let key = tmp.0.join("new.key").display().to_string();
+    let run_dir = tmp.0.join("node").display().to_string();
+    for args in [
+        vec!["keygen", "--out", &key, "--peer", "http://127.0.0.1:9"],
+        vec!["submit", "--transaction-file", &key, "--out", &key],
+        vec![
+            "producer",
+            "--run-dir",
+            &run_dir,
+            "--peer",
+            "http://127.0.0.1:9",
+        ],
+        vec!["light", "--run-dir", &run_dir, "--state-retention", "8"],
+        vec!["full", "--run-dir", &run_dir, "--start", "running"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        let stderr = refused(BIN, &args, &[]);
+        assert_eq!(stderr.trim(), "arkiv-proposer: InvalidRequest", "{args:?}");
+    }
+    assert!(!tmp.0.join("new.key").exists());
+    assert!(!tmp.0.join("node").exists());
+}
+
+#[test]
 fn tampered_or_foreign_prebuilt_state_never_serves() {
-    let tmp = Temp::new("reject");
+    let tmp = temp("reject");
     let (base, input, key) = inputs(&tmp.0, 7);
     let (bundle, state) = (tmp.0.join("bundle"), tmp.0.join("state"));
     let report = stream_build(&tmp.0, &base, &input, &bundle, Some(&state));
@@ -364,7 +326,7 @@ fn tampered_or_foreign_prebuilt_state_never_serves() {
     let port = free_port().to_string();
     let listen = format!("127.0.0.1:{port}");
     let hash = report["genesisHash"].as_str().unwrap().to_string();
-    let refused: Vec<Vec<String>> = vec![
+    let command_lines: Vec<Vec<String>> = vec![
         vec![
             "producer".into(),
             "--run-dir".into(),
@@ -424,35 +386,9 @@ fn tampered_or_foreign_prebuilt_state_never_serves() {
             tmp.0.join("new.key").display().to_string(),
         ],
     ];
-    for mut args in refused {
+    for mut args in command_lines {
         args.extend(["--prebuilt-state".into(), state.display().to_string()]);
-        let mut child = Command::new(BIN)
-            .args(&args)
-            .env("ARKIV_PROPOSER_TOKEN", "t".repeat(32))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let code = loop {
-            if let Some(code) = child.try_wait().unwrap() {
-                break code;
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{args:?} was accepted");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        assert!(!code.success(), "{args:?}");
+        let stderr = refused(BIN, &args, &[("ARKIV_PROPOSER_TOKEN", &"t".repeat(32))]);
         assert!(stderr.contains("InvalidRequest"), "{args:?}: {stderr}");
     }
     assert!(!tmp.0.join("new.key").exists());

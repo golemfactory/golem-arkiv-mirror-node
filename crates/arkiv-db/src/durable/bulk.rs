@@ -5,7 +5,7 @@ use crate::{
     Cell, CellName, Limits, NamespaceDescriptor, PriceSchedule, RecordId, RecordKey, STATE_FORMAT,
     StateHeader,
 };
-use arkiv_db_storage::versioned::{ObjectId, SpaceId};
+use arkiv_db_storage::versioned::SpaceId;
 use arkiv_db_trie::{MerkleMap, SortedTrieBuilder, TrieKey, TrieValue, TryObjectSink};
 use std::{
     fs::{self, File},
@@ -19,6 +19,11 @@ fn io(e: impl fmt::Display) -> DurableError {
 type Entry = (Vec<u8>, Vec<u8>);
 type DiskCheck = std::rc::Rc<dyn Fn() -> Result<(), String>>;
 type ProgressCallback = std::rc::Rc<dyn Fn(&str, u64)>;
+/// A run being written is re-checked against the disk reserve this often.
+const DISK_CHECK_BYTES: u64 = 64 * 1024 * 1024;
+fn check_disk(check: &Option<DiskCheck>) -> Result<(), DurableError> {
+    check.as_ref().map_or(Ok(()), |check| check().map_err(io))
+}
 struct Progress {
     callback: Option<ProgressCallback>,
     phase: &'static str,
@@ -205,19 +210,15 @@ impl Sorter {
         if self.entries.is_empty() {
             return Ok(());
         }
-        if let Some(check) = &self.disk_check {
-            check().map_err(io)?;
-        }
+        check_disk(&self.disk_check)?;
         self.entries.sort_unstable();
         let path = self.path();
         let mut w = RunWriter::new(path)?;
         let mut checked = 0;
         for e in &self.entries {
             write_entry(&mut w, e)?;
-            if w.run.bytes - checked >= 64 * 1024 * 1024 {
-                if let Some(check) = &self.disk_check {
-                    check().map_err(io)?;
-                }
+            if w.run.bytes - checked >= DISK_CHECK_BYTES {
+                check_disk(&self.disk_check)?;
                 checked = w.run.bytes;
             }
         }
@@ -241,9 +242,7 @@ impl Sorter {
         }
     }
     fn merge(&mut self, paths: Vec<Run>) -> Result<Run, DurableError> {
-        if let Some(check) = &self.disk_check {
-            check().map_err(io)?;
-        }
+        check_disk(&self.disk_check)?;
         let mut progress = Progress::new(self.progress.clone(), "sort_merge", false);
         let out = self.path();
         let mut readers = paths
@@ -266,10 +265,8 @@ impl Sorter {
             write_entry(&mut w, &heads[i].take().unwrap())?;
             heads[i] = read_entry(&mut readers[i])?;
             progress.tick();
-            if w.run.bytes - checked >= 64 * 1024 * 1024 {
-                if let Some(check) = &self.disk_check {
-                    check().map_err(io)?;
-                }
+            if w.run.bytes - checked >= DISK_CHECK_BYTES {
+                check_disk(&self.disk_check)?;
                 checked = w.run.bytes;
             }
         }
@@ -302,8 +299,7 @@ struct Sink {
     store: Arc<dyn VersionedStore>,
     space: SpaceId,
     options: Options,
-    pending: Vec<(SpaceId, ObjectId, Vec<u8>)>,
-    bytes: usize,
+    pending: prepare::ObjectBatch,
     max_object: usize,
     disk_check: Option<DiskCheck>,
 }
@@ -317,39 +313,29 @@ impl From<arkiv_db_trie::SortedTrieError<DurableError>> for DurableError {
 }
 impl Sink {
     fn flush(&mut self) -> Result<(), DurableError> {
-        if self.pending.is_empty() {
+        if self.pending.objects.is_empty() {
             return Ok(());
         }
-        if let Some(check) = &self.disk_check {
-            check().map_err(io)?;
-        }
-        match self.store.stage_objects(&self.pending) {
-            CommitOutcome::Committed => {
-                self.pending.clear();
-                self.bytes = 0;
-                Ok(())
-            }
-            CommitOutcome::NotCommitted(e) | CommitOutcome::Indeterminate(e) => Err(e.into()),
-        }
+        check_disk(&self.disk_check)?;
+        self.pending.flush(self.store.as_ref())
     }
 }
 impl TryObjectSink for Sink {
     type Error = DurableError;
     fn record(&mut self, id: B256, bytes: &[u8]) -> Result<(), DurableError> {
         self.max_object = self.max_object.max(bytes.len());
+        // The staged copy charges 32 per object; this constant decides where
+        // batches end, so the two are kept apart.
         let size = bytes.len() + 64;
         if size > self.options.prepare_bytes || self.options.prepare_objects == 0 {
             return Err(DurableError::ResourceLimit(
                 "bulk object exceeds staging cap".into(),
             ));
         }
-        if self.bytes + size > self.options.prepare_bytes
-            || self.pending.len() >= self.options.prepare_objects
-        {
+        if self.pending.is_full(size, &self.options) {
             self.flush()?
         }
-        self.pending.push((self.space, id.0, bytes.to_vec()));
-        self.bytes += size;
+        self.pending.push(self.space, id.0, bytes, size);
         Ok(())
     }
 }
@@ -418,15 +404,32 @@ impl BulkGenesisBuilder {
         self.terms.progress = Some(callback.clone());
         self.host.progress = Some(callback);
     }
-    pub fn add_record(
+    /// Runs one addition. A failure leaves the scratch runs partly written,
+    /// so it poisons the builder.
+    fn guarded<T>(
         &mut self,
-        key: RecordKey,
-        mut cells: Vec<(CellName, Cell)>,
-    ) -> Result<RecordId, DurableError> {
+        add: impl FnOnce(&mut Self) -> Result<T, DurableError>,
+    ) -> Result<T, DurableError> {
         if self.failed {
             return Err(io("builder previously failed"));
         }
         self.failed = true;
+        let added = add(self)?;
+        self.failed = false;
+        Ok(added)
+    }
+    pub fn add_record(
+        &mut self,
+        key: RecordKey,
+        cells: Vec<(CellName, Cell)>,
+    ) -> Result<RecordId, DurableError> {
+        self.guarded(|builder| builder.sort_record(key, cells))
+    }
+    fn sort_record(
+        &mut self,
+        key: RecordKey,
+        mut cells: Vec<(CellName, Cell)>,
+    ) -> Result<RecordId, DurableError> {
         crate::typed::validate_create(&self.limits, &cells)
             .map_err(|e| io(format!("invalid record: {e:?}")))?;
         let id =
@@ -457,22 +460,17 @@ impl BulkGenesisBuilder {
                 cells: cells.into(),
             }),
         )?;
-        self.failed = false;
         Ok(id)
     }
     pub fn add_host(&mut self, key: [u8; 32], bytes: Vec<u8>) -> Result<(), DurableError> {
-        if self.failed {
-            return Err(io("builder previously failed"));
-        }
-        self.failed = true;
-        if bytes.len() > crate::HOST_VALUE_MAX {
-            return Err(io("host value exceeds limit"));
-        }
-        let mut v = vec![0];
-        v.extend(bytes);
-        self.host.add(key.to_vec(), v)?;
-        self.failed = false;
-        Ok(())
+        self.guarded(|builder| {
+            if bytes.len() > crate::HOST_VALUE_MAX {
+                return Err(io("host value exceeds limit"));
+            }
+            let mut v = vec![0];
+            v.extend(bytes);
+            builder.host.add(key.to_vec(), v)
+        })
     }
     pub fn add_host_count(
         &mut self,
@@ -480,16 +478,12 @@ impl BulkGenesisBuilder {
         count: u64,
         cap: u64,
     ) -> Result<(), DurableError> {
-        if self.failed {
-            return Err(io("builder previously failed"));
-        }
-        self.failed = true;
-        let mut v = vec![1];
-        v.extend(count.to_be_bytes());
-        v.extend(cap.to_be_bytes());
-        self.host.add(key.to_vec(), v)?;
-        self.failed = false;
-        Ok(())
+        self.guarded(|builder| {
+            let mut v = vec![1];
+            v.extend(count.to_be_bytes());
+            v.extend(cap.to_be_bytes());
+            builder.host.add(key.to_vec(), v)
+        })
     }
     pub fn finish(
         self,
@@ -508,8 +502,7 @@ impl BulkGenesisBuilder {
             store: target.clone(),
             space: SpaceId::Namespace(1),
             options,
-            pending: Vec::new(),
-            bytes: 0,
+            pending: prepare::ObjectBatch::default(),
             max_object: 0,
             disk_check: self.keys.disk_check.clone(),
         };
@@ -528,27 +521,15 @@ impl BulkGenesisBuilder {
             }
             let split = key.len() - 8;
             let term = &key[..split];
-            if current.as_deref() != Some(term) {
-                if let Some(old) = current.take() {
-                    let (root, len) = posting.finish(&mut sink)?;
-                    terms.push(
-                        &old,
-                        &Posting(MerkleMap::from_root(root, len).map_err(io)?).encode(),
-                        &mut sink,
-                    )?;
-                }
-                current = Some(term.to_vec());
-                posting = SortedTrieBuilder::new();
+            if current.as_deref() != Some(term)
+                && let Some(old) = current.replace(term.to_vec())
+            {
+                push_posting(&mut terms, &old, std::mem::take(&mut posting), &mut sink)?;
             }
             posting.push(&key[split..], &Member.encode(), &mut sink)?;
         }
         if let Some(old) = current {
-            let (root, len) = posting.finish(&mut sink)?;
-            terms.push(
-                &old,
-                &Posting(MerkleMap::from_root(root, len).map_err(io)?).encode(),
-                &mut sink,
-            )?;
+            push_posting(&mut terms, &old, posting, &mut sink)?;
         }
         let terms = terms.finish(&mut sink)?;
         progress.report();
@@ -630,6 +611,17 @@ impl BulkGenesisBuilder {
         })
     }
 }
+/// Seal one term's posting and add it to the term map.
+fn push_posting(
+    terms: &mut SortedTrieBuilder<TermKey>,
+    term: &[u8],
+    posting: SortedTrieBuilder<RecordId>,
+    sink: &mut Sink,
+) -> Result<(), DurableError> {
+    let (root, len) = posting.finish(sink)?;
+    let posting = Posting(MerkleMap::from_root(root, len).map_err(io)?);
+    Ok(terms.push(term, &posting.encode(), sink)?)
+}
 fn build_map<K: TrieKey>(
     sorter: Sorter,
     sink: &mut Sink,
@@ -668,39 +660,16 @@ impl DurableEngine {
         if target.head()?.is_some() {
             return Err(io("bulk target already published"));
         }
-        for key in [PROFILE_KEY, GENESIS_KEY, simulator::IDENTITY_KEY] {
-            if target
-                .read_record_bounded(
-                    Table::Meta,
-                    key,
-                    GENESIS_MAX_BYTES + simulator::IDENTITY_MAX_BYTES + 32,
-                )?
-                .is_some()
-            {
-                return Err(io("bulk target has metadata"));
-            }
+        if has_engine_metadata(target.as_ref())? {
+            return Err(io("bulk target has metadata"));
         }
-        let manifest = EngineManifest {
-            genesis: genesis.id(),
-            sequence: 0,
-            parent: None,
-            state_root: build.header.root(),
-            state: build.header,
-        };
-        let mut batch = manifest_batch(None, &manifest);
-        batch
-            .put_record(Table::Meta, PROFILE_KEY, profile_bytes())
-            .put_record(Table::Meta, GENESIS_KEY, genesis.envelope());
+        let manifest = EngineManifest::genesis(&genesis, build.header);
+        let batch = genesis_batch(&manifest, &genesis, None, None)?;
         if batch.logical_bytes() > options.prepare_bytes as u64 {
             return Err(DurableError::ResourceLimit("bulk metadata cap".into()));
         }
         let engine = Self::from_manifest(target, genesis, options, manifest, None)?;
-        InitializationPending {
-            engine,
-            batch,
-            retry_allowed: true,
-        }
-        .commit()
+        InitializationPending::first_commit(engine, batch)
     }
 }
 
@@ -853,43 +822,46 @@ mod tests {
     }
     #[test]
     fn rejects_duplicates_caps_and_failed_builders_without_publication() {
-        for mode in 0..5 {
+        type Fill = fn(&mut BulkGenesisBuilder);
+        let cases: [(&str, Fill); 5] = [
+            ("duplicate record key", |b| {
+                for _ in 0..2 {
+                    b.add_record(RecordKey::new(b"same").unwrap(), vec![])
+                        .unwrap();
+                }
+            }),
+            ("duplicate host value", |b| {
+                b.add_host([1; 32], vec![1]).unwrap();
+                b.add_host([1; 32], vec![2]).unwrap();
+            }),
+            ("duplicate host count", |b| {
+                b.add_host_count([1; 32], 1, 1).unwrap();
+                b.add_host_count([1; 32], 1, 1).unwrap();
+            }),
+            ("duplicate host count at u64::MAX", |b| {
+                b.add_host_count([1; 32], u64::MAX, u64::MAX).unwrap();
+                b.add_host_count([1; 32], 1, u64::MAX).unwrap();
+            }),
+            ("a builder that already failed", |b| {
+                assert!(
+                    b.add_host([1; 32], vec![0; crate::HOST_VALUE_MAX + 1])
+                        .is_err()
+                );
+                assert!(b.add_host([2; 32], vec![1]).is_err());
+            }),
+        ];
+        for (case, fill) in cases {
             let temp = Temp::new();
             let mut b =
                 BulkGenesisBuilder::new(&temp.0, descriptor(), Limits::DEFAULT, 4096).unwrap();
             let target = Arc::new(MemoryVersionedStore::new());
-            match mode {
-                0 => {
-                    for _ in 0..2 {
-                        b.add_record(RecordKey::new(b"same").unwrap(), vec![])
-                            .unwrap();
-                    }
-                }
-                1 => {
-                    b.add_host([1; 32], vec![1]).unwrap();
-                    b.add_host([1; 32], vec![2]).unwrap();
-                }
-                2 => {
-                    b.add_host_count([1; 32], 1, 1).unwrap();
-                    b.add_host_count([1; 32], 1, 1).unwrap();
-                }
-                3 => {
-                    b.add_host_count([1; 32], u64::MAX, u64::MAX).unwrap();
-                    b.add_host_count([1; 32], 1, u64::MAX).unwrap();
-                }
-                _ => {
-                    assert!(
-                        b.add_host([1; 32], vec![0; crate::HOST_VALUE_MAX + 1])
-                            .is_err()
-                    );
-                    assert!(b.add_host([2; 32], vec![1]).is_err());
-                }
-            }
+            fill(&mut b);
             assert!(
                 b.finish(target.clone(), PriceSchedule::FIXTURE, Options::default())
-                    .is_err()
+                    .is_err(),
+                "{case}"
             );
-            assert!(target.head().unwrap().is_none());
+            assert!(target.head().unwrap().is_none(), "{case}");
         }
     }
     #[test]

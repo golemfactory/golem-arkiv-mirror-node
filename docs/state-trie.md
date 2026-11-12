@@ -129,7 +129,6 @@ composite keys:
 - Fixed-width fields (bytes, big-endian integers) compare as their values,
   and concatenated fixed-width fields compare as tuples, because each field
   starts at the same offset in every key.
-- `KeyWriter` and `KeyReader` compose them.
 
 Evidence (`tests/encoding.rs`): random strings biased toward empty strings,
 trailing zeros, `00`/`01`/`ff`-heavy strings, prefixes of other strings and
@@ -426,10 +425,10 @@ hand-derived literals from the crafted key sets.
 | File | Establishes |
 | --- | --- |
 | `src/node.rs` (unit) | Byte equality with alloy's leaf, extension and branch encoders; long paths; strict decoding round trips; hash check on load; `from_store` inline children; rejection of noncanonical forms; 20,000 mutated inputs never panic and only canonical bytes decode; alloy's decoder panics on a 35-byte path |
-| `src/nibbles.rs`, `src/order.rs` (unit) | Hex-prefix vectors and rejections; escaped and shifted field vectors, `prefix_successor`; writer/reader round trip |
+| `src/nibbles.rs`, `src/order.rs` (unit) | Hex-prefix vectors and rejections; escaped and shifted field vectors, `prefix_successor` |
 | `tests/map.rs` | Random histories against `BTreeMap` and the root oracles for key lengths 1–88; history independence; retained versions unchanged; depth bound reached exactly (`2L + 1`, removal `2L + 2`); empty and single-entry maps; handle validation; empty values rejected by `insert` before any visit or read |
 | `tests/proofs.rs` | Proofs equal `ProofRetainer` (≤ 32 bytes) and the reference (33, 88 bytes); `walk` gives the model's answer; alloy cross-check where valid; the three alloy forgeries; randomized mutations (bit flips, truncations, reordering, duplication, extra and inline nodes, wrong roots, other keys and versions) are rejected or give the honest answer; self-consistent adversarial tries and garbage never panic; old proofs verify against old roots; lazy, counted generation; prefix-related keys proven absent, never included |
-| `tests/variable_keys.rs` | Variable-length prefix-free `ByteKey`s (`00`/`01`/`ff`-heavy, the empty key, maximum length) against a byte-ordered `BTreeMap`: insert/overwrite/remove histories, lookups, typed and raw seeks, retained handles, roots equal to `HashBuilder` and the reference, insertion-order independence, collapse back to the original root, point proofs equal to the reference, complete interval proofs over random inclusive/exclusive/unbounded raw endpoints and prefix runs (omissions, extras, entry and key-length limits rejected), stored reopen/walk/prove; a non-prefix-free codec rejected by `insert` without change |
+| `tests/variable_keys.rs` | Variable-length prefix-free `ByteKey`s (`00`/`01`/`ff`-heavy, the empty key, maximum length) against a byte-ordered `BTreeMap`: insert/overwrite/remove histories, lookups, typed and raw seeks, retained handles, roots equal to `HashBuilder` and the reference, insertion-order independence, point proofs equal to the reference, complete interval proofs over random inclusive/exclusive/unbounded raw endpoints and prefix runs (omissions, extras, entry and key-length limits rejected), stored reopen/walk/prove; a non-prefix-free codec rejected by `insert` without change |
 | `tests/store.rs` | Staging equals the reference object set; reopened maps read lazily with residency-independent visit counts; lazy updates load only touched paths; restaging is complete, minimal and bounded; the per-update creation bounds (`2L + 2` for an insert, `2L` for a removal) reached exactly; history readable; missing and corrupt objects and host loader errors surface as errors; caching loader; nested maps through the hook and `stage_with`, also when another value type staged a byte-identical leaf into the same sink first; hash-valid noncanonical tries rejected by the map and by `walk` |
 | `tests/encoding.rs` | Order preservation, prefix-freeness and uniqueness of the escaped, shifted and composite encodings |
 
@@ -479,7 +478,7 @@ Evidence in `crates/arkiv-db/tests`:
   the block stages, which a commit writes. The two differ when writes of
   one block build identical nodes, such as the one-entry posting maps of a
   new record's terms: each is hashed, but stored once. Measured on
-  2026-09-24 (`cargo test -p arkiv-db --offline --test rehash --
+  2026-09-24 (`cargo test -p arkiv-db --offline --test it rehash:: --
   --nocapture`):
 
   | Block | Hashed nodes | Staged objects | Allowed by the entry writes |

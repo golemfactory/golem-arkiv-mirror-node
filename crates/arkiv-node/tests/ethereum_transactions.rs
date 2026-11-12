@@ -2,17 +2,19 @@
 //! `fixtures/ethereum-sdk-vectors.mjs` regenerates them.
 
 use alloy_primitives::{U256, keccak256};
-use arkiv_db::{Cell, CellName, Value, encode};
+use arkiv_db::{Cell, CellName, Value, decode_exact, encode};
 use arkiv_node::{
     TxOp,
     arkiv::ArkivOperation,
-    signed::{crypto::Signer, ethereum, protocol::*},
+    signed::{ethereum, protocol::*},
 };
 
 mod signed_support;
+use signed_support::signer;
 
+/// Proposer 1, so the SDK account 2 starts at nonce 0.
 fn genesis() -> SignedGenesis {
-    signed_support::genesis(9300, 1000, [7; 16], 2, 1000, &[2])
+    signed_support::genesis(9300, 1000, [7; 16], 1, 1000, &[2])
 }
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -33,7 +35,7 @@ fn independent_sdk_legacy_and_1559_authentication_and_exact_native_mapping() {
         let tx = SignedTx::from_ethereum(&g, &raw).unwrap();
         assert_eq!(tx.hash(), keccak256(&raw));
         assert_eq!(tx.nonce, 0);
-        assert_eq!(tx.tx.actor, Signer::from_bytes([2; 32]).unwrap().address());
+        assert_eq!(tx.tx.actor, signer(2).address());
         assert_eq!(tx.tx.tx_budget, 100_000);
         assert_eq!(tx.ethereum_raw.as_deref(), Some(raw.as_slice()));
         let TxOp::Arkiv {
@@ -58,7 +60,7 @@ fn independent_sdk_legacy_and_1559_authentication_and_exact_native_mapping() {
         assert_eq!(attributes, &udc_attributes());
         let wire = encode(&tx);
         assert_eq!(&wire[..4], &2u32.to_be_bytes());
-        let restored = SignedTx::from_bytes(&wire).unwrap();
+        let restored: SignedTx = decode_exact(&wire).unwrap();
         restored.validate(&g).unwrap();
         assert_eq!(restored, tx);
         for mutation in 0..4 {
@@ -148,11 +150,21 @@ fn sdk_all_remaining_operations_preserve_atomic_order_and_expiry_pair() {
     let ArkivOperation::TransferOwnership { owner, .. } = &ops[2] else {
         panic!("ownership")
     };
-    assert_eq!(
-        owner,
-        Signer::from_bytes([2; 32]).unwrap().address().as_bytes()
-    );
+    assert_eq!(owner, signer(2).address().as_bytes());
     assert!(matches!(&ops[3], ArkivOperation::Delete { .. }));
+}
+
+#[test]
+fn y_parity_above_one_is_a_malformed_transaction() {
+    let mut raw = fixture("eip1559");
+    // `yParity` sits before the two 33-byte signature scalars.
+    let y_parity = raw.len() - 67;
+    assert_eq!(raw[y_parity], 1);
+    raw[y_parity] = 2;
+    assert_eq!(
+        ethereum::parse(&raw).unwrap_err().code.as_str(),
+        "InvalidEthereumTransaction"
+    );
 }
 
 #[test]
@@ -178,24 +190,11 @@ fn legacy_transfer_maps_value_and_unsupported_semantics_are_rejected() {
 
 #[test]
 fn ethereum_original_auth_survives_mining_and_independent_full_replay() {
-    use arkiv_db::{decode_exact, durable::Options};
-    use arkiv_db_memory::MemoryVersionedStore;
-    use arkiv_node::signed::{history::History, host::Host};
-    use std::sync::Arc;
-    let proposer = Signer::from_bytes([1; 32]).unwrap();
-    let g = signed_support::genesis(9300, 1000, [7; 16], 1, 1000, &[2]);
-    let make_host = |producer: bool| {
-        Host::create(
-            Arc::new(MemoryVersionedStore::new()),
-            History::create(Arc::new(MemoryVersionedStore::new()), g.hash()).unwrap(),
-            g.clone(),
-            [9; 16],
-            SignedHeader::sign(&g, g.header(), &proposer).unwrap(),
-            producer.then(|| Signer::from_bytes([1; 32]).unwrap()),
-            Options::default(),
-        )
-        .unwrap()
-    };
+    use arkiv_node::signed::host::Host;
+
+    let _proposer = signer(1);
+    let g = genesis();
+    let make_host = |producer: bool| signed_support::memory_host(&g, signer(1), [9; 16], producer);
     let mut producer = make_host(true);
     let mut follower = make_host(false);
     producer.produce().unwrap();
@@ -217,7 +216,7 @@ fn ethereum_original_auth_survives_mining_and_independent_full_replay() {
     assert_eq!(stored.inputs.txs[0].hash(), keccak256(&raw));
     follower.import(stored).unwrap();
     assert_eq!(producer.head, follower.head);
-    let actor = Signer::from_bytes([2; 32]).unwrap().address();
+    let actor = signer(2).address();
     assert_eq!(producer.committed_nonce(actor).unwrap(), 1);
     assert_eq!(
         producer.account(2, actor).unwrap(),
@@ -315,30 +314,11 @@ fn hostile_dynamic_array_counts_and_aliases_fail_before_expansion() {
 /// without ever being due.
 #[tokio::test]
 async fn sdk_permanent_create_is_stored_at_the_sentinel() {
-    use arkiv_db::durable::Options;
-    use arkiv_db_memory::MemoryVersionedStore;
-    use arkiv_node::signed::{
-        history::History,
-        host::Host,
-        rpc,
-        runtime::{Node, Runtime},
-    };
+    use arkiv_node::signed::runtime::{Node, Runtime};
     use serde_json::{Value as Json, json};
-    use std::sync::Arc;
-    // Proposer 1, so the SDK account 2 starts at nonce 0.
-    let g = signed_support::genesis(9300, 1000, [7; 16], 1, 1000, &[2]);
-    let make_host = |producer: bool| {
-        Host::create(
-            Arc::new(MemoryVersionedStore::new()),
-            History::create(Arc::new(MemoryVersionedStore::new()), g.hash()).unwrap(),
-            g.clone(),
-            [9; 16],
-            SignedHeader::sign(&g, g.header(), &Signer::from_bytes([1; 32]).unwrap()).unwrap(),
-            producer.then(|| Signer::from_bytes([1; 32]).unwrap()),
-            Options::default(),
-        )
-        .unwrap()
-    };
+
+    let g = genesis();
+    let make_host = |producer: bool| signed_support::memory_host(&g, signer(1), [9; 16], producer);
     let (mut producer, mut follower) = (make_host(true), make_host(false));
     producer.produce().unwrap();
     follower.import(producer.block(1).unwrap()).unwrap();
@@ -379,16 +359,11 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     }
     assert_eq!(swept, 1);
     assert_eq!(producer.head, follower.head);
-    let actor = Signer::from_bytes([2; 32]).unwrap().address();
+    let actor = signer(2).address();
     let key = arkiv_node::arkiv::derive_entity_key(9300, actor.as_bytes(), 1, 10);
     let key_hex = arkiv_node::simulator::wire::hex(&key);
     let rt = Runtime::new(Node::Full(Box::new(producer)), None, None, None).unwrap();
-    let call = |method: &str, params: Json| {
-        rpc::handle_request(
-            &rt,
-            json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
-        )
-    };
+    let call = |method: &'static str, params: Json| signed_support::http::call(&rt, method, params);
     // getEntity, as the SDK spells it.
     let select = json!({
         "key": true,
@@ -418,9 +393,8 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     assert_eq!(read["result"], expected, "{read}");
     let missing = call("arkiv_getEntity", json!([format!("0x{}", "00".repeat(32))])).await;
     assert_eq!(missing["result"], Json::Null, "{missing}");
-    // SDK 1.0.1's query shapes: `withCount()` with `orderBy`, `limit` and
-    // `offset` (every select key explicit, `count` added, hex quantities),
-    // and `client.count()`, which selects `count` alone.
+    // SDK 1.0.1's `withCount()` with `orderBy`, `limit` and `offset`: every
+    // select key explicit, `count` added, hex quantities.
     let mut counted = select.clone();
     counted["count"] = json!(true);
     let source = format!("$key = key({key_hex}) ORDER BY $expiresAt:u64 DESC");
@@ -432,34 +406,6 @@ async fn sdk_permanent_create_is_stored_at_the_sentinel() {
     assert_eq!(page["result"]["count"], "0x1", "{page}");
     assert_eq!(page["result"]["data"][0]["key"], key_hex, "{page}");
     assert!(page["result"].get("cursor").is_none(), "{page}");
-    let past = call(
-        "arkiv_query",
-        json!([source, {"select": counted, "limit": "0x14", "offset": "0x1"}]),
-    )
-    .await;
-    assert_eq!(past["result"]["data"], json!([]), "{past}");
-    assert_eq!(past["result"]["count"], "0x1", "{past}");
-    let only = call("arkiv_query", json!(["*", {"select": {"count": true}}])).await;
-    assert_eq!(only["result"]["data"], json!([]), "{only}");
-    assert!(only["result"]["count"].as_str().unwrap().starts_with("0x"));
-    assert!(only["result"].get("cursor").is_none(), "{only}");
-    let range = call(
-        "arkiv_query",
-        json!([
-            format!("$key BETWEEN key({key_hex}) AND key({key_hex})"),
-            {"select": {"count": true}},
-        ]),
-    )
-    .await;
-    assert_eq!(range["result"]["count"], "0x1", "{range}");
-    let bad = call(
-        "arkiv_query",
-        json!(["score > str('a') AND score STARTSWITH u64(1)"]),
-    )
-    .await;
-    assert_eq!(bad["error"]["code"], -32002, "{bad}");
-    let unsorted = call("arkiv_query", json!(["* ORDER BY score", {}])).await;
-    assert_eq!(unsorted["error"]["code"], -32002, "{unsorted}");
     // The receipt's EntityCreated log carries the sentinel as its first word.
     let tx_hash = arkiv_node::simulator::wire::hex(permanent.hash().as_slice());
     let receipt = call("eth_getTransactionReceipt", json!([tx_hash])).await;

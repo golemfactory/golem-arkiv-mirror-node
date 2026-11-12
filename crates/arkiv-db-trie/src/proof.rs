@@ -239,6 +239,48 @@ pub struct PathNode {
     pub value_bytes: usize,
 }
 
+impl PathNode {
+    /// Describes the decoded node `raw`, whose encoding is `rlp`, with no
+    /// nibble selected.
+    pub(crate) fn from_raw(
+        raw: &RawNode<'_>,
+        rlp: &[u8],
+        proof_index: usize,
+        depth: usize,
+        source: PathSource,
+    ) -> Self {
+        let (kind, compressed_path, children, value_bytes) = match raw {
+            RawNode::Leaf { path, value } => {
+                (crate::NodeKind::Leaf, path.clone(), Vec::new(), value.len())
+            }
+            RawNode::Extension { path, child } => (
+                crate::NodeKind::Extension,
+                path.clone(),
+                vec![(*child).into()],
+                0,
+            ),
+            RawNode::Branch { children } => (
+                crate::NodeKind::Branch,
+                Vec::new(),
+                children.iter().copied().map(PathChild::from).collect(),
+                0,
+            ),
+        };
+        Self {
+            proof_index,
+            depth,
+            source,
+            hash: keccak256(rlp),
+            rlp: rlp.to_vec(),
+            kind,
+            compressed_path,
+            selected_nibble: None,
+            children,
+            value_bytes,
+        }
+    }
+}
+
 /// The reason a successfully verified path terminates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathTerminal {
@@ -351,41 +393,11 @@ fn walk_inner<N: AsRef<[u8]>>(
         let rest = &key[position..];
         let raw = decode_raw(current).map_err(invalid)?;
         if let Some(trace) = trace.as_deref_mut() {
-            let (kind, path, selected_nibble, children, value_bytes) = match &raw {
-                RawNode::Leaf { path, value } => (
-                    crate::NodeKind::Leaf,
-                    path.clone(),
-                    None,
-                    Vec::new(),
-                    value.len(),
-                ),
-                RawNode::Extension { path, child } => (
-                    crate::NodeKind::Extension,
-                    path.clone(),
-                    None,
-                    vec![(*child).into()],
-                    0,
-                ),
-                RawNode::Branch { children } => (
-                    crate::NodeKind::Branch,
-                    Vec::new(),
-                    rest.first().copied(),
-                    children.iter().copied().map(PathChild::from).collect(),
-                    0,
-                ),
-            };
-            trace.nodes.push(PathNode {
-                proof_index: index,
-                depth: position,
-                source,
-                hash: keccak256(current),
-                rlp: current.to_vec(),
-                kind,
-                compressed_path: path,
-                selected_nibble,
-                children,
-                value_bytes,
-            });
+            let mut node = PathNode::from_raw(&raw, current, index, position, source);
+            if node.kind == crate::NodeKind::Branch {
+                node.selected_nibble = rest.first().copied();
+            }
+            trace.nodes.push(node);
         }
         let child = match raw {
             RawNode::Leaf { path, value } => {

@@ -204,7 +204,9 @@ fn a_missing_due_count_underflows() {
         )
         .expect("memory engine")
         .expect("created");
-    engine.publish(&setup.seal()).expect("published");
+    engine
+        .publish(&setup.try_seal().expect("sealed"))
+        .expect("published");
     let branch = engine
         .begin(engine.head(), Some(Cost::new(PARAMS.block_budget)))
         .expect("head");
@@ -253,7 +255,9 @@ fn a_malformed_expiry_cell_is_an_invariant_error() {
             )
             .expect("memory engine")
             .expect("created");
-        engine.publish(&setup.seal()).expect("published");
+        engine
+            .publish(&setup.try_seal().expect("sealed"))
+            .expect("published");
         let branch = engine
             .begin(engine.head(), Some(Cost::new(PARAMS.block_budget)))
             .expect("head");

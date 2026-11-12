@@ -4,16 +4,14 @@
 use std::collections::BTreeSet;
 
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     crypto::{Signer, recover, validate_signature},
 };
 use crate::{
-    BlockInputs, BlockOutcomes, ChainSpec, Genesis, Header, RequestIdentity, Scope, TxEnvelope,
-    TxOp, validate,
+    BlockInputs, BlockOutcomes, ChainParams, ChainSpec, Genesis, Header, RequestIdentity, Scope,
+    TxEnvelope, TxOp, validate,
 };
-use arkiv_db::{
-    B256, Decode, DecodeError, Decoder, Encode, Encoder, OwnerId, decode_exact, digest, encode,
-};
+use arkiv_db::{B256, Decode, DecodeError, Decoder, Encode, Encoder, OwnerId, digest, encode};
 
 pub const VERSION: u32 = 1;
 /// Layout version of a [`SignedTx`] that carries its original Ethereum
@@ -133,21 +131,25 @@ pub const MAX_CELLS: usize = 64;
 /// ([`crate::gas::DEFAULT_RENT_CAP_SECONDS`]) and its storage cap the default
 /// ([`crate::gas::DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK`]).
 pub fn default_native_genesis(chain_id: u64, timestamp_ms: u64, block_period_ms: u64) -> Genesis {
-    let mut native = crate::demo::workload::genesis(chain_id, timestamp_ms);
-    native.params.block_period_ms = block_period_ms;
-    native.params.max_rent_lifetime_seconds = crate::gas::DEFAULT_RENT_CAP_SECONDS;
-    native.params.max_new_storage_units_per_block =
-        crate::gas::DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK;
-    native.admins.clear();
-    native.pricing = crate::gas::schedule();
-    native.params.max_admin_per_block = 0;
-    native.params.max_tx_bytes = NATIVE_TX_CAP - SIGNED_TX_OVERHEAD;
-    native.params.max_block_input_bytes = INPUT_CAP;
-    native.params.block_budget = crate::gas::DEFAULT_BLOCK_GAS_LIMIT;
-    native.params.user_budget = 90_000_000;
-    native.params.max_lifetime = 6_307_200;
-    native.params.expiry_per_block = MAX_EXPIRY_PER_BLOCK;
-    native
+    let dev = crate::dev::genesis(chain_id, timestamp_ms);
+    Genesis {
+        pricing: crate::gas::schedule(),
+        params: ChainParams {
+            block_budget: crate::gas::DEFAULT_BLOCK_GAS_LIMIT,
+            user_budget: 90_000_000,
+            expiry_per_block: MAX_EXPIRY_PER_BLOCK,
+            max_admin_per_block: 0,
+            max_tx_bytes: NATIVE_TX_CAP - SIGNED_TX_OVERHEAD,
+            max_block_input_bytes: INPUT_CAP,
+            max_lifetime: 6_307_200,
+            block_period_ms,
+            max_rent_lifetime_seconds: crate::gas::DEFAULT_RENT_CAP_SECONDS,
+            max_new_storage_units_per_block: crate::gas::DEFAULT_MAX_NEW_STORAGE_UNITS_PER_BLOCK,
+            ..dev.params
+        },
+        admins: vec![],
+        ..dev
+    }
 }
 
 impl SignedGenesis {
@@ -174,9 +176,9 @@ impl SignedGenesis {
     pub fn validate(&self) -> Result<()> {
         self.accounts
             .validate()
-            .map_err(|_| Error("InvalidAccountGenesis"))?;
+            .map_err(|_| ErrorCode::InvalidAccountGenesis)?;
         if !crate::gas::is_active(&self.genesis.pricing) {
-            return Err(Error("InvalidGasSchedule"));
+            return Err(ErrorCode::InvalidGasSchedule.into());
         }
         // Without a prefill the proposer creates the entity namespace in
         // block 1 and must be able to pay for it.
@@ -184,7 +186,7 @@ impl SignedGenesis {
             && self.accounts.initial_balance(OwnerId::new(self.proposer))
                 < crate::accounts::fee(self.genesis.params.user_budget)
         {
-            return Err(Error("UnfundedBootstrap"));
+            return Err(ErrorCode::UnfundedBootstrap.into());
         }
         let p = self.genesis.params;
         let l = self.limits;
@@ -218,14 +220,14 @@ impl SignedGenesis {
                 .is_none_or(|n| n > l.max_tx_bytes)
             || p.max_block_input_bytes > l.max_input_bytes
         {
-            return Err(Error("InvalidSignedGenesis"));
+            return Err(ErrorCode::InvalidSignedGenesis.into());
         }
         if let Some(prefill) = &self.prefill {
             prefill
                 .validate(self)
-                .map_err(|_| Error("InvalidPrefillGenesis"))?;
+                .map_err(|_| ErrorCode::InvalidPrefillGenesis)?;
         }
-        ChainSpec::new(self.genesis.clone()).map_err(|_| Error("InvalidSignedGenesis"))?;
+        ChainSpec::new(self.genesis.clone()).map_err(|_| ErrorCode::InvalidSignedGenesis)?;
         self.timestamp(1)?;
         Ok(())
     }
@@ -233,7 +235,8 @@ impl SignedGenesis {
     /// The native execution parameters; signed chain identity comes from `self.hash()`.
     pub fn spec(&self) -> Result<ChainSpec> {
         self.validate()?;
-        ChainSpec::new(self.genesis.clone()).map_err(|_| Error("InvalidSignedGenesis"))
+        ChainSpec::new(self.genesis.clone())
+            .map_err(|_| Error::from(ErrorCode::InvalidSignedGenesis))
     }
 
     pub fn header(&self) -> Header {
@@ -255,7 +258,7 @@ impl SignedGenesis {
         height
             .checked_mul(self.block_period_ms)
             .and_then(|n| self.genesis.timestamp_ms.checked_add(n))
-            .ok_or(Error("TimestampOverflow"))
+            .ok_or(Error::from(ErrorCode::TimestampOverflow))
     }
 }
 
@@ -294,7 +297,7 @@ impl Decode for SignedGenesis {
         };
         value
             .validate()
-            .map_err(|e| invalid("SignedGenesis", e.0))?;
+            .map_err(|e| invalid("SignedGenesis", e.code.as_str()))?;
         Ok(value)
     }
 }
@@ -363,10 +366,10 @@ impl SignedTx {
     pub fn validate(&self, genesis: &SignedGenesis) -> Result<()> {
         let spec = genesis.spec()?;
         if self.genesis_hash != genesis.hash() || self.tx.chain_id != genesis.genesis.chain_id {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if self.tx.tx_budget < crate::gas::TX_INTRINSIC_GAS {
-            return Err(Error("GasLimitBelowIntrinsic"));
+            return Err(ErrorCode::GasLimitBelowIntrinsic.into());
         }
         if self.tx.ops.iter().any(|op| {
             !matches!(
@@ -374,13 +377,13 @@ impl SignedTx {
                 TxOp::Arkiv { .. } | TxOp::Transfer { .. } | TxOp::CreateNamespace { .. }
             )
         }) {
-            return Err(Error("UnsupportedGasOperation"));
+            return Err(ErrorCode::UnsupportedGasOperation.into());
         }
         if self.nonce == u64::MAX {
-            return Err(Error("NonceExhausted"));
+            return Err(ErrorCode::NonceExhausted.into());
         }
         if encode(self).len() > genesis.limits.max_tx_bytes as usize {
-            return Err(Error("TransactionTooLarge"));
+            return Err(ErrorCode::TransactionTooLarge.into());
         }
         if let Some(raw) = &self.ethereum_raw {
             let original = super::ethereum::parse(raw)?;
@@ -388,18 +391,18 @@ impl SignedTx {
                 || original.signature != self.signature
                 || super::ethereum::make_envelope(genesis, &original)? != self.tx
             {
-                return Err(Error("InvalidEthereumEnvelope"));
+                return Err(ErrorCode::InvalidEthereumEnvelope.into());
             }
         } else if recover(self.intent_digest(), &self.signature)? != self.tx.actor {
-            return Err(Error("InvalidSignature"));
+            return Err(ErrorCode::InvalidSignature.into());
         }
-        validate::check_tx(&spec, &self.tx).map_err(|_| Error("InvalidTransaction"))?;
+        validate::check_tx(&spec, &self.tx).map_err(|_| ErrorCode::InvalidTransaction)?;
         // Admission requires fitting an otherwise empty block, including wrappers.
         if self.tx.ops.len() > spec.params().max_ops_per_block as usize
             || encode(self).len() + 8 > genesis.limits.max_input_bytes as usize
             || encode(&self.tx).len() + 8 > spec.params().max_block_input_bytes as usize
         {
-            return Err(Error("TransactionTooLarge"));
+            return Err(ErrorCode::TransactionTooLarge.into());
         }
         Ok(())
     }
@@ -407,13 +410,31 @@ impl SignedTx {
     pub fn from_ethereum(genesis: &SignedGenesis, bytes: &[u8]) -> Result<Self> {
         super::ethereum::decode(genesis, bytes)
     }
+}
 
-    /// Bounded exact transport decode, before signature verification or pool insertion.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > TX_CAP as usize {
-            return Err(Error("TransactionTooLarge"));
-        }
-        decode_exact(bytes).map_err(|_| Error("InvalidTransactionEncoding"))
+/// A transaction that passed [`SignedTx::validate`] against the node's
+/// genesis: what [`Host::admit`](super::host::Host::admit) takes, so the
+/// signature is recovered once, before the node lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidTx(SignedTx);
+
+impl ValidTx {
+    pub fn new(tx: SignedTx, genesis: &SignedGenesis) -> Result<Self> {
+        tx.validate(genesis)?;
+        Ok(Self(tx))
+    }
+
+    /// Decodes and validates a raw Ethereum transaction.
+    pub fn from_ethereum(genesis: &SignedGenesis, bytes: &[u8]) -> Result<Self> {
+        SignedTx::from_ethereum(genesis, bytes).map(Self)
+    }
+
+    pub fn tx(&self) -> &SignedTx {
+        &self.0
+    }
+
+    pub(super) fn into_inner(self) -> SignedTx {
+        self.0
     }
 }
 
@@ -458,7 +479,7 @@ impl Decode for SignedTx {
         if before - d.remaining() > TX_CAP as usize {
             return Err(invalid("SignedTx", "size limit"));
         }
-        validate_signature(&value.signature).map_err(|e| invalid("SignedTx", e.0))?;
+        validate_signature(&value.signature).map_err(|e| invalid("SignedTx", e.code.as_str()))?;
         Ok(value)
     }
 }
@@ -483,10 +504,10 @@ impl SignedInputs {
     pub fn validate(&self, genesis: &SignedGenesis, height: u64) -> Result<()> {
         let spec = genesis.spec()?;
         if encode(self).len() > genesis.limits.max_input_bytes as usize {
-            return Err(Error("InputsTooLarge"));
+            return Err(ErrorCode::InputsTooLarge.into());
         }
         if height == 0 {
-            return Err(Error("InvalidHeight"));
+            return Err(ErrorCode::InvalidHeight.into());
         }
         if height == 1
             && genesis.prefill.is_none()
@@ -498,16 +519,17 @@ impl SignedInputs {
                     [TxOp::CreateNamespace { name }] if name.as_str() == "entities"
                 ))
         {
-            return Err(Error("InvalidBootstrap"));
+            return Err(ErrorCode::InvalidBootstrap.into());
         }
         let mut requests = BTreeSet::new();
         for tx in &self.txs {
             tx.validate(genesis)?;
             if !requests.insert(tx.identity()) {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
         }
-        validate::check_block(&spec, &self.native()).map_err(|_| Error("InvalidInputs"))
+        validate::check_block(&spec, &self.native())
+            .map_err(|_| Error::from(ErrorCode::InvalidInputs))
     }
 }
 
@@ -568,15 +590,15 @@ impl SignedHeader {
     pub fn authenticate(&self, genesis: &SignedGenesis) -> Result<()> {
         genesis.validate()?;
         if self.genesis_hash != genesis.hash() || self.header.chain_id != genesis.genesis.chain_id {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if self.header.timestamp_ms != genesis.timestamp(self.header.height)?
             || (self.header.height == 0 && self.header != genesis.header())
         {
-            return Err(Error("InvalidHeader"));
+            return Err(ErrorCode::InvalidHeader.into());
         }
         if recover(self.intent_digest(), &self.signature)? != OwnerId::new(genesis.proposer) {
-            return Err(Error("InvalidSignature"));
+            return Err(ErrorCode::InvalidSignature.into());
         }
         Ok(())
     }
@@ -600,7 +622,8 @@ impl Decode for SignedHeader {
             header: d.get()?,
             signature: d.array()?,
         };
-        validate_signature(&value.signature).map_err(|e| invalid("SignedHeader", e.0))?;
+        validate_signature(&value.signature)
+            .map_err(|e| invalid("SignedHeader", e.code.as_str()))?;
         Ok(value)
     }
 }
@@ -621,11 +644,11 @@ impl SignedBlock {
     pub fn authenticate(&self, genesis: &SignedGenesis) -> Result<()> {
         self.header.authenticate(genesis)?;
         if encode(self).len() > genesis.limits.max_body_bytes as usize {
-            return Err(Error("BlockTooLarge"));
+            return Err(ErrorCode::BlockTooLarge.into());
         }
         if self.header.header.height == 0 {
             if !self.inputs.txs.is_empty() || self.outcomes != BlockOutcomes::default() {
-                return Err(Error("InvalidGenesisBlock"));
+                return Err(ErrorCode::InvalidGenesisBlock.into());
             }
             return Ok(());
         }
@@ -635,23 +658,16 @@ impl SignedBlock {
             && (self.outcomes.txs.len() != 1
                 || self.outcomes.txs[0].status != crate::TxStatus::Committed)
         {
-            return Err(Error("InvalidBootstrap"));
+            return Err(ErrorCode::InvalidBootstrap.into());
         }
         if self.header.header.inputs_digest != self.inputs.digest()
             || self.header.header.outcomes_digest != self.outcomes.digest()
             || self.outcomes.txs.len() != self.inputs.txs.len()
             || !self.outcomes.admin.is_empty()
         {
-            return Err(Error("InvalidBlockCommitment"));
+            return Err(ErrorCode::InvalidBlockCommitment.into());
         }
         Ok(())
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > BODY_CAP as usize {
-            return Err(Error("BlockTooLarge"));
-        }
-        decode_exact(bytes).map_err(|_| Error("InvalidBlockEncoding"))
     }
 }
 

@@ -12,34 +12,14 @@ pub const QUEUE_COUNT: usize = 1024;
 pub const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    for byte in bytes {
-        s.push(DIGITS[usize::from(byte >> 4)] as char);
-        s.push(DIGITS[usize::from(byte & 15)] as char);
-    }
-    s
-}
+pub use crate::text::hex;
 
 pub fn unhex(s: &str, cap: usize) -> Result<Vec<u8>> {
-    let s = s.strip_prefix("0x").ok_or(DemoError::InvalidRequest)?;
-    if s.len() % 2 != 0 || s.len() / 2 > cap {
+    let digits = s.strip_prefix("0x").ok_or(DemoError::InvalidRequest)?;
+    if digits.len() % 2 != 0 || digits.len() / 2 > cap {
         return Err(DemoError::ProofLimitExceeded);
     }
-
-    fn nibble(b: u8) -> Result<u8> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            _ => Err(DemoError::InvalidRequest),
-        }
-    }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|p| Ok(nibble(p[0])? * 16 + nibble(p[1])?))
-        .collect()
+    crate::text::unhex(s, cap).ok_or(DemoError::InvalidRequest)
 }
 
 pub fn packed<T: Encode>(value: &T) -> String {
@@ -57,13 +37,7 @@ pub fn unpack<T: Decode>(text: &str, cap: usize) -> Result<T> {
 }
 
 pub fn number(text: &str) -> Result<u64> {
-    if text.is_empty()
-        || (text.len() > 1 && text.starts_with('0'))
-        || !text.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(DemoError::InvalidRequest);
-    }
-    text.parse().map_err(|_| DemoError::InvalidRequest)
+    crate::text::decimal(text).ok_or(DemoError::InvalidRequest)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

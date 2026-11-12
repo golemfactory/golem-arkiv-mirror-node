@@ -20,21 +20,23 @@
 //! `genesis stream-verify` keep deriving the state independently.
 
 use crate::{
-    genesis_streaming::{StreamSummary, check_disk, import_identity},
+    genesis_streaming::{PrefillImport, StreamSummary, check_disk},
     signed::protocol::SignedGenesis,
 };
 use arkiv_db::B256;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
-type Result<T> = std::result::Result<T, String>;
+use crate::{fsutil, genesis_error::GenesisToolError};
 
-fn err(e: impl std::fmt::Display) -> String {
-    format!("prebuilt genesis state: {e}")
+type Result<T> = std::result::Result<T, GenesisToolError>;
+
+fn err(e: impl std::fmt::Display) -> GenesisToolError {
+    format!("prebuilt genesis state: {e}").into()
 }
 
 // Layout of `genesis_bulk::build_file`'s private work directory. A prebuilt
@@ -89,17 +91,18 @@ fn expected(g: &SignedGenesis) -> Result<(Manifest, B256)> {
         .ok_or("prebuilt genesis state requires a streaming prefill")?;
     // The same identity `genesis_bulk::build_file` derives from the audited
     // stream, whose summary must equal these signed launch fields.
-    let identity = import_identity(
-        g,
-        p.limits,
-        p.sponsor,
-        &StreamSummary {
+    let identity = PrefillImport {
+        base: g,
+        limits: p.limits,
+        sponsor: p.sponsor,
+        summary: &StreamSummary {
             rows: p.row_count,
             bytes: p.canonical_bytes,
             hash: p.stream_hash,
         },
-        p.permanent_prefill(),
-    );
+        permanent: p.permanent_prefill(),
+    }
+    .identity();
     let manifest = Manifest {
         version: 1,
         genesis_hash: g.hash().to_string(),
@@ -121,28 +124,6 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(err)?;
-    file.write_all(bytes).map_err(err)?;
-    file.sync_all().map_err(err)
-}
-
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(err)
-}
-
-fn parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-}
-
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
@@ -153,16 +134,6 @@ fn is_dir(path: &Path) -> bool {
 
 fn is_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
-}
-
-fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        from,
-        rustix::fs::CWD,
-        to,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
 }
 
 /// A completed bulk directory bound to `g`. Symlinks are refused so that a
@@ -215,9 +186,9 @@ pub(crate) fn check_destination(state_out: &Path, bundle: &Path) -> Result<PathB
     // The bundle builder creates this parent next anyway. Creating it first
     // means the checks below see the final layout, including when the state
     // destination is (or contains) a not-yet-created bundle ancestor.
-    fs::create_dir_all(parent(bundle)).map_err(err)?;
-    let bundle_parent = fs::canonicalize(parent(bundle)).map_err(err)?;
-    let parent_dir = fs::canonicalize(parent(state_out))
+    fs::create_dir_all(fsutil::parent(bundle)).map_err(err)?;
+    let bundle_parent = fs::canonicalize(fsutil::parent(bundle)).map_err(err)?;
+    let parent_dir = fs::canonicalize(fsutil::parent(state_out))
         .map_err(|e| err(format!("state destination parent must exist: {e}")))?;
     let target = parent_dir.join(name);
     if exists(&target) {
@@ -244,7 +215,7 @@ pub(crate) fn check_destination(state_out: &Path, bundle: &Path) -> Result<PathB
         }
     }
     fs::create_dir(&from).map_err(err)?;
-    let probe = rename_noreplace(&from, &to);
+    let probe = fsutil::rename_noreplace(&from, &to);
     fs::remove_dir(if probe.is_ok() { &to } else { &from }).map_err(err)?;
     match probe {
         Ok(()) => Ok(target),
@@ -268,8 +239,8 @@ pub(crate) fn bind(g: &SignedGenesis, work: &Path) -> Result<()> {
     if exists(&path) {
         fs::remove_file(&path).map_err(err)?;
     }
-    write_new(&path, &serde_json::to_vec_pretty(&manifest).map_err(err)?)?;
-    sync_dir(&bulk)
+    fsutil::write_new(&path, &serde_json::to_vec_pretty(&manifest).map_err(err)?).map_err(err)?;
+    fsutil::sync_dir(&bulk).map_err(err)
 }
 
 /// Publish the bound store as a prebuilt state directory. It appears only by an
@@ -277,14 +248,14 @@ pub(crate) fn bind(g: &SignedGenesis, work: &Path) -> Result<()> {
 pub(crate) fn publish(g: &SignedGenesis, work: &Path, target: &Path) -> Result<()> {
     let bulk = work.join(BULK);
     check_store(&bulk, g, true)?;
-    rename_noreplace(&bulk, target).map_err(|e| {
+    fsutil::rename_noreplace(&bulk, target).map_err(|e| {
         err(format!(
             "publication rename: {e}; the completed state remains in {}",
             bulk.display()
         ))
     })?;
-    sync_dir(parent(target))?;
-    sync_dir(work)
+    fsutil::sync_dir(fsutil::parent(target)).map_err(err)?;
+    fsutil::sync_dir(work).map_err(err)
 }
 
 /// Make the prebuilt store at `source` the producer's completed private bulk
@@ -314,7 +285,7 @@ fn install_with(
     }
     check_store(source, g, true)?;
     fs::create_dir_all(work_dir).map_err(err)?;
-    sync_dir(parent(work_dir))?;
+    fsutil::sync_dir(fsutil::parent(work_dir)).map_err(err)?;
     if exists(&target) {
         // Unselected bulk scratch: disposable by design, as in build_file.
         fs::remove_dir_all(&target).map_err(err)?;
@@ -323,12 +294,12 @@ fn install_with(
     if exists(&pending) {
         fs::remove_dir_all(&pending).map_err(err)?;
     }
-    sync_dir(work_dir)?;
+    fsutil::sync_dir(work_dir).map_err(err)?;
     if !copy {
-        match rename_noreplace(source, &target) {
+        match fsutil::rename_noreplace(source, &target) {
             Ok(()) => {
-                sync_dir(work_dir)?;
-                sync_dir(parent(source))?;
+                fsutil::sync_dir(work_dir).map_err(err)?;
+                fsutil::sync_dir(fsutil::parent(source)).map_err(err)?;
                 return Ok(Installed::Moved);
             }
             Err(rustix::io::Errno::XDEV) => {}
@@ -336,8 +307,8 @@ fn install_with(
         }
     }
     copy_store(source, &pending)?;
-    rename_noreplace(&pending, &target).map_err(|e| err(format!("install rename: {e}")))?;
-    sync_dir(work_dir)?;
+    fsutil::rename_noreplace(&pending, &target).map_err(|e| err(format!("install rename: {e}")))?;
+    fsutil::sync_dir(work_dir).map_err(err)?;
     Ok(Installed::Copied)
 }
 
@@ -354,7 +325,7 @@ fn copy_store(source: &Path, pending: &Path) -> Result<()> {
             .checked_add(fs::metadata(source.join(file)).map_err(err)?.len())
             .ok_or_else(|| err("store size overflow"))?;
     }
-    check_disk(parent(pending), total)?;
+    check_disk(fsutil::parent(pending), total)?;
     fs::create_dir(pending).map_err(err)?;
     fs::create_dir(pending.join(COMPLETE)).map_err(err)?;
     for file in &files {
@@ -365,8 +336,8 @@ fn copy_store(source: &Path, pending: &Path) -> Result<()> {
         }
         File::open(&to).and_then(|f| f.sync_all()).map_err(err)?;
     }
-    sync_dir(&pending.join(COMPLETE))?;
-    sync_dir(pending)
+    fsutil::sync_dir(&pending.join(COMPLETE)).map_err(err)?;
+    fsutil::sync_dir(pending).map_err(err)
 }
 
 #[cfg(test)]
@@ -436,11 +407,8 @@ mod tests {
     }
 
     fn stream_expiring(rows: u64, expiry: impl Fn(u64) -> u64) -> Vec<u8> {
-        let mut b = b"ARKPFL02".to_vec();
-        b.extend_from_slice(&crate::genesis_bundle::ROW_CODEC.to_be_bytes());
-        b.extend_from_slice(&rows.to_be_bytes());
-        for n in 0..rows {
-            let f = encode(&PrefillEntity {
+        let rows: Vec<_> = (0..rows)
+            .map(|n| PrefillEntity {
                 creator: [2; 20],
                 create_nonce: n,
                 salt: n as u128,
@@ -456,11 +424,9 @@ mod tests {
                         Cell::attribute(Value::str("hello")),
                     ),
                 ],
-            });
-            b.extend_from_slice(&(f.len() as u32).to_be_bytes());
-            b.extend(f);
-        }
-        b
+            })
+            .collect();
+        crate::genesis_streaming::write_stream(rows.iter())
     }
 
     struct Built {
@@ -691,7 +657,7 @@ mod tests {
         let b = author(&tmp.0, "b", 8, 4, true);
         let work = tmp.0.join("node/prefill-work");
         let refused = |g: &SignedGenesis, source: &Path, needle: &str| {
-            let error = install(g, source, &work).unwrap_err();
+            let error = install(g, source, &work).unwrap_err().to_string();
             assert!(error.contains(needle), "{error}");
             assert!(!exists(&work.join(BULK)), "nothing was selected: {error}");
         };
@@ -753,7 +719,7 @@ mod tests {
             let error = prepare_streaming(&once.genesis, &prefill, &work, Options::default())
                 .err()
                 .unwrap();
-            assert!(error.contains("identity or bounds"), "{error}");
+            assert!(error.to_string().contains("identity or bounds"), "{error}");
         }
     }
 
@@ -786,7 +752,7 @@ mod tests {
             let error =
                 build_bundle_with_state(&base_path, &input, &output, Some(&state), [2; 20], 1024)
                     .unwrap_err();
-            assert!(error.contains(needle), "{state:?}: {error}");
+            assert!(error.to_string().contains(needle), "{state:?}: {error}");
             assert!(!exists(&output));
             assert!(names(&work).is_empty(), "no construction started");
             assert!(!names(&tmp.0).iter().any(|n| n.contains("state-probe")));
@@ -805,6 +771,7 @@ mod tests {
         assert!(
             bind(&other.genesis, &work)
                 .unwrap_err()
+                .to_string()
                 .contains("identity")
         );
         // Unbound stores are never published; rebinding replaces a stale manifest.
@@ -813,7 +780,9 @@ mod tests {
         fs::write(work.join(BULK).join(MANIFEST), b"stale").unwrap();
         bind(&built.genesis, &work).unwrap();
         fs::create_dir(&target).unwrap();
-        let error = publish(&built.genesis, &work, &target).unwrap_err();
+        let error = publish(&built.genesis, &work, &target)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("remains in"), "{error}");
         // The stranded store is itself a valid prebuilt state directory.
         let node = tmp.0.join("node/prefill-work");

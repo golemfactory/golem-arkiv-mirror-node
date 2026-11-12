@@ -30,9 +30,8 @@ Adoption keeps the staged store:
    publication is height zero, with the bundle's state header, limits and
    pricing. Its head must be that manifest. The store must hold exactly the
    records `initialize_bulk` writes: the engine profile and import genesis, one
-   manifest and its index entry. Later snapshots, import checkpoints, retention
-   floors or any simulator record make it ineligible, and so does an
-   incremental import or its compaction. Incremental imports keep older states
+   manifest and its index entry. Later snapshots, retention floors, any simulator record or any other
+   record make it ineligible, and so does an incremental import. Incremental imports keep older states
    and their objects. The store checks the exact set, not a count.
 2. **Verification** (`DurableEngine::adopt_staged_simulator`). Every object
    reachable from the staged state is read and checked exactly as the copy
@@ -108,7 +107,7 @@ consumes the staged store, so the copy installation refuses a relabelled store
 ("unknown engine profile/version") instead of rebuilding or serving it. A store
 that fails verification is not relabelled: every retry fails the same way until
 the import scratch is removed. The redb crash-point test
-(`crates/arkiv-db-redb/tests/relabel.rs`) checks every mutating backend call of
+(`crates/arkiv-db-redb/tests/it/relabel.rs`) checks every mutating backend call of
 the relabelling commit, under durable-only, all-unsynced and torn crash images.
 Each image passes redb's integrity check and holds exactly the old or exactly the
 new publication, never a mix.

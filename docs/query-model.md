@@ -62,8 +62,7 @@ table in the [block format](block-format.md).
   raw byte key and scan prefix: the namespace ID is passed separately. Raw
   `Put`, `Delete`, `get` and `scan_prefix` reject longer inputs with
   `InvalidArgument(KeyTooLong)` before lookup, charging or recording a write.
-  Raw values keep their byte charges; the separate low-level `Database`
-  facade keeps its arbitrary-byte storage contract.
+  Raw values keep their byte charges.
 - `Term::{Eq { name, value }, NotEq { name, value }, Range { name, lower,
   upper }, StartsWith { name, prefix }, Exists { name, tag }}`; `Literal {
   term, negated }`; `Query { groups: Vec<Vec<Literal>> }`, an ordered flat DNF

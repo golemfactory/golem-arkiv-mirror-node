@@ -4,6 +4,7 @@ use crate::{
     engine::WorkingState,
     layout::{Blob, NamespaceState, Posting, StoredRecord},
 };
+use arkiv_db_storage::versioned::{CommitOutcome, VersionedStore};
 use arkiv_db_storage::versioned::{ObjectId, SpaceId};
 use arkiv_db_trie::{MerkleMap, StageBudget, StageError, TrieKey, TrieValue, TryObjectSink};
 use std::collections::BTreeMap;
@@ -206,5 +207,41 @@ impl TryObjectSink for Staging {
         self.objects.push((self.space, id.0, bytes.to_vec()));
         self.stats.payload_bytes = payload;
         Ok(())
+    }
+}
+
+/// Objects waiting for one `stage_objects` call. The caller chooses what an
+/// object is charged against `prepare_bytes` and refuses one that cannot fit
+/// an empty batch.
+#[derive(Default)]
+pub(super) struct ObjectBatch {
+    pub(super) objects: Vec<(SpaceId, ObjectId, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl ObjectBatch {
+    /// Whether the batch must be flushed before an object charged `size`
+    /// (at most `prepare_bytes`) is pushed.
+    pub(super) fn is_full(&self, size: usize, options: &Options) -> bool {
+        self.objects.len() >= options.prepare_objects || self.bytes > options.prepare_bytes - size
+    }
+
+    pub(super) fn push(&mut self, space: SpaceId, id: ObjectId, bytes: &[u8], size: usize) {
+        self.objects.push((space, id, bytes.to_vec()));
+        self.bytes += size;
+    }
+
+    pub(super) fn flush(&mut self, store: &dyn VersionedStore) -> Result<(), DurableError> {
+        if self.objects.is_empty() {
+            return Ok(());
+        }
+        match store.stage_objects(&self.objects) {
+            CommitOutcome::Committed => {
+                self.objects.clear();
+                self.bytes = 0;
+                Ok(())
+            }
+            CommitOutcome::NotCommitted(e) | CommitOutcome::Indeterminate(e) => Err(e.into()),
+        }
     }
 }

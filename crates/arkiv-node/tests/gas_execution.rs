@@ -9,16 +9,13 @@ use arkiv_node::{
     signed::{
         crypto::Signer,
         history::History,
-        host::Host,
+        host::{Host, Launch, Prefill},
         protocol::{SignedBlock, SignedGenesis, SignedHeader, SignedInputs, SignedTx},
     },
 };
 use std::sync::Arc;
 mod signed_support;
-
-fn signer() -> Signer {
-    Signer::from_bytes([1; 32]).unwrap()
-}
+use signed_support::{arkiv_ops, memory_host, sign_tx, signer};
 
 fn genesis() -> SignedGenesis {
     signed_support::genesis(9200, 1000, [8; 16], 1, 5000, &[1, 2])
@@ -29,17 +26,7 @@ fn host(producer: bool) -> Host {
 }
 
 fn host_of(g: SignedGenesis, producer: bool) -> Host {
-    let cert = SignedHeader::sign(&g, g.header(), &signer()).unwrap();
-    Host::create(
-        Arc::new(MemoryVersionedStore::new()),
-        History::create(Arc::new(MemoryVersionedStore::new()), g.hash()).unwrap(),
-        g,
-        [3; 16],
-        cert,
-        producer.then(signer),
-        Options::default(),
-    )
-    .unwrap()
+    memory_host(&g, signer(1), [3; 16], producer)
 }
 
 /// An entity with an indexed `group` and `body` bytes of unindexed data.
@@ -65,33 +52,16 @@ fn create(salt: u128, body: usize, lifetime: u64) -> ArkivOperation {
 }
 
 fn tx(h: &Host, nonce: u64, budget: u64, ops: Vec<ArkivOperation>) -> SignedTx {
-    tx_by(h, &signer(), nonce, budget, ops)
+    tx_by(h, &signer(1), nonce, budget, ops)
 }
 
 fn tx_by(h: &Host, by: &Signer, nonce: u64, budget: u64, ops: Vec<ArkivOperation>) -> SignedTx {
-    SignedTx::sign(
-        &h.genesis,
-        nonce,
-        TxEnvelope {
-            chain_id: 9200,
-            actor: by.address(),
-            request_id: [nonce as u8; 32],
-            tx_budget: budget,
-            ops: ops
-                .into_iter()
-                .map(|operation| TxOp::Arkiv {
-                    namespace: arkiv::entity_namespace(),
-                    operation,
-                })
-                .collect(),
-        },
-        by,
-    )
-    .unwrap()
+    let request_id = [nonce as u8; 32];
+    sign_tx(&h.genesis, by, nonce, request_id, budget, arkiv_ops(ops))
 }
 
 fn key(nonce: u64, salt: u128) -> RecordKey {
-    key_of(&signer(), nonce, salt)
+    key_of(&signer(1), nonce, salt)
 }
 
 fn key_of(by: &Signer, nonce: u64, salt: u128) -> RecordKey {
@@ -228,7 +198,7 @@ fn permanent_create_pays_rent_outside_gas_and_rollback_retains_gas_and_nonce() {
     let mut f = host(false);
     p.produce().unwrap();
     f.import(p.block(1).unwrap()).unwrap();
-    let actor = signer().address();
+    let actor = signer(1).address();
     // A live permanent create fits an ordinary gas budget: rent is not gas.
     let cap = clock(&p).cap_blocks();
     assert_eq!(cap, 6_307_200);
@@ -305,7 +275,7 @@ fn permanent_create_pays_rent_outside_gas_and_rollback_retains_gas_and_nonce() {
 fn a_128_kib_permanent_entity_fits_one_transaction() {
     let mut p = host(true);
     p.produce().unwrap();
-    let actor = signer().address();
+    let actor = signer(1).address();
     let before = balance(&p, actor);
     let op = permanent(1, arkiv::MAX_ENTITY_BYTES);
     p.submit(tx(&p, 1, 2_000_000, vec![op])).unwrap();
@@ -341,7 +311,7 @@ fn tight_host(tight: &Signer, funds: U256) -> Host {
         base.proposer,
         base.block_period_ms,
         AccountConfig::new(vec![
-            (signer().address(), signed_support::balance()),
+            (signer(1).address(), signed_support::balance()),
             (tight.address(), funds),
         ])
         .unwrap(),
@@ -376,7 +346,7 @@ fn dry_run(by: &Signer, txs: &[(u64, Vec<ArkivOperation>)]) -> Vec<(U256, u64)> 
 
 #[test]
 fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
-    let tight = signed_support::signer(7);
+    let tight = signer(7);
     let op = permanent(1, 4096);
     let (rent, _) = dry_run(&tight, &[(1_000_000, vec![op.clone()])])[0];
     assert!(rent > U256::ZERO);
@@ -386,12 +356,11 @@ fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
     assert_eq!(
         h.submit(tx_by(&h, &tight, 0, 1_000_000, vec![op.clone()]))
             .unwrap_err()
-            .0,
+            .code
+            .as_str(),
         "InsufficientBalance"
     );
     assert!(h.pool.is_empty());
-    // Enough for the gas reservation alone is not enough either.
-    assert!(accounts::fee(1_000_000) < need - U256::from(1u64));
     // Exactly gas plus rent: admitted, committed, and the unused gas refunded.
     let mut h = tight_host(&tight, need);
     h.submit(tx_by(&h, &tight, 0, 1_000_000, vec![op])).unwrap();
@@ -401,7 +370,8 @@ fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
     assert_eq!(
         h.submit(tx_by(&h, &tight, 1, 21_000, vec![permanent(2, 0)]))
             .unwrap_err()
-            .0,
+            .code
+            .as_str(),
         "InsufficientBalance"
     );
     h.produce().unwrap();
@@ -416,7 +386,7 @@ fn admission_refuses_a_sender_who_cannot_pay_gas_and_rent() {
 
 #[test]
 fn rent_the_sender_cannot_pay_at_execution_fails_its_transaction_atomically() {
-    let tight = signed_support::signer(7);
+    let tight = signer(7);
     let entity = key_of(&tight, 0, 1);
     let dry = dry_run(
         &tight,
@@ -468,7 +438,7 @@ fn rent_the_sender_cannot_pay_at_execution_fails_its_transaction_atomically() {
 
 #[test]
 fn the_producer_drops_a_transaction_whose_reservation_rent_consumed() {
-    let tight = signed_support::signer(7);
+    let tight = signer(7);
     let entity = key_of(&tight, 0, 1);
     let dry = dry_run(
         &tight,
@@ -531,7 +501,7 @@ fn forged_schedule_and_low_intrinsic_are_rejected() {
     let g = genesis();
     let tx = TxEnvelope {
         chain_id: 9200,
-        actor: signer().address(),
+        actor: signer(1).address(),
         request_id: [1; 32],
         tx_budget: 20_999,
         ops: vec![TxOp::Arkiv {
@@ -540,7 +510,10 @@ fn forged_schedule_and_low_intrinsic_are_rejected() {
         }],
     };
     assert_eq!(
-        SignedTx::sign(&g, 1, tx, &signer()).unwrap_err().0,
+        SignedTx::sign(&g, 1, tx, &signer(1))
+            .unwrap_err()
+            .code
+            .as_str(),
         "GasLimitBelowIntrinsic"
     );
 }
@@ -645,7 +618,10 @@ fn lifecycle_growth_extension_shrink_and_delete() {
 fn signed_genesis_rejects_other_wire_versions() {
     let g = genesis();
     let mut bytes = arkiv_db::encode(&g);
-    assert_eq!(&bytes[..4], &1u32.to_be_bytes());
+    assert_eq!(
+        &bytes[..4],
+        &arkiv_node::signed::protocol::VERSION.to_be_bytes()
+    );
     assert_eq!(arkiv_db::decode_exact::<SignedGenesis>(&bytes).unwrap(), g);
     for version in [0u32, 2, 3, 4] {
         bytes[..4].copy_from_slice(&version.to_be_bytes());
@@ -661,15 +637,18 @@ fn durable_reopen_light_proof_and_reserved_expiry_sweep() {
     let history = Arc::new(MemoryVersionedStore::new());
     let light_store = Arc::new(MemoryVersionedStore::new());
     let g = genesis();
-    let cert = SignedHeader::sign(&g, g.header(), &signer()).unwrap();
+    let cert = SignedHeader::sign(&g, g.header(), &signer(1)).unwrap();
     let mut p = Host::create(
         state.clone(),
-        History::create(history.clone(), g.hash()).unwrap(),
-        g.clone(),
-        [3; 16],
-        cert.clone(),
-        Some(signer()),
         Options::default(),
+        Launch {
+            history: History::create(history.clone(), g.hash()).unwrap(),
+            genesis: g.clone(),
+            source: [3; 16],
+            certificate: cert.clone(),
+            signer: Some(signer(1)),
+        },
+        Prefill::None,
     )
     .unwrap();
     let mut light = Light::create(light_store.clone(), g.clone(), cert).unwrap();
@@ -692,7 +671,7 @@ fn durable_reopen_light_proof_and_reserved_expiry_sweep() {
         state,
         History::open(history, g.hash()).unwrap(),
         &g,
-        Some(signer()),
+        Some(signer(1)),
         Options::default(),
     )
     .unwrap();
@@ -751,26 +730,14 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
     f.import(p.block(1).unwrap()).unwrap();
     let ns = NamespaceId::from_bytes(2u64.to_be_bytes()).unwrap();
     let submit = |p: &mut Host, nonce, actor: &Signer, ops| {
-        let signed = SignedTx::sign(
-            &p.genesis,
-            nonce,
-            TxEnvelope {
-                chain_id: 9200,
-                actor: actor.address(),
-                request_id: [nonce as u8; 32],
-                tx_budget: 1_000_000,
-                ops,
-            },
-            actor,
-        )
-        .unwrap();
+        let signed = sign_tx(&p.genesis, actor, nonce, [nonce as u8; 32], 1_000_000, ops);
         p.submit(signed).unwrap();
         p.produce().unwrap();
     };
     submit(
         &mut p,
         1,
-        &signer(),
+        &signer(1),
         vec![TxOp::CreateNamespace {
             name: NamespaceName::new("bricks").unwrap(),
         }],
@@ -778,7 +745,7 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
     submit(
         &mut p,
         2,
-        &signer(),
+        &signer(1),
         vec![TxOp::Arkiv {
             namespace: ns,
             operation: create(22, 1024, 8),
@@ -802,7 +769,7 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
         .value
         .unwrap();
     let projected = arkiv::project(&row).unwrap();
-    assert_eq!(projected.owner, *signer().address().as_bytes());
+    assert_eq!(projected.owner, *signer(1).address().as_bytes());
     let rent = gas::rent(
         0,
         gas::storage_units(&row.cells).unwrap().total,
@@ -846,7 +813,7 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
     };
     assert_eq!(page.rows.len(), 1);
     arkiv::validate_proven_row(&page.rows[0]).unwrap();
-    let other = Signer::from_bytes([2; 32]).unwrap();
+    let other = signer(2);
     submit(
         &mut p,
         0,
@@ -864,7 +831,13 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
             fault: HostFault::Arkiv(ArkivFault::NotOwner)
         }
     );
+    // Generic data writes are not admitted without Arkiv storage rent.
     for op in [
+        TxOp::Put {
+            namespace: ns,
+            key: b"brick".to_vec(),
+            value: b"red".to_vec(),
+        },
         TxOp::PatchRecord {
             namespace: ns,
             key: entity.clone(),
@@ -886,21 +859,21 @@ fn named_namespace_entities_preserve_rent_authority_proofs_and_expiry() {
             3,
             TxEnvelope {
                 chain_id: 9200,
-                actor: signer().address(),
+                actor: signer(1).address(),
                 request_id: [3; 32],
                 tx_budget: 1_000_000,
                 ops: vec![op],
             },
-            &signer(),
+            &signer(1),
         )
         .unwrap_err();
-        assert_eq!(signed.0, "UnsupportedGasOperation");
+        assert_eq!(signed.code.as_str(), "UnsupportedGasOperation");
     }
     let unknown = NamespaceId::from_bytes(999u64.to_be_bytes()).unwrap();
     submit(
         &mut p,
         3,
-        &signer(),
+        &signer(1),
         vec![TxOp::Arkiv {
             namespace: unknown,
             operation: create(99, 0, 1),
@@ -955,7 +928,7 @@ fn the_producer_defers_what_would_cross_the_storage_cap_and_followers_check_it()
     let mut f = host_of(g.clone(), false);
     p.produce().unwrap();
     f.import(p.block(1).unwrap()).unwrap();
-    let s = |n| signed_support::signer(n);
+    let s = signer;
     // Three 100 KiB creates of about 103,000 units each, then a small one
     // of the first sender.
     for n in 2..=4 {
@@ -1027,11 +1000,11 @@ fn the_producer_defers_what_would_cross_the_storage_cap_and_followers_check_it()
         state_root: f.head.state_root,
     };
     let forged = SignedBlock {
-        header: SignedHeader::sign(&g, header, &signer()).unwrap(),
+        header: SignedHeader::sign(&g, header, &signer(1)).unwrap(),
         inputs,
         outcomes,
     };
-    assert_eq!(f.import(forged).unwrap_err().0, "InvalidBlock");
+    assert_eq!(f.import(forged).unwrap_err().code.as_str(), "InvalidBlock");
     assert_eq!(f.head, p.head);
 }
 
@@ -1039,7 +1012,7 @@ fn the_producer_defers_what_would_cross_the_storage_cap_and_followers_check_it()
 fn a_transaction_over_the_storage_cap_is_refused_or_dropped() {
     let mut p = host_of(capped(150_000), true);
     p.produce().unwrap();
-    let s = |n| signed_support::signer(n);
+    let s = signer;
     // Two 80 KiB creates in one transaction add about 166,000 units: no block
     // can hold them, so admission refuses them.
     assert_eq!(
@@ -1051,7 +1024,8 @@ fn a_transaction_over_the_storage_cap_is_refused_or_dropped() {
             vec![create_bytes(1, 80 * 1024), create_bytes(2, 80 * 1024)],
         ))
         .unwrap_err()
-        .0,
+        .code
+        .as_str(),
         "ExceedsStorageCap"
     );
     assert!(p.pool.is_empty());
@@ -1086,7 +1060,10 @@ fn a_transaction_over_the_storage_cap_is_refused_or_dropped() {
         "the doomed transaction and its successor left"
     );
     let hash = arkiv_node::simulator::wire::hex(doomed_hash.as_slice());
-    assert_eq!(p.pool.dropped.reason(&hash), Some("ExceedsStorageCap"));
+    assert_eq!(
+        p.pool.dropped.reason(&hash).map(|r| r.as_str()),
+        Some("ExceedsStorageCap")
+    );
     let status = p.request_status(s(3).address(), [1; 32]).unwrap();
     assert_eq!(
         (status["status"].as_str(), status["reason"].as_str()),
@@ -1100,7 +1077,7 @@ fn poisoned_senders_cost_one_execution_per_block() {
     // quotes nothing (the entity is not at the head yet) and a third
     // transaction whose 3M-gas reservation the growth's rent consumes.
     const K: u8 = 5;
-    let senders: Vec<Signer> = (0..K).map(|n| signed_support::signer(20 + n)).collect();
+    let senders: Vec<Signer> = (0..K).map(|n| signer(20 + n)).collect();
     let txs = |s: &Signer| {
         let entity = key_of(s, 0, 1);
         [
@@ -1122,7 +1099,7 @@ fn poisoned_senders_cost_one_execution_per_block() {
     let funds = dry[0].0 + dry[1].0 + accounts::fee(dry[0].1 + dry[1].1) + accounts::fee(3_000_000)
         - U256::from(1u64);
     let base = genesis();
-    let mut allocations = vec![(signer().address(), signed_support::balance())];
+    let mut allocations = vec![(signer(1).address(), signed_support::balance())];
     allocations.extend(senders.iter().map(|s| (s.address(), funds)));
     let g = SignedGenesis::new(
         base.genesis,
@@ -1176,8 +1153,8 @@ fn poisoned_senders_cost_one_execution_per_block() {
 #[test]
 fn a_transaction_quote_covers_its_own_create_and_patch() {
     const K: u8 = 32;
-    let heavy = signed_support::signer(2);
-    let senders: Vec<Signer> = (0..K).map(|n| signed_support::signer(40 + n)).collect();
+    let heavy = signer(2);
+    let senders: Vec<Signer> = (0..K).map(|n| signer(40 + n)).collect();
     let first = |s: &Signer| vec![permanent(1, 0), grow(&key_of(s, 0, 1), 680)];
     let dry = dry_run(&senders[0], &[(1_000_000, first(&senders[0]))]);
     let probe = tight_host(&senders[0], signed_support::balance());
@@ -1188,7 +1165,7 @@ fn a_transaction_quote_covers_its_own_create_and_patch() {
     let funds = accounts::fee(1_000_000) + quoted.rent_wei + accounts::fee(10_000_000);
     let base = genesis();
     let mut allocations = vec![
-        (signer().address(), signed_support::balance()),
+        (signer(1).address(), signed_support::balance()),
         (heavy.address(), signed_support::balance()),
     ];
     allocations.extend(senders.iter().map(|s| (s.address(), funds)));

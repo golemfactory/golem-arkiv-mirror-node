@@ -58,7 +58,7 @@ records, bad framing/digests and mismatched manifest/root/height are
 corruption. The facade retains no historical block, header or inclusion
 vector. All history remains on disk without pruning.
 
-`crates/arkiv-db/tests/simulator_composition.rs` contains hand-built framing
+`crates/arkiv-db/tests/it/simulator_composition.rs` contains hand-built framing
 vectors, wrong-profile/identity/cap tests, atomic visibility and uncertainty
 checks, corruption cases, and a 1,000-publication lazy-open/retention test.
 The simulator host's node tests exercise canonical bodies and real redb.

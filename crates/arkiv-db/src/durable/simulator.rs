@@ -75,7 +75,7 @@ impl SimulatorIdentity {
             };
             Ok((identity, d.remaining()))
         })()
-        .map_err(|_| corrupt("malformed simulator identity"))?;
+        .map_err(|e| corrupt(format!("malformed simulator identity: {e}")))?;
         if decoded.1 != 0 || decoded.0.check_size().is_err() {
             return Err(corrupt("invalid simulator identity"));
         }
@@ -136,6 +136,14 @@ impl SimulatorPacket {
                 .iter()
                 .map(|i| i.key.len() + 8 + 8 + 32 + 1 + i.key.len() + 4 + i.value.len() + 32)
                 .sum::<usize>())
+    }
+    pub(crate) fn check_fits(&self, options: &Options) -> Result<(), DurableError> {
+        if self.reserved_bytes()? > options.prepare_bytes {
+            return Err(DurableError::ResourceLimit(
+                "host packet exceeds preparation cap".into(),
+            ));
+        }
+        Ok(())
     }
     pub(crate) fn append(
         &self,
@@ -242,7 +250,7 @@ pub(crate) fn read_block(
         let payload = d.bytes()?;
         Ok((height, id, root, payload, d.remaining()))
     })()
-    .map_err(|_| corrupt("malformed simulator block"))?;
+    .map_err(|e| corrupt(format!("malformed simulator block: {e}")))?;
     if decoded.0 != manifest.sequence
         || decoded.1 != manifest.id().0
         || decoded.2 != manifest.state_root.0
@@ -252,11 +260,7 @@ pub(crate) fn read_block(
         return Err(corrupt("simulator block/manifest association"));
     }
     Ok(SimulatorBlock {
-        info: CommitInfo {
-            snapshot: SnapshotId::from_sequence(decoded.0),
-            commit_id: manifest.id(),
-            state_root: manifest.state_root,
-        },
+        info: info_of(manifest),
         bytes: decoded.3.to_vec(),
     })
 }
@@ -385,7 +389,7 @@ impl DurableEngine {
             let value = d.bytes()?;
             Ok((height, id, stored_key, value, d.remaining()))
         })()
-        .map_err(|_| corrupt("malformed simulator inclusion"))?;
+        .map_err(|e| corrupt(format!("malformed simulator inclusion: {e}")))?;
         if decoded.2 != key
             || decoded.3.is_empty()
             || decoded.3.len() > INCLUSION_MAX_BYTES

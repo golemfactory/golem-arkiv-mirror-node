@@ -724,47 +724,25 @@ pub(crate) fn terms(
     limit: usize,
     meter: &mut Meter<'_>,
 ) -> Result<Vec<Value>, Fault> {
-    meter.charge(OperationClass::TermSeek, 1)?;
-    let (start, skip_start) = match lower {
-        Bound::Unbounded => (TermKey::run_start(name, tag, &[]), false),
-        Bound::Included(bound) => (
-            TermKey::run_start(name, tag, &bound.term_bytes().expect("indexable")),
-            false,
-        ),
-        Bound::Excluded(bound) => (
-            TermKey::run_start(name, tag, &bound.term_bytes().expect("indexable")),
-            true,
-        ),
-    };
-    let mut run = state.terms.range_from(&start, &loaders.terms);
+    let mut run = ValueRun::range(state, loaders, name, tag, lower, &Bound::Unbounded, meter)?;
     let mut values = Vec::new();
-    let outcome = loop {
-        if values.len() == limit {
-            break Ok(());
+    let mut collect = || -> Result<(), Fault> {
+        while values.len() < limit {
+            let Some((bytes, _)) = run.next()? else {
+                break;
+            };
+            meter.charge_group(&[
+                (OperationClass::TermVisit, 1),
+                (OperationClass::ReadByte, units(bytes.len())),
+            ])?;
+            values.push(
+                Value::from_term_bytes(tag, &bytes).expect("decoded term keys hold term bytes"),
+            );
         }
-        let (term, _) = match run.next() {
-            None => break Ok(()),
-            Some(Err(error)) => break Err(Fault::from(error)),
-            Some(Ok(entry)) => entry,
-        };
-        if term.name != *name || term.tag != tag {
-            break Ok(());
-        }
-        let Some(bytes) = &term.value else {
-            break Ok(());
-        };
-        if skip_start && term == start {
-            continue;
-        }
-        if let Err(reason) = meter.charge_group(&[
-            (OperationClass::TermVisit, 1),
-            (OperationClass::ReadByte, units(bytes.len())),
-        ]) {
-            break Err(reason.into());
-        }
-        values.push(Value::from_term_bytes(tag, bytes).expect("decoded term keys hold term bytes"));
+        Ok(())
     };
-    meter.note_index_nodes(run.probe().nodes);
+    let outcome = collect();
+    meter.note_index_nodes(run.nodes());
     outcome.map(|()| values)
 }
 
@@ -919,86 +897,177 @@ impl Source<'_> {
     }
 }
 
-/// Where a term run stops.
-enum RunEnd<'q> {
-    Range(&'q Bound<Value>),
-    Prefix(&'q [u8]),
+/// Where a run of value terms stops.
+enum RunEnd {
+    Upper(Bound<Vec<u8>>),
+    Prefix(Arc<str>),
 }
 
-/// Opens every posting of the contiguous run of value terms of `(name, tag)`
-/// that satisfy the predicate, in key order, each positioned at `from` (its
-/// seek and first entry are stepped at once, to prime the merge). The seek
-/// is charged once; each qualifying term is charged as it is visited; the
-/// existence term, a stepped-over `Excluded` endpoint and the key that
-/// terminates the run are never charged.
+fn term_bound(bound: &Bound<Value>) -> Bound<Vec<u8>> {
+    let bytes = |value: &Value| value.term_bytes().expect("validated bounds are indexable");
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(value) => Bound::Included(bytes(value)),
+        Bound::Excluded(value) => Bound::Excluded(bytes(value)),
+    }
+}
+
+/// One term of a run: its value bytes and posting.
+type RunTerm = (Arc<[u8]>, PostingMap);
+
+/// The contiguous run of value terms of one `(name, tag)` that satisfy a
+/// range or prefix predicate, in key order. Opening it charges the seek;
+/// the caller charges each term it takes. The existence term, a
+/// stepped-over `Excluded` lower bound and the key that ends the run are
+/// never yielded, so never charged.
+struct ValueRun<'a> {
+    entries: Range<'a, TermKey, Posting, Loader<'a>>,
+    start: TermKey,
+    skip_start: bool,
+    end: RunEnd,
+}
+
+impl<'a> ValueRun<'a> {
+    fn range(
+        state: &TypedState,
+        loaders: &'a NamespaceLoaders<'a>,
+        name: &CellName,
+        tag: TypeTag,
+        lower: &Bound<Value>,
+        upper: &Bound<Value>,
+        meter: &mut Meter<'_>,
+    ) -> Result<Self, Fault> {
+        let (bytes, skip_start) = match term_bound(lower) {
+            Bound::Unbounded => (Vec::new(), false),
+            Bound::Included(bytes) => (bytes, false),
+            Bound::Excluded(bytes) => (bytes, true),
+        };
+        let start = TermKey::run_start(name, tag, &bytes);
+        let end = RunEnd::Upper(term_bound(upper));
+        Self::open(state, loaders, start, skip_start, end, meter)
+    }
+
+    fn prefix(
+        state: &TypedState,
+        loaders: &'a NamespaceLoaders<'a>,
+        name: &CellName,
+        prefix: &Arc<str>,
+        meter: &mut Meter<'_>,
+    ) -> Result<Self, Fault> {
+        let start = TermKey::run_start(name, TypeTag::Str, prefix.as_bytes());
+        let end = RunEnd::Prefix(Arc::clone(prefix));
+        Self::open(state, loaders, start, false, end, meter)
+    }
+
+    fn open(
+        state: &TypedState,
+        loaders: &'a NamespaceLoaders<'a>,
+        start: TermKey,
+        skip_start: bool,
+        end: RunEnd,
+        meter: &mut Meter<'_>,
+    ) -> Result<Self, Fault> {
+        meter.charge(OperationClass::TermSeek, 1)?;
+        Ok(Self {
+            entries: state.terms.range_from(&start, &loaders.terms),
+            start,
+            skip_start,
+            end,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<RunTerm>, Fault> {
+        loop {
+            let Some(entry) = self.entries.next() else {
+                return Ok(None);
+            };
+            let (term, posting) = entry?;
+            if term.name != self.start.name || term.tag != self.start.tag {
+                return Ok(None);
+            }
+            if self.skip_start && term == self.start {
+                continue;
+            }
+            let Some(value) = term.value else {
+                return Ok(None);
+            };
+            let inside = match &self.end {
+                RunEnd::Upper(Bound::Unbounded) => true,
+                RunEnd::Upper(Bound::Included(bound)) => value.as_ref() <= bound.as_slice(),
+                RunEnd::Upper(Bound::Excluded(bound)) => value.as_ref() < bound.as_slice(),
+                RunEnd::Prefix(prefix) => value.starts_with(prefix.as_bytes()),
+            };
+            return Ok(inside.then_some((value, posting.0)));
+        }
+    }
+
+    /// Physical node visits of the term-map traversal so far.
+    fn nodes(&self) -> u64 {
+        self.entries.probe().nodes
+    }
+}
+
+/// Adds a posting already positioned by `range_from` to a merge by id: its
+/// seek and first entry are stepped at once.
+fn prime<'a>(
+    heads: &mut BinaryHeap<Reverse<(RecordId, usize)>>,
+    postings: &mut Vec<PostingRange<'a>>,
+    mut entries: PostingRange<'a>,
+) -> Result<(), Fault> {
+    let first = entries.next();
+    let index = postings.len();
+    postings.push(entries);
+    if let Some(entry) = first {
+        let (id, Member) = entry?;
+        heads.push(Reverse((id, index)));
+    }
+    Ok(())
+}
+
+/// Opens every posting of `run` in key order, each positioned at `from`,
+/// charging each term as it is visited.
 ///
 /// The term-map traversal is noted here on every path. The postings are
 /// noted by the returned source's owner, or here when a `TermVisit` rejects:
 /// no group will own the partial run, but the postings it had already
 /// positioned were visited.
-#[allow(clippy::too_many_arguments)]
 fn open_run<'a>(
-    state: &TypedState,
+    mut run: ValueRun<'a>,
     loaders: &'a NamespaceLoaders<'a>,
-    name: &CellName,
-    tag: TypeTag,
-    start: TermKey,
-    skip_start: bool,
-    end: RunEnd<'_>,
     from: RecordId,
     meter: &mut Meter<'_>,
 ) -> Result<Source<'a>, Fault> {
-    meter.charge(OperationClass::TermSeek, 1)?;
-    let mut run = state.terms.range_from(&start, &loaders.terms);
     let mut postings = Vec::new();
     let mut heads = BinaryHeap::new();
-    let outcome = loop {
-        let (term, posting) = match run.next() {
-            None => break Ok(()),
-            Some(Err(error)) => break Err(Fault::from(error)),
-            Some(Ok(entry)) => entry,
-        };
-        if term.name != *name || term.tag != tag {
-            break Ok(());
+    let mut open = || -> Result<(), Fault> {
+        while let Some((_, posting)) = run.next()? {
+            meter.charge(OperationClass::TermVisit, 1)?;
+            let entries = posting.range_from(&from, &loaders.postings);
+            prime(&mut heads, &mut postings, entries)?;
         }
-        let Some(value) = &term.value else {
-            break Ok(());
-        };
-        if skip_start && term == start {
-            continue;
-        }
-        let inside = match end {
-            RunEnd::Range(Bound::Unbounded) => true,
-            RunEnd::Range(Bound::Included(bound)) => {
-                value.as_ref() <= bound.term_bytes().expect("ordered").as_slice()
-            }
-            RunEnd::Range(Bound::Excluded(bound)) => {
-                value.as_ref() < bound.term_bytes().expect("ordered").as_slice()
-            }
-            RunEnd::Prefix(prefix) => value.starts_with(prefix),
-        };
-        if !inside {
-            break Ok(());
-        }
-        if let Err(reason) = meter.charge(OperationClass::TermVisit, 1) {
-            break Err(reason.into());
-        }
-        let mut entries = posting.0.range_from(&from, &loaders.postings);
-        let first = entries.next();
-        let index = postings.len();
-        postings.push(entries);
-        match first {
-            None => {}
-            Some(Ok((id, Member))) => heads.push(Reverse((id, index))),
-            Some(Err(error)) => break Err(error.into()),
-        }
+        Ok(())
     };
-    meter.note_index_nodes(run.probe().nodes);
+    let outcome = open();
+    meter.note_index_nodes(run.nodes());
     let source = Source::Run { heads, postings };
     if outcome.is_err() {
         source.note_physical(meter);
     }
     outcome.map(|()| source)
+}
+
+/// Reads one term leaf (`TermSeek` 1): its posting, if the term exists.
+fn lookup(
+    state: &TypedState,
+    loaders: &NamespaceLoaders<'_>,
+    term: &TermKey,
+    meter: &mut Meter<'_>,
+) -> Result<Option<PostingMap>, Fault> {
+    meter.charge(OperationClass::TermSeek, 1)?;
+    let mut probe = Probe::new();
+    let posting = state.terms.get(term, &loaders.terms, &mut probe);
+    meter.note_index_nodes(probe.nodes);
+    Ok(posting?.map(|posting| posting.0))
 }
 
 /// Opens one posting positioned at `from`; a missing term is an empty
@@ -1010,14 +1079,11 @@ fn open_posting<'a>(
     from: RecordId,
     meter: &mut Meter<'_>,
 ) -> Result<Source<'a>, Fault> {
-    meter.charge(OperationClass::TermSeek, 1)?;
-    let mut probe = Probe::new();
-    let posting = state.terms.get(term, &loaders.terms, &mut probe);
-    meter.note_index_nodes(probe.nodes);
-    Ok(match posting? {
-        Some(posting) => Source::Posting(posting.0.range_from(&from, &loaders.postings)),
-        None => Source::Empty,
-    })
+    Ok(
+        lookup(state, loaders, term, meter)?.map_or(Source::Empty, |posting| {
+            Source::Posting(posting.range_from(&from, &loaders.postings))
+        }),
+    )
 }
 
 /// One AND-group as a lazy stream of its matches in id order.
@@ -1074,51 +1140,29 @@ impl<'a, 'q> GroupStream<'a, 'q> {
                 }
                 Term::Range { name, lower, upper } => {
                     let tag = range_tag(lower, upper);
-                    let (start, skip_start) = match lower {
-                        Bound::Unbounded => (TermKey::run_start(name, tag, &[]), false),
-                        Bound::Included(bound) => (
-                            TermKey::run_start(name, tag, &bound.term_bytes().expect("ordered")),
-                            false,
-                        ),
-                        Bound::Excluded(bound) => (
-                            TermKey::run_start(name, tag, &bound.term_bytes().expect("ordered")),
-                            true,
-                        ),
-                    };
-                    open_run(
-                        state,
-                        loaders,
-                        name,
-                        tag,
-                        start,
-                        skip_start,
-                        RunEnd::Range(upper),
-                        from,
-                        meter,
-                    )?
+                    let run = ValueRun::range(state, loaders, name, tag, lower, upper, meter)?;
+                    open_run(run, loaders, from, meter)?
                 }
-                Term::StartsWith { name, prefix } => open_run(
-                    state,
-                    loaders,
-                    name,
-                    TypeTag::Str,
-                    TermKey::run_start(name, TypeTag::Str, prefix.as_bytes()),
-                    false,
-                    RunEnd::Prefix(prefix.as_bytes()),
-                    from,
-                    meter,
-                )?,
+                Term::StartsWith { name, prefix } => {
+                    let run = ValueRun::prefix(state, loaders, name, prefix, meter)?;
+                    open_run(run, loaders, from, meter)?
+                }
             },
         };
         probes.extend(group.iter().skip(1));
-        Ok(Self {
+        Ok(Self::written(source, probes))
+    }
+
+    /// A stream with neither followers nor absent postings.
+    fn written(source: Source<'a>, probes: Vec<&'q Literal>) -> Self {
+        Self {
             source,
             followers: Vec::new(),
             absent: Vec::new(),
             probes,
             head: None,
             head_row: None,
-        })
+        }
     }
 
     fn open_as(

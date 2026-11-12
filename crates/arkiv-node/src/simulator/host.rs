@@ -1,9 +1,11 @@
 //! One durable writer. Published headers are exposed only after Committed.
 
-use super::{Error, Result, metadata, wire::*, workload::Workload};
+use super::{Error, ErrorCode, Result, metadata, wire::*, workload::Workload};
+use crate::health::Health;
 use crate::{
     Block, BlockInputs, BlockOutcomes, ChainSpec, Genesis, Header, Inclusion, RequestIdentity,
-    Scope, exec::execute_block_observed,
+    Scope,
+    exec::{BlockEnv, execute_block_observed},
 };
 use arkiv_db::durable::{
     DurableEngine, EngineGenesis, Initialization, Options, Publication, Recovery,
@@ -51,12 +53,12 @@ impl RunConfig {
     pub fn validate(&self) -> Result<ChainSpec> {
         self.workload.validate()?;
         let g = &self.genesis;
-        let selected = crate::demo::workload::genesis(g.chain_id, g.timestamp_ms);
+        let selected = crate::dev::genesis(g.chain_id, g.timestamp_ms);
         // Only the development workload's limits and params are supported.
         if g.limits != selected.limits || g.params != selected.params {
-            return Err(Error("UnsupportedVersion"));
+            return Err(ErrorCode::UnsupportedVersion.into());
         }
-        ChainSpec::new(g.clone()).map_err(|_| Error("InvalidRequest"))
+        ChainSpec::new(g.clone()).map_err(|_| Error::from(ErrorCode::InvalidRequest))
     }
 }
 
@@ -75,12 +77,12 @@ pub fn uuid(bytes: &[u8; 16]) -> String {
 
 pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     if s.len() != 36 || [8, 13, 18, 23].iter().any(|&i| s.as_bytes()[i] != b'-') {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let b = unhex(&format!("0x{}", s.replace('-', "")), 16)?;
-    let a: [u8; 16] = b.try_into().map_err(|_| Error("InvalidRequest"))?;
+    let a: [u8; 16] = b.try_into().map_err(|_| ErrorCode::InvalidRequest)?;
     if uuid(&a) != s {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     Ok(a)
 }
@@ -119,9 +121,9 @@ impl Control {
     pub fn validate(&self) -> Result<([u8; 32], B256)> {
         let id: [u8; 32] = unhex(&self.command_id, 32)?
             .try_into()
-            .map_err(|_| Error("InvalidRequest"))?;
+            .map_err(|_| ErrorCode::InvalidRequest)?;
         if self.run_id.len() != 32 || unhex(&format!("0x{}", self.run_id), 16)?.len() != 16 {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let revision = number(&self.expected_revision)?;
         let height = self.expected_height.as_deref().map(number).transpose()?;
@@ -130,10 +132,10 @@ impl Control {
             "resume" => 2,
             "step" => 3,
             "configure" => 4,
-            _ => return Err(Error("InvalidRequest")),
+            _ => return Err(ErrorCode::InvalidRequest.into()),
         };
         if (action == 4) != self.config.is_some() {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         if let Some(c) = &self.config {
             c.validate()?;
@@ -187,7 +189,7 @@ impl StoredBlock {
         let feed = json_bytes(&self.feed, FEED_CAP)?;
         let body = encode(&self.block);
         if body.len() > 1024 * 1024 || self.controls.len() > 2 {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         let mut e = Encoder::new();
         e.u32(NODE_VERSION);
@@ -198,14 +200,14 @@ impl StoredBlock {
         e.put(&self.controls);
         let bytes = e.into_bytes();
         if bytes.len() > ENVELOPE_CAP || bytes.len() * 2 + 4096 > RESPONSE_CAP {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         Ok(bytes)
     }
 
     pub fn from_bytes(bytes: &[u8], id: &Identity, genesis: &Genesis) -> Result<Self> {
         if bytes.len() > ENVELOPE_CAP || bytes.len() * 2 + 4096 > RESPONSE_CAP {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         let parse = || -> std::result::Result<Self, DecodeError> {
             let mut d = Decoder::new(bytes);
@@ -251,36 +253,52 @@ impl StoredBlock {
                 controls,
             })
         };
-        let record = parse().map_err(|_| Error("StorageCorrupt"))?;
+        let record = parse().map_err(|_| ErrorCode::StorageCorrupt)?;
         let b = &record.block;
         let f = &record.feed;
-        f.validate_digest().map_err(|_| Error("StorageCorrupt"))?;
+        f.validate_digest().map_err(|_| ErrorCode::StorageCorrupt)?;
         if f.feed_version != 1
             || (&f.source_id, &f.run_id, &f.genesis_hash, &f.chain_id)
                 != (&id.source_id, &id.run_id, &id.genesis_hash, &id.chain_id)
             || f.header
                 .validate(genesis.chain_id)
-                .map_err(|_| Error("StorageCorrupt"))?
+                .map_err(|_| ErrorCode::StorageCorrupt)?
                 != b.header
             || f.spent_units != b.outcomes.spent.to_string()
             || b.header.outcomes_digest != b.outcomes.digest()
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         if b.header.height == 0 {
             if b.header != genesis.header()
                 || b.inputs != BlockInputs::default()
                 || b.outcomes != BlockOutcomes::default()
             {
-                return Err(Error("StorageCorrupt"));
+                return Err(ErrorCode::StorageCorrupt.into());
             }
         } else if b.header.inputs_digest != b.inputs.digest() {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
-        if record.bytes().map_err(|_| Error("StorageCorrupt"))? != bytes {
-            return Err(Error("StorageCorrupt"));
+        if record.bytes().map_err(|_| ErrorCode::StorageCorrupt)? != bytes {
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(record)
+    }
+}
+
+/// Whether a full simulator node authors blocks or follows a producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Producer,
+    Full,
+}
+
+impl Role {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Producer => "producer",
+            Self::Full => "full",
+        }
     }
 }
 
@@ -294,14 +312,12 @@ pub struct Host {
     pub workload: Workload,
     pub revision: u64,
     pub paused: bool,
-    pub health: &'static str,
+    pub health: Health,
     pub observed: u64,
-    pub role: &'static str,
+    pub role: Role,
     pending: Option<StoredBlock>,
     pending_config: Option<(ControlReceipt, Workload)>,
     volatile_controls: BTreeMap<[u8; 32], B256>,
-    /// The last state-retention refusal, for API error details.
-    pub refusal: crate::retention::Refusal,
 }
 
 impl Host {
@@ -346,8 +362,8 @@ impl Host {
             packet,
         )? {
             Initialization::Committed(e) => e,
-            Initialization::NotCommitted { .. } => return Err(Error("StorageUnavailable")),
-            Initialization::Indeterminate { .. } => return Err(Error("CommitUncertain")),
+            Initialization::NotCommitted { .. } => return Err(ErrorCode::StorageUnavailable.into()),
+            Initialization::Indeterminate { .. } => return Err(ErrorCode::CommitUncertain.into()),
         };
         Ok(Self {
             engine,
@@ -359,13 +375,12 @@ impl Host {
             head,
             revision: 0,
             paused: true,
-            health: "paused",
+            health: Health::Paused,
             observed: 0,
-            role: "producer",
+            role: Role::Producer,
             pending: None,
             pending_config: None,
             volatile_controls: BTreeMap::new(),
-            refusal: Default::default(),
         })
     }
 
@@ -376,14 +391,14 @@ impl Host {
     ) -> Result<Self> {
         let durable_identity = DurableEngine::read_simulator_identity(store.as_ref())?;
         let run: RunConfig =
-            decode_exact(&durable_identity.metadata).map_err(|_| Error("StorageCorrupt"))?;
+            decode_exact(&durable_identity.metadata).map_err(|_| ErrorCode::StorageCorrupt)?;
         let spec = run.validate()?;
         if run.genesis.header().hash() != durable_identity.node_genesis_hash {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         let identity = identity(&durable_identity, &run.genesis);
         if expected.is_some_and(|e| *e != identity) {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let engine = DurableEngine::open_simulator(
             store,
@@ -396,11 +411,11 @@ impl Host {
         if record.block.header.height != stored.info.snapshot.sequence()
             || record.block.header.state_root != stored.info.state_root
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         run.workload
             .update_allowed(&record.workload)
-            .map_err(|_| Error("StorageCorrupt"))?;
+            .map_err(|_| ErrorCode::StorageCorrupt)?;
         Ok(Self {
             head: record.block.header,
             workload: record.workload,
@@ -412,25 +427,24 @@ impl Host {
             durable_identity,
             identity,
             paused: true,
-            health: "paused",
-            role: "producer",
+            health: Health::Paused,
+            role: Role::Producer,
             pending: None,
             pending_config: None,
             volatile_controls: BTreeMap::new(),
-            refusal: Default::default(),
         })
     }
 
     pub fn block(&self, height: u64) -> Result<StoredBlock> {
         if height > self.head.height {
-            return Err(Error("UnknownBlock"));
+            return Err(ErrorCode::UnknownBlock.into());
         }
         let stored = self.engine.simulator_block(height)?;
         let block = StoredBlock::from_bytes(&stored.bytes, &self.identity, &self.run.genesis)?;
         if block.block.header.height != height
             || block.block.header.state_root != stored.info.state_root
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(block)
     }
@@ -450,21 +464,21 @@ impl Host {
             return Ok(None);
         };
         if bytes.len() != 40 {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         if bytes[..32] != digest.0 {
-            return Err(Error("RequestConflict"));
+            return Err(ErrorCode::RequestConflict.into());
         }
         Ok(Some(u64::from_be_bytes(bytes[32..].try_into().unwrap())))
     }
 
     pub fn control(&mut self, c: Control) -> Result<serde_json::Value> {
-        if self.role != "producer" {
-            return Err(Error("InvalidRequest"));
+        if self.role != Role::Producer {
+            return Err(ErrorCode::InvalidRequest.into());
         }
         let (id, digest) = c.validate()?;
         if c.run_id != self.identity.run_id {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if let Some(height) = self.existing_control(&id, digest)? {
             return Ok(serde_json::json!({
@@ -475,7 +489,7 @@ impl Host {
         }
         if let Some(old) = self.volatile_controls.get(&id) {
             if *old != digest {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
             return Ok(serde_json::json!({"status":"volatile","paused":self.paused}));
         }
@@ -486,13 +500,17 @@ impl Host {
                 .transpose()?
                 .is_some_and(|h| h != self.head.height)
         {
-            return Err(Error("RequestConflict"));
+            return Err(ErrorCode::RequestConflict.into());
         }
         match c.action.as_str() {
             "pause" | "resume" => {
                 self.paused = c.action == "pause";
-                if self.health != "storage-fenced" {
-                    self.health = if self.paused { "paused" } else { "running" };
+                if self.health != Health::StorageFenced {
+                    self.health = if self.paused {
+                        Health::Paused
+                    } else {
+                        Health::Running
+                    };
                 }
                 if self.volatile_controls.len() >= 64 {
                     let key = *self.volatile_controls.first_key_value().unwrap().0;
@@ -507,14 +525,14 @@ impl Host {
                 if let Some((old, prior)) = &self.pending_config
                     && (old.id != id || old.digest != digest || prior != &config)
                 {
-                    return Err(Error("QueueFull"));
+                    return Err(ErrorCode::QueueFull.into());
                 }
                 self.pending_config = Some((ControlReceipt { id, digest }, config));
                 let effective = self
                     .head
                     .height
                     .checked_add(1)
-                    .ok_or(Error("CapacityReached"))?;
+                    .ok_or(ErrorCode::CapacityReached)?;
                 Ok(serde_json::json!({
                     "status": "pending",
                     "effectiveHeight": effective.to_string(),
@@ -522,7 +540,7 @@ impl Host {
             }
             "step" => {
                 if !self.paused {
-                    return Err(Error("RequestConflict"));
+                    return Err(ErrorCode::RequestConflict.into());
                 }
                 let h = self.produce(Some(ControlReceipt { id, digest }))?;
                 Ok(serde_json::json!({
@@ -531,19 +549,19 @@ impl Host {
                     "configRevision": self.revision.to_string(),
                 }))
             }
-            _ => Err(Error("InvalidRequest")),
+            _ => Err(ErrorCode::InvalidRequest.into()),
         }
     }
 
     pub fn produce(&mut self, command: Option<ControlReceipt>) -> Result<Header> {
         if self.pending.is_some() {
-            return Err(Error("CommitUncertain"));
+            return Err(ErrorCode::CommitUncertain.into());
         }
         let height = self
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         let workload = self
             .pending_config
             .as_ref()
@@ -552,7 +570,7 @@ impl Host {
         let revision = if self.pending_config.is_some() {
             self.revision
                 .checked_add(1)
-                .ok_or(Error("CapacityReached"))?
+                .ok_or(ErrorCode::CapacityReached)?
         } else {
             self.revision
         };
@@ -572,7 +590,7 @@ impl Host {
         let height = record.block.header.height;
         if height <= self.head.height {
             if self.block(height)?.bytes()? != record.bytes()? {
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
             return Ok(self.head);
         }
@@ -581,23 +599,23 @@ impl Host {
                 .head
                 .height
                 .checked_add(1)
-                .ok_or(Error("CapacityReached"))?
+                .ok_or(ErrorCode::CapacityReached)?
         {
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         self.workload.update_allowed(&record.workload)?;
         if record.revision < self.revision
             || record.revision > self.revision.saturating_add(1)
             || (record.revision == self.revision && record.workload != self.workload)
         {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         if record.block.header.timestamp_ms
             != record
                 .workload
                 .timestamp(self.run.genesis.timestamp_ms, height)?
         {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         self.execute_publish(
             record.block.inputs.clone(),
@@ -622,7 +640,7 @@ impl Host {
             .head
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         // Included requests may never be replayed as new work.
         for (identity, _, _) in RequestIdentity::of_block(self.spec.chain_id(), &inputs) {
             if self
@@ -630,12 +648,12 @@ impl Host {
                 .simulator_inclusion(&encode(&identity))?
                 .is_some()
             {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
         }
         for c in &controls {
             if self.existing_control(&c.id, c.digest)?.is_some() {
-                return Err(Error("RequestConflict"));
+                return Err(ErrorCode::RequestConflict.into());
             }
         }
         let branch = self.engine.begin(
@@ -643,27 +661,26 @@ impl Host {
             Some(Cost::new(self.spec.params().block_budget)),
         )?;
         let mut metadata = None;
-        let executed = execute_block_observed(
-            &self.spec,
-            branch,
-            &self.head,
+        let env = BlockEnv {
+            spec: &self.spec,
+            parent: &self.head,
             height,
-            timestamp,
-            &inputs,
-            |branch, inputs, outcomes, expired| {
+            timestamp_ms: timestamp,
+        };
+        let executed =
+            execute_block_observed(env, branch, &inputs, |branch, inputs, outcomes, expired| {
                 metadata = Some(metadata::capture(branch, inputs, outcomes, expired)?);
                 Ok(())
-            },
-        )
-        .map_err(|e| match e {
-            crate::ExecError::Storage(s) => s.into(),
-            _ => Error("InvalidRequest"),
-        })?;
+            })
+            .map_err(|e| match e {
+                crate::ExecError::Storage(s) => s.into(),
+                _ => Error::from(ErrorCode::InvalidRequest),
+            })?;
         let record = StoredBlock {
             feed: FeedBlock::new(
                 &self.identity,
                 &executed.header,
-                metadata.ok_or(Error("StorageCorrupt"))?,
+                metadata.ok_or(ErrorCode::StorageCorrupt)?,
             )?,
             block: Block {
                 header: executed.header,
@@ -678,7 +695,7 @@ impl Host {
         if let Some(expected) = expected
             && expected.bytes()? != bytes
         {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let mut inclusions = Vec::new();
         for (identity, scope, index) in
@@ -721,28 +738,32 @@ impl Host {
     fn commit_prepared(&mut self) -> Result<Header> {
         match self.engine.commit()? {
             Publication::Committed(info) => {
-                let record = self.pending.take().ok_or(Error("StorageCorrupt"))?;
+                let record = self.pending.take().ok_or(ErrorCode::StorageCorrupt)?;
                 if record.block.header.height != info.snapshot.sequence()
                     || record.block.header.state_root != info.state_root
                 {
-                    self.health = "storage-fenced";
-                    return Err(Error("StorageCorrupt"));
+                    self.health = Health::StorageFenced;
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 self.head = record.block.header;
                 self.workload = record.workload;
                 self.revision = record.revision;
                 self.pending_config = None;
                 self.observed = self.observed.max(self.head.height);
-                self.health = if self.paused { "paused" } else { "running" };
+                self.health = if self.paused {
+                    Health::Paused
+                } else {
+                    Health::Running
+                };
                 Ok(self.head)
             }
             Publication::NotCommitted(_) => {
-                self.health = "storage-fenced";
-                Err(Error("StorageUnavailable"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::StorageUnavailable.into())
             }
             Publication::Indeterminate(_) => {
-                self.health = "storage-fenced";
-                Err(Error("CommitUncertain"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::CommitUncertain.into())
             }
         }
     }
@@ -751,8 +772,10 @@ impl Host {
     pub fn retry_pending(&mut self) -> Result<Header> {
         match self.engine.recover_pending()? {
             Recovery::RetryPrepared => self.commit_prepared(),
-            Recovery::ObservedCommittedDurabilityUnknown(_) => Err(Error("CommitUncertain")),
-            Recovery::Ready => Err(Error("InvalidRequest")),
+            Recovery::ObservedCommittedDurabilityUnknown(_) => {
+                Err(ErrorCode::CommitUncertain.into())
+            }
+            Recovery::Ready => Err(ErrorCode::InvalidRequest.into()),
         }
     }
 
@@ -762,9 +785,9 @@ impl Host {
             || r.snapshot.block_hash != h.hash()
             || r.snapshot.state_root != h.state_root
         {
-            return Err(Error("CursorMismatch"));
+            return Err(ErrorCode::CursorMismatch.into());
         }
-        crate::retention::state(&self.engine, &self.refusal, h.height)
+        crate::retention::state(&self.engine, h.height)
     }
 
     pub fn proof(&self, r: &arkiv_db::proof::EqRequest) -> Result<Vec<u8>> {

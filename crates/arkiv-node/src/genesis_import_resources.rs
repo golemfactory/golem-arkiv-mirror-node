@@ -1,12 +1,14 @@
 //! Resource policy for private bulk genesis construction and final installation.
 
+use crate::genesis_error::GenesisToolError;
 use arkiv_db::durable::Options;
 use arkiv_db_redb::RedbConfig;
 use std::path::Path;
-type Result<T> = std::result::Result<T, String>;
 
-fn err(e: impl std::fmt::Display) -> String {
-    format!("import resources: {e}")
+type Result<T> = std::result::Result<T, GenesisToolError>;
+
+fn err(e: impl std::fmt::Display) -> GenesisToolError {
+    format!("import resources: {e}").into()
 }
 
 /// One redb cache plus decoded engine caches remain bounded independently of rows.
@@ -52,7 +54,8 @@ pub fn check_disk(path: &Path, additional_bytes: u64) -> Result<()> {
         return Err(format!(
             "insufficient prefill disk space: \
              available={available} required={required} bytes (including reserve)"
-        ));
+        )
+        .into());
     }
     Ok(())
 }

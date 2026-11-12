@@ -17,25 +17,16 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use std::{
-    io,
-    process::Command,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{io, process::Command, time::Duration};
 
 use arkiv_db_redb::{
     RedbConfig, RedbStore,
-    testing::{CrashDisk, CrashMode, DiskOp, SplitMix},
+    testing::{CrashDisk, CrashMode, DiskOp},
 };
-use arkiv_db_storage::versioned::{
-    CommitBatch, CommitOutcome, ObjectReader, Reconciliation, SpaceId, VersionedStore, reconcile,
-};
+use arkiv_db_storage::versioned::{ObjectReader, SpaceId, VersionedStore};
 use common::{
-    BenchDir, amplification, assert_applied, base_dir, block, commit, crash, crash_store, creation,
+    BenchDir, Chain, amplification, assert_applied, base_dir, block, commit, crash, crash_store,
+    creation,
     disk_full::{self, Space},
     filesystem_of, isolation, lost_sync, mb, recovery, timed,
 };
@@ -203,7 +194,7 @@ fn atomicity(scale: &Scale) {
         "ten tables after a restart, quick repair, 2 + 128 torn modes",
         &tally,
     );
-    let (tally_off, _) = timed(|| crash::run(false, crash::SEEDS));
+    let tally_off = crash::run(false, crash::SEEDS);
     row(
         "ten tables after a restart, no quick repair, 2 + 16 torn modes",
         &tally_off,
@@ -213,14 +204,7 @@ fn atomicity(scale: &Scale) {
         "ten tables in steady state, quick repair, 2 + 128 torn modes",
         &steady,
     );
-    let select = |k: u64, trace: &[DiskOp]| {
-        let calls = trace.len() as u64;
-        k < 16
-            || k + 32 >= calls
-            || k.is_multiple_of(97)
-            || (k.saturating_sub(1)..=k + 1)
-                .any(|i| i < calls && trace[i as usize] != DiskOp::Write)
-    };
+    let select = crash::sampled(97);
     let points = if scale.growing_all_points {
         "every crash point"
     } else {
@@ -245,17 +229,15 @@ fn durability() {
     println!("\n## Immediate durability\n");
     let disk = CrashDisk::new();
     let store = crash_store(&disk, RedbConfig::default());
-    let mut parent = None;
+    let mut chain = Chain::default();
     let mut survived = 0;
-    for height in 0..50 {
-        let batch = block(parent, height, 1, &[(SpaceId::Namespace(1), 10, 200)]);
-        commit(&store, batch.clone());
-        parent = Some(batch.new_head);
+    for _ in 0..50 {
+        commit(&store, &chain.next(&[(SpaceId::Namespace(1), 10, 200)]));
         let reopened = crash_store(
             &CrashDisk::from_image(disk.crash_image(CrashMode::DurableOnly)),
             RedbConfig::default(),
         );
-        if reopened.head().unwrap() == parent {
+        if reopened.head().unwrap() == chain.head() {
             survived += 1;
         }
     }
@@ -323,59 +305,19 @@ fn recovery_gate(scale: &Scale) {
 fn history(scale: &Scale) {
     println!("\n## Historical objects after reopen and during commits\n");
     let dir = BenchDir::new("experiment-history");
-    let store = Arc::new(
-        RedbStore::create(
-            dir.file("history.redb"),
-            RedbConfig::with_cache_size(256 << 10),
-        )
-        .unwrap(),
-    );
-    let published: Arc<RwLock<Vec<CommitBatch>>> = Arc::default();
-    let done = Arc::new(AtomicBool::new(false));
-    let verified = Arc::new(AtomicU64::new(0));
-    let first = block(None, 0, 1, &[(SpaceId::Namespace(1), 50, 200)]);
-    commit(store.as_ref(), first.clone());
-    published.write().unwrap().push(first);
-    let started = Instant::now();
-    std::thread::scope(|scope| {
-        for reader in 0..4 {
-            let (store, published, done, verified) = (
-                Arc::clone(&store),
-                Arc::clone(&published),
-                Arc::clone(&done),
-                Arc::clone(&verified),
-            );
-            scope.spawn(move || {
-                let mut rng = SplitMix::new(reader);
-                while !done.load(Ordering::Acquire) {
-                    let batch = {
-                        let list = published.read().unwrap();
-                        list[rng.below(list.len() as u64) as usize].clone()
-                    };
-                    assert_applied(store.as_ref(), &batch);
-                    verified.fetch_add(batch.objects.len() as u64, Ordering::Relaxed);
-                }
-            });
+    let store = RedbStore::create(
+        dir.file("history.redb"),
+        RedbConfig::with_cache_size(256 << 10),
+    )
+    .unwrap();
+    let run = common::history::concurrent_history(&store, scale.history_blocks, |height| {
+        let mut objects = vec![(SpaceId::Namespace(1), 50, 200)];
+        if height > 0 {
+            objects.push((SpaceId::Namespace(2 + height % 7), 10, 500));
         }
-        let mut parent = Some(published.read().unwrap()[0].new_head);
-        for height in 1..scale.history_blocks {
-            let batch = block(
-                parent,
-                height,
-                1,
-                &[
-                    (SpaceId::Namespace(1), 50, 200),
-                    (SpaceId::Namespace(2 + height % 7), 10, 500),
-                ],
-            );
-            commit(store.as_ref(), batch.clone());
-            parent = Some(batch.new_head);
-            published.write().unwrap().push(batch);
-        }
-        done.store(true, Ordering::Release);
+        objects
     });
-    let elapsed = started.elapsed();
-    let blocks = published.read().unwrap().clone();
+    let (blocks, elapsed, verified) = (run.blocks, run.elapsed, run.verified_objects);
     drop(store);
     let reopened =
         RedbStore::open(dir.file("history.redb"), RedbConfig::with_cache_size(0)).unwrap();
@@ -386,8 +328,8 @@ fn history(scale: &Scale) {
         "- {} blocks committed in {:.2} s while 4 readers verified {} historical objects ({:.0} objects/s); every committed object matched.",
         blocks.len(),
         elapsed.as_secs_f64(),
-        verified.load(Ordering::Relaxed),
-        verified.load(Ordering::Relaxed) as f64 / elapsed.as_secs_f64()
+        verified,
+        verified as f64 / elapsed.as_secs_f64()
     );
     println!(
         "- after a reopen with a zero-byte redb cache, all {} objects of all blocks read back identical.",
@@ -400,52 +342,12 @@ fn history(scale: &Scale) {
 
 fn reconciliation() {
     println!("\n## Lost-acknowledgement reconciliation\n");
-    let genesis = block(None, 0, 1, &[(SpaceId::Namespace(1), 30, 200)]);
-    let candidate = block(
-        Some(genesis.new_head),
-        1,
-        1,
-        &[
-            (SpaceId::Namespace(1), 40, 200),
-            (SpaceId::Namespace(2), 20, 700),
-        ],
-    );
-    let image = {
-        let disk = CrashDisk::new();
-        let store = crash_store(&disk, RedbConfig::default());
-        commit(&store, genesis);
-        disk.crash(store, CrashMode::DurableOnly)
-    };
-    let trace = {
-        let disk = CrashDisk::from_image(image.clone());
-        let store = crash_store(&disk, RedbConfig::default());
-        let start = disk.mutating_trace().len();
-        commit(&store, candidate.clone());
-        disk.mutating_trace()[start..].to_vec()
-    };
-    let (mut absent, mut committed, mut once) = (0, 0, 0);
-    for (k, op) in trace.iter().enumerate() {
-        let skip = trace[..k].iter().filter(|earlier| *earlier == op).count() as u64;
-        let disk = CrashDisk::from_image(image.clone());
-        let store = crash_store(&disk, RedbConfig::default());
-        disk.fail(*op, skip, io::ErrorKind::Other);
-        let outcome = store.commit(&candidate);
-        assert!(!matches!(outcome, CommitOutcome::Committed));
-        match reconcile(&store, &candidate).unwrap() {
-            Reconciliation::Committed => committed += 1,
-            Reconciliation::NotCommitted => {
-                absent += 1;
-                commit(&store, candidate.clone());
-                if matches!(store.commit(&candidate), CommitOutcome::NotCommitted(_)) {
-                    once += 1;
-                }
-            }
-            Reconciliation::Diverged { head } => panic!("diverged at {head:?}"),
-        }
-    }
+    let sweep = common::reconcile::io_error_sweep();
     println!(
-        "- I/O error injected at each of the {} mutating calls of a commit: {absent} reconciled absent (retried: committed once, second retry refused in {once}), {committed} reconciled committed (the final sync failed after the commit record was written).",
-        trace.len()
+        "- I/O error injected at each of the {} mutating calls of a commit: {} reconciled absent (the retry committed once and a second retry was refused), {} reconciled committed (the final sync failed after the commit record was written).",
+        sweep.calls,
+        sweep.not_committed + sweep.indeterminate_absent,
+        sweep.indeterminate_committed
     );
     let (_, candidate) = lost_sync::chain();
     let two_phase = lost_sync::lost_final_sync(true);
@@ -468,7 +370,7 @@ fn latching() {
     let disk = CrashDisk::new();
     let store = crash_store(&disk, RedbConfig::with_cache_size(0));
     let genesis = block(None, 0, 1, &[(SpaceId::Namespace(1), 10, 200)]);
-    commit(&store, genesis.clone());
+    commit(&store, &genesis);
     disk.fail(DiskOp::Read, 0, io::ErrorKind::Other);
     let error = store.head().unwrap_err();
     let refused = store

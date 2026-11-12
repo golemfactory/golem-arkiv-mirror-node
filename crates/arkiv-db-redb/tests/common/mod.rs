@@ -11,18 +11,24 @@ pub mod amplification;
 pub mod crash;
 pub mod creation;
 pub mod disk_full;
+pub mod history;
 pub mod isolation;
 pub mod lost_sync;
+pub mod reconcile;
 pub mod recovery;
 
 use std::{
+    io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use alloy_primitives::keccak256;
-use arkiv_db_redb::{RedbConfig, RedbStore, testing::CrashDisk};
+use arkiv_db_redb::{
+    RedbConfig, RedbStore,
+    testing::{CrashDisk, CrashMode, DiskOp},
+};
 use arkiv_db_storage::versioned::{
     CommitBatch, CommitOutcome, Head, ObjectId, SpaceId, Table, VersionedStore, height_key,
 };
@@ -172,9 +178,34 @@ pub fn block(
     batch
 }
 
+/// Consecutive blocks of one chain (fork 1), each built on the one before.
+#[derive(Debug, Default)]
+pub struct Chain {
+    head: Option<Head>,
+}
+
+impl Chain {
+    /// The head of the last block built, `None` before the first.
+    pub fn head(&self) -> Option<Head> {
+        self.head
+    }
+
+    /// The height the next block will have.
+    pub fn height(&self) -> u64 {
+        self.head.map_or(0, |head| head.height + 1)
+    }
+
+    /// Builds the next block; see [`block`] for `objects`.
+    pub fn next(&mut self, objects: &[(SpaceId, u64, usize)]) -> CommitBatch {
+        let batch = block(self.head, self.height(), 1, objects);
+        self.head = Some(batch.new_head);
+        batch
+    }
+}
+
 /// Asserts `Committed`.
-pub fn commit(store: &dyn VersionedStore, batch: CommitBatch) {
-    let outcome = store.commit(&batch);
+pub fn commit(store: &dyn VersionedStore, batch: &CommitBatch) {
+    let outcome = store.commit(batch);
     assert_eq!(outcome, CommitOutcome::Committed);
 }
 
@@ -219,10 +250,51 @@ pub fn assert_absent(store: &dyn VersionedStore, batch: &CommitBatch) {
     }
 }
 
+/// A 1 MiB redb cache, with or without quick repair (two-phase commit).
+pub fn config(quick_repair: bool) -> RedbConfig {
+    RedbConfig {
+        cache_size: 1 << 20,
+        quick_repair,
+    }
+}
+
+/// A 64 KiB redb cache with the store's default settings.
+pub fn small_cache_config() -> RedbConfig {
+    RedbConfig::with_cache_size(64 << 10)
+}
+
 /// A redb store on a simulated disk, reopenable on the same disk.
 pub fn crash_store(disk: &CrashDisk, config: RedbConfig) -> RedbStore {
     let disk = disk.clone();
     RedbStore::with_backend(move || Ok(disk.backend()), config).expect("open store on crash disk")
+}
+
+/// The durable image of a new store after committing `batches` (every commit
+/// synced; the store is then cut off, so no clean close runs).
+pub fn durable_image(config: RedbConfig, batches: &[CommitBatch]) -> Vec<u8> {
+    let disk = CrashDisk::new();
+    let store = crash_store(&disk, config);
+    for batch in batches {
+        commit(&store, batch);
+    }
+    disk.crash(store, CrashMode::DurableOnly)
+}
+
+/// The mutating backend calls of one complete commit of `batch` on `image`.
+pub fn commit_trace(image: &[u8], config: RedbConfig, batch: &CommitBatch) -> Vec<DiskOp> {
+    let disk = CrashDisk::from_image(image.to_vec());
+    let store = crash_store(&disk, config);
+    let start = disk.mutating_trace().len();
+    commit(&store, batch);
+    disk.mutating_trace()[start..].to_vec()
+}
+
+/// Arms `disk` to fail call `k` of `trace` (a trace of the commit about to
+/// run) with an error of `kind`.
+pub fn fail_call(disk: &CrashDisk, trace: &[DiskOp], k: usize, kind: io::ErrorKind) {
+    let op = trace[k];
+    let skip = trace[..k].iter().filter(|earlier| **earlier == op).count() as u64;
+    disk.fail(op, skip, kind);
 }
 
 pub fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {

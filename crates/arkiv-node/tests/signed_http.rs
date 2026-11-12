@@ -1,6 +1,5 @@
 //! Real-socket signed submission, body replication and light proof verification.
 
-use alloy_primitives::U256;
 use arkiv_db::{
     CellName, Value as DbValue,
     durable::Options,
@@ -8,13 +7,13 @@ use arkiv_db::{
 };
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::{
-    Expiry, TxEnvelope, TxOp,
-    accounts::AccountConfig,
-    arkiv::{ArkivOperation, entity_namespace},
+    Expiry, TxOp,
+    arkiv::ArkivOperation,
     signed::{
+        ErrorCode,
         crypto::Signer,
         history::History,
-        host::Host,
+        host::{Host, Prefill},
         light::Light,
         protocol::*,
         runtime::{self, Node, Runtime, Shared},
@@ -37,102 +36,58 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod signed_support;
+use signed_support::{
+    allocations, arkiv_ops,
+    http::{Server, serve},
+    launch, memory_host, scalar_signer, sign_tx,
+};
+
 const TOKEN: &str = "signed-test-replication-token-0123456789";
 
-struct Server {
-    url: String,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn serve(router: Router) -> Server {
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", socket.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
-    Server { url, task }
-}
-
 fn signer(who: u8) -> Signer {
-    let mut key = [0; 32];
-    key[31] = who;
-    Signer::from_bytes(key).unwrap()
+    scalar_signer(who.into())
 }
 
 fn genesis() -> SignedGenesis {
-    let funded = [1, 2, 3].map(|who| {
-        (
-            signer(who).address(),
-            U256::from(10u64).pow(U256::from(24u64)),
-        )
-    });
     SignedGenesis::new(
         default_native_genesis(7, 1_000, 250),
         [0x42; 16],
         *signer(1).address().as_bytes(),
         250,
-        AccountConfig::new(funded.to_vec()).unwrap(),
+        allocations(&[1, 2, 3].map(|who| signer(who).address())),
     )
     .unwrap()
 }
 
 fn host(producer: bool) -> Host {
-    let genesis = genesis();
-    let cert = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
-    Host::create(
-        Arc::new(MemoryVersionedStore::new()),
-        History::create(Arc::new(MemoryVersionedStore::new()), genesis.hash()).unwrap(),
-        genesis,
-        [1; 16],
-        cert,
-        producer.then(|| signer(1)),
-        Options::default(),
-    )
-    .unwrap()
+    memory_host(&genesis(), signer(1), [1; 16], producer)
 }
 
 fn create(who: u8, nonce: u64, salt: u128) -> SignedTx {
-    let signer = signer(who);
     let mut request = [0; 32];
     request[0] = who;
     request[24..].copy_from_slice(&nonce.to_be_bytes());
-    SignedTx::sign(
-        &genesis(),
-        nonce,
-        TxEnvelope {
-            chain_id: 7,
-            actor: signer.address(),
-            request_id: request,
-            tx_budget: 2_000_000,
-            ops: vec![TxOp::Arkiv {
-                namespace: entity_namespace(),
-                operation: ArkivOperation::Create {
-                    salt,
-                    flags: 0,
-                    expiry: Expiry {
-                        expires_at: 0,
-                        min_lifetime: 1_000,
-                    },
-                    attributes: vec![
-                        (
-                            CellName::new("group").unwrap(),
-                            arkiv_db::Cell::attribute(DbValue::U64(1)),
-                        ),
-                        (
-                            CellName::new("body").unwrap(),
-                            arkiv_db::Cell::field(DbValue::bytes(b"private canonical payload")),
-                        ),
-                    ],
-                },
-            }],
+    let create = ArkivOperation::Create {
+        salt,
+        flags: 0,
+        expiry: Expiry {
+            expires_at: 0,
+            min_lifetime: 1_000,
         },
-        &signer,
-    )
-    .unwrap()
+        attributes: vec![
+            (
+                CellName::new("group").unwrap(),
+                arkiv_db::Cell::attribute(DbValue::U64(1)),
+            ),
+            (
+                CellName::new("body").unwrap(),
+                arkiv_db::Cell::field(DbValue::bytes(b"private canonical payload")),
+            ),
+        ],
+    };
+    let ops = arkiv_ops(vec![create]);
+    sign_tx(&genesis(), &signer(who), nonce, request, 2_000_000, ops)
 }
 
 async fn post(client: &reqwest::Client, url: &str, path: &str, body: Value) -> reqwest::Response {
@@ -961,7 +916,22 @@ async fn altered_or_truncated_proof_never_returns_verified_rows() {
         }),
     ))
     .await;
-    for bad in [&mutator, &dropper] {
+    let malformed = serve(Router::new().route(
+        "/signed/v1/query/range",
+        route_post(|| async { Json(json!({"proof":"0x00"})) }),
+    ))
+    .await;
+    let eq = ["query/verified", "query/inspect"].as_slice();
+    for (bad, endpoints, body) in [
+        (&mutator, eq, query()),
+        (&dropper, eq, query()),
+        // Correctly authenticated headers cannot authorize a malformed witness.
+        (
+            &malformed,
+            ["query/range/inspect"].as_slice(),
+            range_query(),
+        ),
+    ] {
         let light = light_rt(&bad.url, &producer);
         {
             let source = producer.node.lock().unwrap();
@@ -980,8 +950,8 @@ async fn altered_or_truncated_proof_never_returns_verified_rows() {
                 .unwrap();
         }
         let local = serve(runtime::public_router(light)).await;
-        for endpoint in ["query/verified", "query/inspect"] {
-            let r = post(&reqwest::Client::new(), &local.url, endpoint, query()).await;
+        for endpoint in endpoints {
+            let r = post(&reqwest::Client::new(), &local.url, endpoint, body.clone()).await;
             assert!(!r.status().is_success());
             let v: Value = r.json().await.unwrap();
             for field in ["rows", "verification", "inspection", "canonicalProof"] {
@@ -1018,7 +988,7 @@ async fn authentic_conflict_in_sampled_header_freezes_full_without_body_fetch() 
     .unwrap();
     assert_eq!(
         runtime::sync_once(rt.clone()).await,
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(ErrorCode::ChainConflict.into())
     );
     let node = rt.node.lock().unwrap();
     assert_eq!(runtime::status(&node)["health"], "chain-conflict");
@@ -1026,37 +996,31 @@ async fn authentic_conflict_in_sampled_header_freezes_full_without_body_fetch() 
 }
 
 fn full_with_retained_history() -> (Host, Arc<MemoryVersionedStore>) {
-    let genesis = genesis();
-    let certificate = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
     let store = Arc::new(MemoryVersionedStore::new());
-    let history = History::create(store.clone(), genesis.hash()).unwrap();
     let full = Host::create(
         Arc::new(MemoryVersionedStore::new()),
-        history,
-        genesis,
-        [1; 16],
-        certificate,
-        None,
         Options::default(),
+        launch(&genesis(), signer(1), [1; 16], store.clone(), false),
+        Prefill::None,
     )
     .unwrap();
     (full, store)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn future_sampled_and_advertised_conflict_freezes_before_replication() {
-    let mut producer = host(true);
-    producer.produce().unwrap();
-    let block = producer.block(1).unwrap();
-    let mut changed = block.header.header;
-    changed.inputs_digest = arkiv_db::B256::repeat_byte(17);
-    let sampled = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
+/// Syncs a full node at genesis from a source advertising `certificate` and
+/// `sampled` and serving `block` as the body of height 1. The sync ends in a
+/// chain conflict; returns the node, the number of body fetches and the
+/// store of its history.
+async fn sync_into_conflict(
+    certificate: &SignedHeader,
+    sampled: &SignedHeader,
+    block: SignedBlock,
+) -> (Shared, usize, Arc<MemoryVersionedStore>) {
     let (full, history_store) = full_with_retained_history();
-    assert_eq!(full.head.height, 0);
     let headers = json!({
         "identity": full.identity,
-        "certificates": [pack(&block.header)],
-        "sampled": pack(&sampled),
+        "certificates": [pack(certificate)],
+        "sampled": pack(sampled),
     });
     let bodies = Arc::new(AtomicUsize::new(0));
     let count = bodies.clone();
@@ -1091,9 +1055,22 @@ async fn future_sampled_and_advertised_conflict_freezes_before_replication() {
     .unwrap();
     assert_eq!(
         runtime::sync_once(rt.clone()).await,
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(ErrorCode::ChainConflict.into())
     );
-    assert_eq!(bodies.load(Ordering::SeqCst), 0);
+    (rt, bodies.load(Ordering::SeqCst), history_store)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn future_sampled_and_advertised_conflict_freezes_before_replication() {
+    let mut producer = host(true);
+    producer.produce().unwrap();
+    let block = producer.block(1).unwrap();
+    let mut changed = block.header.header;
+    changed.inputs_digest = arkiv_db::B256::repeat_byte(17);
+    let sampled = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
+    let certificate = block.header.clone();
+    let (rt, bodies, history_store) = sync_into_conflict(&certificate, &sampled, block).await;
+    assert_eq!(bodies, 0);
     assert_eq!(head(&rt), genesis().header());
     assert_eq!(
         runtime::status(&rt.node.lock().unwrap())["health"],
@@ -1102,7 +1079,7 @@ async fn future_sampled_and_advertised_conflict_freezes_before_replication() {
     drop(rt);
     assert!(matches!(
         History::open(history_store, genesis().hash()),
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(e) if e.code == ErrorCode::ChainConflict
     ));
 }
 
@@ -1115,48 +1092,8 @@ async fn authentic_replication_certificate_conflict_persists_freeze_before_execu
     let mut changed = block.header.header;
     changed.inputs_digest = arkiv_db::B256::repeat_byte(18);
     let advertised = SignedHeader::sign(&genesis(), changed, &signer(1)).unwrap();
-    let (full, history_store) = full_with_retained_history();
-    let headers = json!({
-        "identity": full.identity,
-        "certificates": [pack(&advertised)],
-        "sampled": pack(&advertised),
-    });
-    let bodies = Arc::new(AtomicUsize::new(0));
-    let count = bodies.clone();
-    let source = serve(
-        Router::new()
-            .route(
-                "/signed/v1/headers",
-                axum::routing::get(move || {
-                    let headers = headers.clone();
-                    async move { Json(headers) }
-                }),
-            )
-            .route(
-                "/signed/v1/replication/blocks/1",
-                axum::routing::get(move || {
-                    let count = count.clone();
-                    let bytes = pack(&block);
-                    async move {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({"blockBytes":bytes}))
-                    }
-                }),
-            ),
-    )
-    .await;
-    let rt = Runtime::new(
-        Node::Full(Box::new(full)),
-        Some(source.url.clone()),
-        Some(source.url.clone()),
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        runtime::sync_once(rt.clone()).await,
-        Err(arkiv_node::signed::Error("ChainConflict"))
-    );
-    assert_eq!(bodies.load(Ordering::SeqCst), 1);
+    let (rt, bodies, history_store) = sync_into_conflict(&advertised, &advertised, block).await;
+    assert_eq!(bodies, 1);
     {
         let node = rt.node.lock().unwrap();
         assert_eq!(node.head(), genesis().header());
@@ -1167,7 +1104,7 @@ async fn authentic_replication_certificate_conflict_persists_freeze_before_execu
     drop(rt);
     assert!(matches!(
         History::open(history_store, genesis().hash()),
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(e) if e.code == ErrorCode::ChainConflict
     ));
 }
 
@@ -1230,7 +1167,7 @@ async fn advertised_header_survives_failed_body_fetch_and_detects_later_conflict
     assert!(fetches > 0);
     assert_eq!(
         runtime::sync_once(rt.clone()).await,
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(ErrorCode::ChainConflict.into())
     );
     assert_eq!(bodies.load(Ordering::SeqCst), fetches);
     assert_eq!(
@@ -1240,7 +1177,7 @@ async fn advertised_header_survives_failed_body_fetch_and_detects_later_conflict
     drop(rt);
     assert!(matches!(
         History::open(history_store, genesis().hash()),
-        Err(arkiv_node::signed::Error("ChainConflict"))
+        Err(e) if e.code == ErrorCode::ChainConflict
     ));
 }
 
@@ -1376,36 +1313,6 @@ async fn range_inspection_exposes_only_complete_authenticated_branching_witnesse
         let empty: Value = response.json().await.unwrap();
         assert_eq!(empty["rows"], json!([]));
         assert_eq!(empty["inspection"]["postingSets"], json!([]));
-    }
-    // Correctly authenticated headers cannot authorize a malformed witness.
-    let bad = serve(Router::new().route(
-        "/signed/v1/query/range",
-        route_post(|| async { Json(json!({"proof":"0x00"})) }),
-    ))
-    .await;
-    let light = light_rt(&bad.url, &producer);
-    {
-        let source = producer.node.lock().unwrap();
-        let mut node = light.node.lock().unwrap();
-        let Node::Light { light, .. } = &mut *node else {
-            panic!()
-        };
-        light
-            .append(
-                &[
-                    source.certificate(1).unwrap(),
-                    source.certificate(2).unwrap(),
-                ],
-                &source.certificate(2).unwrap(),
-            )
-            .unwrap();
-    }
-    let rejected = serve(runtime::public_router(light)).await;
-    let response = post(&client, &rejected.url, "query/range/inspect", query.clone()).await;
-    assert!(!response.status().is_success());
-    let rejected: Value = response.json().await.unwrap();
-    for field in ["rows", "verification", "inspection", "canonicalProof"] {
-        assert!(rejected.get(field).is_none());
     }
     let wrong_role = post(&client, &public.url, "query/range/inspect", query).await;
     assert_eq!(
@@ -1662,18 +1569,20 @@ async fn prefill_binary_chunks_are_bounded_and_reject_truncated_files() {
     getrandom::fill(&mut random).unwrap();
     let path = std::env::temp_dir().join(format!("prefill-chunk-{}", hex(&random)));
     std::fs::write(&path, &bytes).unwrap();
-    let mut h = Host::create_with_prefill(
+    let h = Host::create(
         Arc::new(MemoryVersionedStore::new()),
-        History::create(Arc::new(MemoryVersionedStore::new()), g.hash()).unwrap(),
-        g.clone(),
-        [1; 16],
-        SignedHeader::sign(&g, g.header(), &signer).unwrap(),
-        Some(signer),
         Options::default(),
-        Some(bytes.clone()),
+        launch(
+            &g,
+            signer,
+            [1; 16],
+            Arc::new(MemoryVersionedStore::new()),
+            true,
+        ),
+        Prefill::Stream(bytes.clone()),
     )
-    .unwrap();
-    h.prefill_file = Some(path.clone());
+    .unwrap()
+    .serving_prefill_file(path.clone());
     let rt = Runtime::new(Node::Full(Box::new(h)), None, None, None).unwrap();
     let server = serve(runtime::public_router(rt)).await;
     let client = reqwest::Client::new();

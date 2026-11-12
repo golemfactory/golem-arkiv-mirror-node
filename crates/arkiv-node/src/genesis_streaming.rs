@@ -6,7 +6,7 @@ use crate::{
     genesis_bundle::{PrefillEntity, PrefillLaunch, PrefillLimits, recipe_hash},
     signed::protocol::SignedGenesis,
 };
-use alloy_primitives::{Keccak256, U256};
+use alloy_primitives::Keccak256;
 use arkiv_db::{
     B256, Decoder, decode_exact, digest,
     durable::{DurableEngine, Options},
@@ -21,10 +21,12 @@ use std::{
 
 pub use crate::genesis_import_resources::{check_disk, import_redb_config};
 
-type Result<T> = std::result::Result<T, String>;
+use crate::{fsutil, genesis_error::GenesisToolError};
 
-fn err(e: impl std::fmt::Debug) -> String {
-    format!("streaming prefill: {e:?}")
+type Result<T> = std::result::Result<T, GenesisToolError>;
+
+fn err(e: impl std::fmt::Debug) -> GenesisToolError {
+    format!("streaming prefill: {e:?}").into()
 }
 
 pub const STREAM_DOMAIN: &str = "arkiv/prefill-stream/v2";
@@ -101,6 +103,24 @@ pub struct StreamSummary {
     pub hash: B256,
 }
 
+/// What every prefill stream file starts with, before its row codec and
+/// row count.
+const STREAM_MAGIC: &[u8; 8] = b"ARKPFL02";
+
+/// The stream file of `rows` as given: the header, then each row behind its
+/// length. It neither orders nor checks them; a [`StreamReader`] does.
+pub fn write_stream<'a>(rows: impl ExactSizeIterator<Item = &'a PrefillEntity>) -> Vec<u8> {
+    let mut stream = STREAM_MAGIC.to_vec();
+    stream.extend_from_slice(&crate::genesis_bundle::ROW_CODEC.to_be_bytes());
+    stream.extend_from_slice(&(rows.len() as u64).to_be_bytes());
+    for row in rows {
+        let frame = encode(row);
+        stream.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        stream.extend(frame);
+    }
+    stream
+}
+
 /// One bounded frame and one preceding creator/nonce, independent of row count.
 pub struct StreamReader<R> {
     reader: R,
@@ -125,7 +145,7 @@ impl<R: Read> StreamReader<R> {
         validate_limits(limits)?;
         let mut header = [0u8; 20];
         reader.read_exact(&mut header).map_err(err)?;
-        if &header[..8] != b"ARKPFL02"
+        if &header[..8] != STREAM_MAGIC
             || header[8..12] != crate::genesis_bundle::ROW_CODEC.to_be_bytes()
         {
             return Err("invalid streaming prefill header".into());
@@ -320,80 +340,42 @@ impl VerifiedStream {
     }
 }
 
-pub(crate) fn import_identity(
-    base: &SignedGenesis,
-    limits: PrefillLimits,
-    sponsor: [u8; 20],
-    summary: &StreamSummary,
-    permanent: bool,
-) -> B256 {
-    let mut base = base.clone();
-    base.prefill = None;
-    let mut bytes = encode(&base);
-    bytes.extend_from_slice(&encode(&limits));
-    bytes.extend_from_slice(&sponsor);
-    bytes.extend_from_slice(summary.hash.as_slice());
-    bytes.extend_from_slice(&summary.rows.to_be_bytes());
-    bytes.extend_from_slice(&summary.bytes.to_be_bytes());
-    // Private scratch built under one policy is never reused for the other.
-    digest(
-        if permanent {
-            "arkiv/prefill-import/v4"
-        } else {
-            "arkiv/prefill-import/v2"
-        },
-        &bytes,
-    )
+/// A streaming prefill import: the launch it builds state for and the
+/// audited stream it reads.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefillImport<'a> {
+    pub base: &'a SignedGenesis,
+    pub limits: PrefillLimits,
+    pub sponsor: [u8; 20],
+    pub summary: &'a StreamSummary,
+    /// The permanent-prefill contract (launch version 4): a row whose expiry
+    /// is `u64::MAX` is created permanent, is not scheduled for expiry (no
+    /// due/total counts, so the per-height capacity does not apply) and adds
+    /// storage units but no rent. Finite rows are unaffected by the policy.
+    pub permanent: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn bulk_build(
-    base: &SignedGenesis,
-    limits: PrefillLimits,
-    sponsor: [u8; 20],
-    path: &Path,
-    work_dir: &Path,
-    options: Options,
-    batch_bytes: usize,
-    summary: &StreamSummary,
-) -> Result<(DurableEngine, U256, u64)> {
-    bulk_build_with(
-        base,
-        limits,
-        sponsor,
-        path,
-        work_dir,
-        options,
-        batch_bytes,
-        summary,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn bulk_build_with(
-    base: &SignedGenesis,
-    limits: PrefillLimits,
-    sponsor: [u8; 20],
-    path: &Path,
-    work_dir: &Path,
-    options: Options,
-    batch_bytes: usize,
-    summary: &StreamSummary,
-    permanent: bool,
-) -> Result<(DurableEngine, U256, u64)> {
-    crate::genesis_bulk::build_file(
-        base,
-        limits,
-        sponsor,
-        &mut File::open(path).map_err(err)?,
-        work_dir,
-        options,
-        batch_bytes,
-        summary,
-        permanent,
-    )
+impl PrefillImport<'_> {
+    /// Identifies the import's private scratch.
+    pub(crate) fn identity(&self) -> B256 {
+        let mut base = self.base.clone();
+        base.prefill = None;
+        let mut bytes = encode(&base);
+        bytes.extend_from_slice(&encode(&self.limits));
+        bytes.extend_from_slice(&self.sponsor);
+        bytes.extend_from_slice(self.summary.hash.as_slice());
+        bytes.extend_from_slice(&self.summary.rows.to_be_bytes());
+        bytes.extend_from_slice(&self.summary.bytes.to_be_bytes());
+        // Private scratch built under one policy is never reused for the other.
+        digest(
+            if self.permanent {
+                "arkiv/prefill-import/v4"
+            } else {
+                "arkiv/prefill-import/v2"
+            },
+            &bytes,
+        )
+    }
 }
 
 /// Verify bounded canonical frames and the signed stream commitment without state replay.
@@ -427,16 +409,19 @@ pub fn prepare_verified_streaming(
         .as_ref()
         .filter(|p| p.is_streaming())
         .ok_or("expected streaming prefill v2")?;
+    let import = PrefillImport {
+        base: g,
+        limits: p.limits,
+        sponsor: p.sponsor,
+        summary: &stream.summary,
+        permanent: p.permanent_prefill(),
+    };
     let (engine, burn, units) = crate::genesis_bulk::build_file(
-        g,
-        p.limits,
-        p.sponsor,
+        import,
         &mut stream.file,
         work_dir,
         crate::genesis_import_resources::import_options(options),
         DEFAULT_BATCH_BYTES,
-        &stream.summary,
-        p.permanent_prefill(),
     )?;
     if engine.head_snapshot().state_header() != p.state
         || burn != p.burned_wei
@@ -517,16 +502,19 @@ pub fn build_bundle_with_state(
         .and_then(|n| n.to_str())
         .ok_or("invalid bundle output name")?;
     let work = parent.join(format!(".{name}.stream-work"));
-    let (engine, burn, units) = bulk_build_with(
-        &base,
+    let import = PrefillImport {
+        base: &base,
         limits,
         sponsor,
-        stream,
+        summary: &summary,
+        permanent,
+    };
+    let (engine, burn, units) = crate::genesis_bulk::build_file(
+        import,
+        &mut File::open(stream).map_err(err)?,
         &work,
         crate::genesis_import_resources::import_options(Options::default()),
         batch_bytes,
-        &summary,
-        permanent,
     )?;
     let mut launch = PrefillLaunch {
         version: PrefillLaunch::version_for(true, permanent),
@@ -553,7 +541,7 @@ pub fn build_bundle_with_state(
     fs::create_dir(&stage).map_err(err)?;
     let result: Result<()> = (|| {
         check_disk(&stage, summary.bytes)?;
-        write_new(&stage.join("genesis.bin"), &encode(&base))?;
+        fsutil::write_new(&stage.join("genesis.bin"), &encode(&base)).map_err(err)?;
         let mut source = File::open(stream).map_err(err)?;
         let mut target = OpenOptions::new()
             .write(true)
@@ -569,20 +557,14 @@ pub fn build_bundle_with_state(
         if audit_stream_with(&stage.join("prefill.bin"), limits, permanent)? != summary {
             return Err("prefill changed during bundle publication".into());
         }
-        write_new(
+        fsutil::write_new(
             &stage.join("report.json"),
             &serde_json::to_vec_pretty(&report).map_err(err)?,
-        )?;
-        File::open(&stage).map_err(err)?.sync_all().map_err(err)?;
-        rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &stage,
-            rustix::fs::CWD,
-            output,
-            rustix::fs::RenameFlags::NOREPLACE,
         )
         .map_err(err)?;
-        File::open(parent).map_err(err)?.sync_all().map_err(err)?;
+        fsutil::sync_dir(&stage).map_err(err)?;
+        fsutil::rename_noreplace(&stage, output).map_err(err)?;
+        fsutil::sync_dir(parent).map_err(err)?;
         Ok(())
     })();
     if result.is_err() {
@@ -596,23 +578,13 @@ pub fn build_bundle_with_state(
     }
     fs::remove_dir_all(&work)
         .map_err(|e| format!("bundle published; staging cleanup failed: {e}"))?;
-    File::open(parent).map_err(err)?.sync_all().map_err(err)?;
+    fsutil::sync_dir(parent).map_err(err)?;
     Ok(report)
-}
-
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(err)?;
-    file.write_all(bytes).map_err(err)?;
-    file.sync_all().map_err(err)
 }
 
 pub fn summary_report(g: &SignedGenesis) -> Result<serde_json::Value> {
     let p = g.prefill.as_ref().ok_or("missing prefill")?;
-    let sponsor: String = p.sponsor.iter().map(|b| format!("{b:02x}")).collect();
+    let sponsor = alloy_primitives::hex::encode(p.sponsor);
     let mut report = serde_json::json!({
         "version": p.version,
         "genesisHash": g.hash().to_string(),
@@ -637,8 +609,35 @@ mod tests {
     use super::*;
     use crate::accounts;
     use crate::signed::protocol::{SignedLimits, default_native_genesis};
+    use alloy_primitives::U256;
     use arkiv_db::{Cell, CellName, OwnerId, Value};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn bulk_build(
+        base: &SignedGenesis,
+        limits: PrefillLimits,
+        path: &Path,
+        work_dir: &Path,
+        options: Options,
+        batch_bytes: usize,
+        summary: &StreamSummary,
+    ) -> Result<(DurableEngine, U256, u64)> {
+        let import = PrefillImport {
+            base,
+            limits,
+            sponsor: [2; 20],
+            summary,
+            permanent: false,
+        };
+        crate::genesis_bulk::build_file(
+            import,
+            &mut File::open(path).map_err(err)?,
+            work_dir,
+            options,
+            batch_bytes,
+        )
+    }
+
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct Temp(std::path::PathBuf);
     impl Temp {
@@ -714,15 +713,7 @@ mod tests {
     }
 
     fn stream(rows: &[PrefillEntity]) -> Vec<u8> {
-        let mut b = b"ARKPFL02".to_vec();
-        b.extend_from_slice(&crate::genesis_bundle::ROW_CODEC.to_be_bytes());
-        b.extend_from_slice(&(rows.len() as u64).to_be_bytes());
-        for row in rows {
-            let f = encode(row);
-            b.extend_from_slice(&(f.len() as u32).to_be_bytes());
-            b.extend(f);
-        }
-        b
+        write_stream(rows.iter())
     }
 
     fn signed_stream(rows: &[PrefillEntity]) -> SignedGenesis {
@@ -798,7 +789,7 @@ mod tests {
             while r.next_row()?.is_some() {}
             r.finish()
         };
-        let error = read(false).unwrap_err();
+        let error = read(false).unwrap_err().to_string();
         assert!(error.contains("permanent-prefill"), "{error}");
         assert!(
             StreamReader::new(bytes.as_slice(), limits())
@@ -894,7 +885,6 @@ mod tests {
         let error = bulk_build(
             &capped,
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("finite"),
             Options::default(),
@@ -902,7 +892,7 @@ mod tests {
             &summary_of(&path),
         )
         .unwrap_err();
-        assert!(error.contains("permanent"), "{error}");
+        assert!(error.to_string().contains("permanent"), "{error}");
         let mut finite = g;
         let mut l = finite.prefill.take().unwrap();
         l.version = 2;
@@ -971,7 +961,7 @@ mod tests {
             4096,
         )
         .unwrap_err();
-        assert!(error.contains("allow_permanent"), "{error}");
+        assert!(error.to_string().contains("allow_permanent"), "{error}");
         assert!(!tmp.0.join("rejected").exists());
         let report =
             build_bundle(&finite_base, &finite_path, &tmp.0.join("v2"), [2; 20], 4096).unwrap();
@@ -1081,7 +1071,7 @@ mod tests {
             .err()
             .unwrap();
             if mutation {
-                assert_eq!(error, "prefill stream changed during import");
+                assert_eq!(error.to_string(), "prefill stream changed during import");
             }
         }
         fs::write(&path, valid).unwrap();
@@ -1099,7 +1089,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error, "verified prefill genesis mismatch");
+        assert_eq!(error.to_string(), "verified prefill genesis mismatch");
     }
 
     #[test]
@@ -1142,7 +1132,7 @@ mod tests {
         let error = prepare_verified_streaming(&g, verified, &work, Options::default())
             .err()
             .unwrap();
-        assert_eq!(error, "prefill stream changed during import");
+        assert_eq!(error.to_string(), "prefill stream changed during import");
         fs::write(&path, stream(&rows)).unwrap();
         let resumed = prepare_streaming(&g, &path, &work, Options::default()).unwrap();
         assert_eq!(resumed.head_snapshot().state_header(), state);
@@ -1152,7 +1142,7 @@ mod tests {
         let error = prepare_streaming(&changed, &path, &work, Options::default())
             .err()
             .unwrap();
-        assert_eq!(error, "prefill derived state/rent mismatch");
+        assert_eq!(error.to_string(), "prefill derived state/rent mismatch");
     }
 
     #[test]
@@ -1280,7 +1270,6 @@ mod tests {
                 let (engine, burn, units) = bulk_build(
                     &base(),
                     limits(),
-                    [2; 20],
                     &path,
                     &work,
                     Options::default(),
@@ -1309,7 +1298,6 @@ mod tests {
         let (limited, burn, units) = bulk_build(
             &base(),
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("limited"),
             options,
@@ -1321,7 +1309,6 @@ mod tests {
         let (normal, normal_burn, normal_units) = bulk_build(
             &base(),
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("normal"),
             Options::default(),
@@ -1351,7 +1338,6 @@ mod tests {
             bulk_build(
                 &base(),
                 limits(),
-                [2; 20],
                 &path,
                 &tmp.0.join("resume"),
                 Options::default(),
@@ -1364,7 +1350,6 @@ mod tests {
         let (resumed, burn, units) = bulk_build(
             &base(),
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("resume"),
             Options::default(),
@@ -1375,7 +1360,6 @@ mod tests {
         let (clean, clean_burn, clean_units) = bulk_build(
             &base(),
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("clean"),
             Options::default(),
@@ -1400,7 +1384,6 @@ mod tests {
         let (engine, _, _) = bulk_build(
             &base(),
             limits(),
-            [2; 20],
             &path,
             &tmp.0.join("work"),
             Options::default(),
@@ -1416,7 +1399,6 @@ mod tests {
             bulk_build(
                 &changed,
                 limits(),
-                [2; 20],
                 &path,
                 &tmp.0.join("work"),
                 Options::default(),
@@ -1581,7 +1563,6 @@ mod tests {
                 bulk_build(
                     &g,
                     limits(),
-                    [2; 20],
                     &path,
                     &work,
                     Options::default(),
@@ -1605,7 +1586,6 @@ mod tests {
             bulk_build(
                 &base(),
                 cap,
-                [2; 20],
                 &path,
                 &tmp.0.join("storage"),
                 Options::default(),
@@ -1633,6 +1613,7 @@ mod tests {
         assert!(
             prepare_streaming(&g, &path, &work, Options::default())
                 .unwrap_err()
+                .to_string()
                 .contains("identity or bounds")
         );
         fs::write(&receipt, original).unwrap();

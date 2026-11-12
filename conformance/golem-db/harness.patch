@@ -13,7 +13,7 @@ index fbfd44f..9188242 100644
 +# repository's checkout. Elsewhere, rewrite the three paths (see the kit's
 +# README in arkiv-state-db-experiment/conformance/golem-db).
 +arkiv-db = { path = "../../../arkiv-state-db-experiment/crates/arkiv-db" }
-+arkiv-db-redb = { path = "../../../arkiv-state-db-experiment/crates/arkiv-db-redb" }
++arkiv-db-redb = { path = "../../../arkiv-state-db-experiment/crates/arkiv-db-redb", features = ["testing"] }
 +arkiv-db-storage = { path = "../../../arkiv-state-db-experiment/crates/arkiv-db-storage" }
  anyhow = "1"
  hdrhistogram = "7"

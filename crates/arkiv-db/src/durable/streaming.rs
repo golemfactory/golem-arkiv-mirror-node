@@ -1,4 +1,5 @@
 //! Bounded, restartable copying of a private import's current state.
+use super::prepare::ObjectBatch;
 use super::*;
 use crate::{
     StateHeader,
@@ -6,14 +7,11 @@ use crate::{
 };
 use arkiv_db_storage::versioned::{ObjectId, SpaceId};
 use arkiv_db_trie::{MerkleMap, NodeLoader, TrieError, TrieKey, TrieValue};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
-pub(super) fn checkpoint_key(sequence: u64) -> String {
-    format!("import/checkpoint/{sequence:016x}")
-}
-
-struct CopyFailure(DurableError);
-impl From<TrieError> for CopyFailure {
+/// A failed walk of a staged state, by the copy or by an adoption.
+pub(super) struct WalkError(pub(super) DurableError);
+impl From<TrieError> for WalkError {
     fn from(e: TrieError) -> Self {
         Self(corrupt(format!("import traversal: {e}")))
     }
@@ -80,38 +78,21 @@ struct Copier<'a> {
     target: &'a dyn VersionedStore,
     options: &'a Options,
     object_cap: usize,
-    pending_bytes: Cell<usize>,
-    pending: RefCell<Vec<(SpaceId, ObjectId, Vec<u8>)>>,
+    pending: RefCell<ObjectBatch>,
     postings: RefCell<PostingCache>,
 }
 impl Copier<'_> {
     fn flush(&self) -> Result<(), DurableError> {
-        let mut pending = self.pending.borrow_mut();
-        if pending.is_empty() {
-            return Ok(());
-        }
-        match self.target.stage_objects(&pending) {
-            CommitOutcome::Committed => {
-                pending.clear();
-                self.pending_bytes.set(0);
-                Ok(())
-            }
-            CommitOutcome::NotCommitted(e) | CommitOutcome::Indeterminate(e) => Err(e.into()),
-        }
+        self.pending.borrow_mut().flush(self.target)
     }
     fn push(&self, space: SpaceId, id: ObjectId, bytes: &[u8]) -> Result<(), DurableError> {
         check_object_size(bytes.len(), self.options)?;
         let size = bytes.len() + 32;
-        let flush = {
-            let pending = self.pending.borrow();
-            pending.len() >= self.options.prepare_objects
-                || self.pending_bytes.get() > self.options.prepare_bytes - size
-        };
-        if flush {
-            self.flush()?;
+        let mut pending = self.pending.borrow_mut();
+        if pending.is_full(size, self.options) {
+            pending.flush(self.target)?;
         }
-        self.pending.borrow_mut().push((space, id, bytes.to_vec()));
-        self.pending_bytes.set(self.pending_bytes.get() + size);
+        pending.push(space, id, bytes, size);
         Ok(())
     }
     fn map<K: TrieKey, V: TrieValue>(
@@ -157,7 +138,7 @@ impl Copier<'_> {
     }
     fn state(&self, state: &StateHeader, genesis: &EngineGenesis) -> Result<(), DurableError> {
         let catalog = Catalog::from_root(state.catalog_root, state.catalog_len)
-            .map_err(|e| CopyFailure::from(e).0)?;
+            .map_err(|e| WalkError::from(e).0)?;
         self.map(&catalog, SpaceId::Catalog, |id, ns| {
             check_namespace(state, id, &ns)?;
             let space = SpaceId::Namespace(id.ordinal());
@@ -169,7 +150,7 @@ impl Copier<'_> {
             })
         })?;
         let host = HostMap::from_root(state.host_root, state.host_len)
-            .map_err(|e| CopyFailure::from(e).0)?;
+            .map_err(|e| WalkError::from(e).0)?;
         self.map(&host, SpaceId::Host, |_, blob| check_host(&blob))?;
         self.flush()
     }
@@ -192,7 +173,7 @@ pub(super) fn check_row(
     row: &crate::layout::StoredRecord,
 ) -> Result<(), DurableError> {
     crate::typed::validate_create(&genesis.limits, &row.cells)
-        .map_err(|_| incompatible("import row exceeds admission limits"))
+        .map_err(|fault| incompatible(format!("import row fails admission: {fault:?}")))
 }
 pub(super) fn check_host(blob: &crate::layout::Blob) -> Result<(), DurableError> {
     if blob.0.len() > crate::HOST_VALUE_MAX {
@@ -217,67 +198,23 @@ struct CopyLoader<'a, 'b> {
     space: SpaceId,
 }
 impl<V: TrieValue> NodeLoader<V> for CopyLoader<'_, '_> {
-    type Error = CopyFailure;
-    fn read(&self, id: &crate::B256) -> Result<Option<Vec<u8>>, CopyFailure> {
+    type Error = WalkError;
+    fn read(&self, id: &crate::B256) -> Result<Option<Vec<u8>>, WalkError> {
         let bytes = self
             .copier
             .source
             .read_object_bounded(self.space, &id.0, self.copier.object_cap)
-            .map_err(|e| CopyFailure(e.into()))?;
+            .map_err(|e| WalkError(e.into()))?;
         if let Some(bytes) = &bytes {
             self.copier
                 .push(self.space, id.0, bytes)
-                .map_err(CopyFailure)?;
+                .map_err(WalkError)?;
         }
         Ok(bytes)
     }
 }
 
 impl DurableEngine {
-    /// Atomically associates a bounded opaque restart cursor with an engine-only
-    /// import publication. This metadata never enters the canonical state root.
-    pub fn prepare_import(
-        &mut self,
-        candidate: SealedCandidate,
-        checkpoint: &[u8],
-    ) -> Result<CommitInfo, PrepareFailure> {
-        let result = if checkpoint.len() > self.options.prepare_bytes {
-            Err(DurableError::ResourceLimit(
-                "import checkpoint exceeds batch cap".into(),
-            ))
-        } else {
-            self.prepare_inner(&candidate, None, Some(checkpoint))
-        };
-        match result {
-            Ok(prepared) => {
-                let info = prepared.info;
-                self.pending = Some(prepared);
-                self.state = WriterState::Prepared;
-                Ok(info)
-            }
-            Err(error) => Err(PrepareFailure {
-                error,
-                candidate: Box::new(candidate),
-            }),
-        }
-    }
-    pub fn import_checkpoint(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, DurableError> {
-        Ok(self.context.store.read_record_bounded(
-            Table::Meta,
-            checkpoint_key(self.head().sequence()).as_bytes(),
-            max_bytes,
-        )?)
-    }
-    /// Copy only current reachable state into an unpublished store and publish
-    /// an engine-only genesis. Useful for bounded-memory staging compaction.
-    pub fn initialize_from_staged(
-        &self,
-        target: Arc<dyn VersionedStore>,
-        genesis: EngineGenesis,
-        options: Options,
-    ) -> Result<Initialization, DurableError> {
-        self.publish_staged(target, genesis, options, None, None)
-    }
     /// Copy current state in bounded durable batches, then atomically publish
     /// the sole height-zero manifest and simulator packet. Until publication
     /// the destination has no head and cannot be opened as a node. On failure,
@@ -291,83 +228,19 @@ impl DurableEngine {
         identity: simulator::SimulatorIdentity,
         packet: simulator::SimulatorPacket,
     ) -> Result<Initialization, DurableError> {
-        self.publish_staged(target, genesis, options, Some(identity), Some(packet))
-    }
-    fn publish_staged(
-        &self,
-        target: Arc<dyn VersionedStore>,
-        genesis: EngineGenesis,
-        options: Options,
-        identity: Option<simulator::SimulatorIdentity>,
-        packet: Option<simulator::SimulatorPacket>,
-    ) -> Result<Initialization, DurableError> {
-        genesis.validate()?;
-        options.validate()?;
-        self.context.generation()?;
-        if self.state != WriterState::Ready || self.simulator.is_some() {
-            return Err(incompatible(
-                "copy requires ready engine-only staging source",
-            ));
-        }
-        if genesis.initial_state.as_ref() != Some(&self.manifest.state)
-            || genesis.limits != self.genesis.limits
-            || genesis.pricing != self.genesis.pricing
-        {
-            return Err(incompatible("staged source/genesis association"));
-        }
+        self.check_staging_source(&genesis, &options, "copy")?;
         if target.head()?.is_some() || target.database_id() == self.context.store.database_id() {
             return Err(incompatible(
                 "copy destination must be a separate headless store",
             ));
         }
-        for key in [PROFILE_KEY, GENESIS_KEY, simulator::IDENTITY_KEY] {
-            if target
-                .read_record_bounded(
-                    Table::Meta,
-                    key,
-                    GENESIS_MAX_BYTES + simulator::IDENTITY_MAX_BYTES + 32,
-                )?
-                .is_some()
-            {
-                return Err(incompatible("copy destination already has engine metadata"));
-            }
+        if has_engine_metadata(target.as_ref())? {
+            return Err(incompatible("copy destination already has engine metadata"));
         }
-        if let Some(identity) = &identity {
-            identity.validate(&genesis)?;
-        }
-        let manifest = EngineManifest {
-            genesis: genesis.id(),
-            sequence: 0,
-            parent: None,
-            state_root: self.manifest.state_root,
-            state: self.manifest.state.clone(),
-        };
-        let mut batch = manifest_batch(None, &manifest);
-        batch
-            .put_record(
-                Table::Meta,
-                PROFILE_KEY,
-                identity
-                    .as_ref()
-                    .map_or_else(profile_bytes, |_| simulator::profile_bytes()),
-            )
-            .put_record(Table::Meta, GENESIS_KEY, genesis.envelope());
-        if let Some(identity) = &identity {
-            batch.put_record(Table::Meta, simulator::IDENTITY_KEY, identity.envelope()?);
-        }
-        if let Some(packet) = packet {
-            if packet.reserved_bytes()? > options.prepare_bytes {
-                return Err(DurableError::ResourceLimit(
-                    "genesis packet exceeds batch cap".into(),
-                ));
-            }
-            packet.append(&mut batch, &manifest)?;
-        }
-        if identity.is_none()
-            && let Some(checkpoint) = self.import_checkpoint(options.prepare_bytes)?
-        {
-            batch.put_record(Table::Meta, checkpoint_key(0).into_bytes(), checkpoint);
-        }
+        identity.validate(&genesis)?;
+        packet.check_fits(&options)?;
+        let manifest = EngineManifest::genesis(&genesis, self.manifest.state.clone());
+        let batch = genesis_batch(&manifest, &genesis, Some(&identity), Some(&packet))?;
         if batch.logical_bytes() > options.prepare_bytes as u64 {
             return Err(DurableError::ResourceLimit(
                 "genesis metadata exceeds batch cap".into(),
@@ -378,18 +251,36 @@ impl DurableEngine {
             target: target.as_ref(),
             options: &options,
             object_cap: genesis.max_object_bytes as usize,
-            pending_bytes: Cell::new(0),
-            pending: RefCell::new(Vec::new()),
+            pending: RefCell::default(),
             postings: RefCell::new(PostingCache::new(POSTING_CACHE_SLOTS)),
         }
         .state(&manifest.state, &genesis)?;
-        let engine = Self::from_manifest(target, genesis, options, manifest, identity)?;
-        InitializationPending {
-            engine,
-            batch,
-            retry_allowed: true,
+        let engine = Self::from_manifest(target, genesis, options, manifest, Some(identity))?;
+        InitializationPending::first_commit(engine, batch)
+    }
+    /// What both the staged copy and the in-place adoption require of their
+    /// source: a ready engine-only store whose head state is `genesis`'s.
+    pub(super) fn check_staging_source(
+        &self,
+        genesis: &EngineGenesis,
+        options: &Options,
+        action: &str,
+    ) -> Result<(), DurableError> {
+        genesis.validate()?;
+        options.validate()?;
+        self.context.generation()?;
+        if self.state != WriterState::Ready || self.simulator.is_some() {
+            return Err(incompatible(format!(
+                "{action} requires a ready engine-only staging source"
+            )));
         }
-        .commit()
+        if genesis.initial_state.as_ref() != Some(&self.manifest.state)
+            || genesis.limits != self.genesis.limits
+            || genesis.pricing != self.genesis.pricing
+        {
+            return Err(incompatible("staged source/genesis association"));
+        }
+        Ok(())
     }
 }
 
@@ -445,8 +336,7 @@ mod tests {
             target,
             options,
             object_cap: usize::MAX,
-            pending_bytes: Cell::new(0),
-            pending: RefCell::new(Vec::new()),
+            pending: RefCell::default(),
             postings: RefCell::new(PostingCache::new(slots)),
         }
     }
@@ -468,10 +358,10 @@ mod tests {
         copy.posting(&first, 1).unwrap();
         let first_reads = source.stats().object_reads();
         assert!(first_reads > 1);
-        let pending = copy.pending.borrow().len();
+        let pending = copy.pending.borrow().objects.len();
         copy.posting(&first, 1).unwrap();
         assert_eq!(source.stats().object_reads(), first_reads);
-        assert_eq!(copy.pending.borrow().len(), pending);
+        assert_eq!(copy.pending.borrow().objects.len(), pending);
         copy.posting(&second, 1).unwrap();
         let both_reads = source.stats().object_reads();
         assert!(both_reads > first_reads);

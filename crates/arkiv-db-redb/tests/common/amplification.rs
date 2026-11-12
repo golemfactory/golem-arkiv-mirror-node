@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use arkiv_db_redb::{RedbConfig, RedbStore};
-use arkiv_db_storage::versioned::{BackendStats, Head, SpaceId, VersionedStore};
+use arkiv_db_storage::versioned::{BackendStats, SpaceId, VersionedStore};
 
-use super::{BenchDir, block, commit, quantile, timed};
+use super::{BenchDir, Chain, commit, quantile, timed};
 
 /// One series: equal object volume, one block size.
 #[derive(Clone, Debug)]
@@ -55,21 +55,20 @@ pub fn measure(
         total_objects.div_ceil(objects_per_block)
     };
     let start = store.stats().backend.expect("backend");
-    let mut parent: Option<Head> = None;
+    let mut chain = Chain::default();
     let mut logical = 0;
     let mut times = Vec::with_capacity(blocks as usize);
     let mut remaining = total_objects;
-    for height in 0..blocks {
+    for _ in 0..blocks {
         let now = objects_per_block.min(remaining);
         remaining -= now;
         let spaces: Vec<_> = (0..4)
             .map(|ns| (SpaceId::Namespace(ns), (now + 3 - ns) / 4, object_len))
             .filter(|(_, count, _)| *count > 0)
             .collect();
-        let batch = block(parent, height, 1, &spaces);
+        let batch = chain.next(&spaces);
         logical += batch.logical_bytes();
-        parent = Some(batch.new_head);
-        let ((), elapsed) = timed(|| commit(&store, batch));
+        let ((), elapsed) = timed(|| commit(&store, &batch));
         times.push(elapsed);
     }
     let backend = store.stats().backend.expect("backend").since(&start);

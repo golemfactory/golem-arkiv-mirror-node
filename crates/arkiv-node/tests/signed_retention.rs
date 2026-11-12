@@ -2,20 +2,18 @@
 //! heights below the floor with an explicit HistoryPruned error, serves the
 //! floor and the head, and archive (the default) is unchanged.
 
-use alloy_primitives::{U256, keccak256};
+use alloy_primitives::keccak256;
 use arkiv_db::{
     CellName, Value as DbValue,
     durable::{Options, Retention},
 };
 use arkiv_db_memory::MemoryVersionedStore;
 use arkiv_node::{
-    Expiry, TxEnvelope, TxOp,
-    accounts::AccountConfig,
-    arkiv::{ARKIV_ADDRESS, ArkivOperation, entity_namespace},
+    Expiry,
+    arkiv::{ARKIV_ADDRESS, ArkivOperation},
     signed::{
         crypto::Signer,
-        history::History,
-        host::Host,
+        host::{Host, Prefill},
         protocol::*,
         rpc,
         runtime::{self, Node, Runtime, Shared},
@@ -25,77 +23,63 @@ use arkiv_node::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+mod signed_support;
+use signed_support::{
+    allocations, arkiv_ops,
+    http::{call, serve},
+    launch, scalar_signer, sign_tx,
+};
+
 fn signer(who: u8) -> Signer {
-    let mut key = [0; 32];
-    key[31] = who;
-    Signer::from_bytes(key).unwrap()
+    scalar_signer(who.into())
 }
 
 fn genesis() -> SignedGenesis {
-    let funded = [1, 2].map(|who| {
-        (
-            signer(who).address(),
-            U256::from(10u64).pow(U256::from(24u64)),
-        )
-    });
     SignedGenesis::new(
         default_native_genesis(7, 1_000, 250),
         [0x43; 16],
         *signer(1).address().as_bytes(),
         250,
-        AccountConfig::new(funded.to_vec()).unwrap(),
+        allocations(&[1, 2].map(|who| signer(who).address())),
     )
     .unwrap()
 }
 
 fn create(nonce: u64) -> SignedTx {
-    let signer = signer(2);
     let mut request = [0; 32];
     request[24..].copy_from_slice(&nonce.to_be_bytes());
-    SignedTx::sign(
-        &genesis(),
-        nonce,
-        TxEnvelope {
-            chain_id: 7,
-            actor: signer.address(),
-            request_id: request,
-            tx_budget: 2_000_000,
-            ops: vec![TxOp::Arkiv {
-                namespace: entity_namespace(),
-                operation: ArkivOperation::Create {
-                    salt: nonce as u128,
-                    flags: 0,
-                    expiry: Expiry {
-                        expires_at: 0,
-                        min_lifetime: 1_000,
-                    },
-                    attributes: vec![(
-                        CellName::new("group").unwrap(),
-                        arkiv_db::Cell::attribute(DbValue::U64(1)),
-                    )],
-                },
-            }],
+    let create = ArkivOperation::Create {
+        salt: nonce as u128,
+        flags: 0,
+        expiry: Expiry {
+            expires_at: 0,
+            min_lifetime: 1_000,
         },
-        &signer,
-    )
-    .unwrap()
+        attributes: vec![(
+            CellName::new("group").unwrap(),
+            arkiv_db::Cell::attribute(DbValue::U64(1)),
+        )],
+    };
+    let ops = arkiv_ops(vec![create]);
+    sign_tx(&genesis(), &signer(2), nonce, request, 2_000_000, ops)
 }
 
 /// Head 6: block 1 bootstrap, creates in blocks 2 and 3, then empty blocks.
 fn node(retention: Retention) -> (Shared, String) {
-    let genesis = genesis();
-    let cert = SignedHeader::sign(&genesis, genesis.header(), &signer(1)).unwrap();
     let mut host = Host::create(
         Arc::new(MemoryVersionedStore::new()),
-        History::create(Arc::new(MemoryVersionedStore::new()), genesis.hash()).unwrap(),
-        genesis,
-        [1; 16],
-        cert,
-        Some(signer(1)),
         Options {
             retention,
             ..Options::default()
         },
+        launch(
+            &genesis(),
+            signer(1),
+            [1; 16],
+            Arc::new(MemoryVersionedStore::new()),
+            true,
+        ),
+        Prefill::None,
     )
     .unwrap();
     host.produce().unwrap();
@@ -113,14 +97,6 @@ fn node(retention: Retention) -> (Shared, String) {
         Runtime::new(Node::Full(Box::new(host)), None, None, None).unwrap(),
         hash,
     )
-}
-
-async fn call(rt: &Shared, method: &str, params: Value) -> Value {
-    rpc::handle_request(
-        rt,
-        json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
-    )
-    .await
 }
 
 fn ok(answer: &Value) -> &Value {
@@ -173,12 +149,8 @@ async fn json_rpc_refuses_state_below_the_floor() {
         4,
     );
     assert_eq!(
-        ok(&call(&rt, "eth_call", json!([entity_nonce_call(), "0x4"])).await)
-            .as_str()
-            .unwrap()
-            .chars()
-            .last(),
-        Some('2')
+        ok(&call(&rt, "eth_call", json!([entity_nonce_call(), "0x4"])).await),
+        &json!(format!("0x{:064x}", 2))
     );
     pruned(
         &call(&rt, "arkiv_getEntityCount", json!([{"block":3}])).await,
@@ -280,18 +252,11 @@ async fn query_cursor_is_not_a_lease() {
     );
 }
 
-async fn serve(rt: Shared) -> (String, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", socket.local_addr().unwrap());
-    let router = runtime::public_router(rt);
-    let task = tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
-    (url, task)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_answers_410_with_floor_details() {
     let (rt, _) = node(Retention::Window(2));
-    let (url, task) = serve(rt).await;
+    let server = serve(runtime::public_router(rt)).await;
+    let url = &server.url;
     let client = reqwest::Client::new();
     let status: Value = client
         .get(format!("{url}/signed/v1/status"))
@@ -390,7 +355,6 @@ async fn rest_answers_410_with_floor_details() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

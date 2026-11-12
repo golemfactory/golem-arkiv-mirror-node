@@ -12,6 +12,10 @@ pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 100_000_000;
 pub const REFERENCE_GAS_PRICE_WEI: u64 = 1_000_000_000;
 pub const ENTITY_OVERHEAD_UNITS: u64 = 512;
 pub const INDEX_OVERHEAD_UNITS: u64 = 128;
+/// The kind and value tag bytes stored with every cell.
+const CELL_TAG_UNITS: u64 = 2;
+/// GLM base units (wei) per GLM.
+const WEI_PER_GLM: u128 = 1_000_000_000_000_000_000;
 /// The rent rate, in GLM base units (wei) per storage unit per day of
 /// chargeable lifetime: 20 gwei, charged per second so the same lifetime
 /// costs the same at every block period. A year is 7,300 gwei per unit.
@@ -122,7 +126,7 @@ impl RentClock {
             return None;
         };
         match unit_ms.checked_mul(RATE_NUMERATOR) {
-            Some(n) => Some(n.div_ceil(RATE_DENOMINATOR)),
+            Some(scaled) => Some(scaled.div_ceil(RATE_DENOMINATOR)),
             None => None,
         }
     }
@@ -137,13 +141,43 @@ const RATE_NUMERATOR: u128 = RENT_WEI_PER_UNIT_DAY / gcd(RENT_WEI_PER_UNIT_DAY, 
 const RATE_DENOMINATOR: u128 = DAY_MS / gcd(RENT_WEI_PER_UNIT_DAY, DAY_MS);
 
 /// The GLM gas schedule: Ethereum-sized prices for the engine's operation
-/// classes.
+/// classes, in [`arkiv_db::OperationClass::ALL`] order.
+#[rustfmt::skip]
 pub const fn schedule() -> PriceSchedule {
     PriceSchedule::new(
         SCHEDULE_ID,
         [
-            100, 20_000, 10_000, 10_000, 10_000, 4, 4, 100, 100, 10, 1, 20_000, 12_000, 10_000,
-            250, 4, 100, 500, 0, 300, 100, 100, 10, 10, 10, 10, 10, 100, 2, 10, 1,
+            100,    // DirectoryLookup
+            20_000, // NamespaceCreate
+            10_000, // NamespaceTransfer
+            10_000, // PutRecord
+            10_000, // DeleteRecord
+            4,      // WriteKeyByte
+            4,      // WriteValueByte
+            100,    // PointRead
+            100,    // ScanSeek
+            10,     // ScanEntry
+            1,      // ReadByte
+            20_000, // RecordCreate
+            12_000, // RecordPatch
+            10_000, // RecordDelete
+            250,    // CellWrite
+            4,      // CellByte
+            100,    // CellRemove
+            500,    // IndexInsert
+            0,      // IndexTermCreate
+            300,    // IndexRemove
+            100,    // QueryGroup
+            100,    // TermSeek
+            10,     // TermVisit
+            10,     // PostingEntry
+            10,     // RowVisit
+            10,     // RecordProbe
+            10,     // ResultRow
+            100,    // RootUpdate
+            2,      // RowByte
+            10,     // ProofNode
+            1,      // ProofByte
         ],
     )
 }
@@ -198,8 +232,9 @@ pub fn storage_units(cells: &[(CellName, Cell)]) -> Result<StorageUnits, GasErro
         ..Default::default()
     };
     for (name, cell) in cells {
-        let bytes = u64::try_from(cell.value.encoded_len()).map_err(|_| GasError::Overflow)?;
-        result.cell_bytes = add(result.cell_bytes, add(add(name.len() as u64, bytes)?, 2)?)?;
+        let value = u64::try_from(cell.value.encoded_len()).map_err(|_| GasError::Overflow)?;
+        let stored = add(add(name.len() as u64, value)?, CELL_TAG_UNITS)?;
+        result.cell_bytes = add(result.cell_bytes, stored)?;
         if cell.kind == CellKind::Attribute {
             result.index_overhead = add(result.index_overhead, INDEX_OVERHEAD_UNITS)?;
         }
@@ -275,10 +310,10 @@ pub fn rent(
     let extension_blocks = horizon - paid;
     let unit_blocks = u128::from(growth_units)
         .checked_mul(u128::from(remaining_blocks))
-        .and_then(|n| {
+        .and_then(|growth| {
             u128::from(after_units)
                 .checked_mul(u128::from(extension_blocks))
-                .and_then(|ext| n.checked_add(ext))
+                .and_then(|extension| growth.checked_add(extension))
         })
         .ok_or(GasError::Overflow)?;
     let wei = clock.wei(unit_blocks).ok_or(GasError::Overflow)?;
@@ -298,9 +333,8 @@ pub fn reference_fee_wei(gas: u64) -> u128 {
 
 /// `wei` as a decimal GLM amount without trailing zeros.
 pub fn glm(wei: u128) -> String {
-    let unit = 1_000_000_000_000_000_000u128;
-    let whole = wei / unit;
-    let fraction = format!("{:018}", wei % unit);
+    let whole = wei / WEI_PER_GLM;
+    let fraction = format!("{:018}", wei % WEI_PER_GLM);
     let fraction = fraction.trim_end_matches('0');
     if fraction.is_empty() {
         whole.to_string()

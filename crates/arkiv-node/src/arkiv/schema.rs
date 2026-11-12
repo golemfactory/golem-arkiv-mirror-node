@@ -1,7 +1,7 @@
 //! Public adapter: SDK IDs are deliberately independent of engine tags.
 
-use super::ArkivFault;
-use alloy_primitives::U256;
+use super::{ArkivFault, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY};
+use crate::value_json::{parse_scaled, scaled_text};
 use arkiv_db::{Cell, CellKind, CellName, Row, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +20,24 @@ pub enum ArkivTypeId {
 }
 
 impl ArkivTypeId {
+    /// The type an ABI `typeId` names, without its indexed flag.
+    pub fn from_id(id: u8) -> Option<Self> {
+        [
+            Self::Bool,
+            Self::I32,
+            Self::U64,
+            Self::U256,
+            Self::Dec,
+            Self::Bytes32,
+            Self::Bytes,
+            Self::Str,
+            Self::Addr,
+            Self::Key,
+        ]
+        .into_iter()
+        .find(|known| *known as u8 == id)
+    }
+
     pub fn of(value: &Value) -> Result<Self, ArkivFault> {
         Ok(match value {
             Value::Bool(_) => Self::Bool,
@@ -76,6 +94,8 @@ pub fn sdk_safe_name(name: &str) -> bool {
 /// Bit 7 of an ABI `typeId`: the attribute is indexed. The low seven bits
 /// are the [`ArkivTypeId`].
 pub const INDEXED_FLAG: u8 = 0x80;
+/// Every creation flag an entity may hold.
+pub(super) const ALL_FLAGS: u64 = (FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION) as u64;
 /// The most attribute triples one create or patch may carry.
 pub const MAX_ATTRIBUTES: usize = 32;
 /// The host cells every entity carries: `$key`, `$creator`, `$owner`,
@@ -97,8 +117,8 @@ pub fn validate_value(value: &Value) -> Result<(), ArkivFault> {
     match value {
         // Any UTF-8 within the length cap, control characters included, as
         // on the Arkiv network.
-        Value::Str(s) if s.len() > MAX_STR_BYTES => Err(ArkivFault::Value),
-        Value::Bytes(b) if b.len() > MAX_BYTES_LENGTH => Err(ArkivFault::Value),
+        Value::Str(text) if text.len() > MAX_STR_BYTES => Err(ArkivFault::Value),
+        Value::Bytes(bytes) if bytes.len() > MAX_BYTES_LENGTH => Err(ArkivFault::Value),
         _ => Ok(()),
     }
 }
@@ -136,54 +156,22 @@ pub fn entity_bytes<'a>(cells: impl IntoIterator<Item = &'a (CellName, Cell)>) -
         .sum()
 }
 
-/// Parse decimal scaled units without floating point or rounding.
+/// Fractional digits of a `dec` value.
+const DEC_SCALE: u8 = 18;
+
+/// Parse decimal scaled units without floating point or rounding. Unlike the
+/// JSON form ([`parse_scaled`]) a leading `+` is accepted.
 pub fn parse_decimal(input: &str) -> Result<[u8; 32], ArkivFault> {
-    let (negative, s) = match input.as_bytes().first() {
-        Some(b'-') => (true, &input[1..]),
-        Some(b'+') => (false, &input[1..]),
-        _ => (false, input),
+    let unsigned = match input.strip_prefix('+') {
+        Some(rest) if rest.starts_with('-') => return Err(ArkivFault::Value),
+        Some(rest) => rest,
+        None => input,
     };
-    let (whole, fraction) = s.split_once('.').map_or((s, ""), |(w, f)| (w, f));
-    if whole.is_empty()
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || fraction.len() > 18
-        || !fraction.bytes().all(|b| b.is_ascii_digit())
-        || (s.contains('.') && fraction.is_empty())
-    {
-        return Err(ArkivFault::Value);
-    }
-    let digits = format!("{whole}{fraction}{}", "0".repeat(18 - fraction.len()));
-    let magnitude = U256::from_str_radix(&digits, 10).map_err(|_| ArkivFault::Value)?;
-    let sign = U256::from(1u8) << 255;
-    if magnitude > sign || (!negative && magnitude == sign) {
-        return Err(ArkivFault::Value);
-    }
-    Ok(if negative {
-        U256::ZERO.wrapping_sub(magnitude)
-    } else {
-        magnitude
-    }
-    .to_be_bytes())
+    parse_scaled(unsigned, DEC_SCALE, 256).ok_or(ArkivFault::Value)
 }
 
 pub fn format_decimal(bytes: &[u8; 32]) -> String {
-    let value = U256::from_be_bytes(*bytes);
-    let negative = bytes[0] & 128 != 0;
-    let magnitude = if negative {
-        U256::ZERO.wrapping_sub(value)
-    } else {
-        value
-    };
-    let unit = U256::from(1_000_000_000_000_000_000u64);
-    let whole = magnitude / unit;
-    let frac = format!("{:018}", magnitude % unit);
-    let frac = frac.trim_end_matches('0');
-    let sign = if negative { "-" } else { "" };
-    if frac.is_empty() {
-        format!("{sign}{whole}")
-    } else {
-        format!("{sign}{whole}.{frac}")
-    }
+    scaled_text(*bytes, DEC_SCALE)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +206,7 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
         .as_bytes()
         .try_into()
         .map_err(|_| ArkivFault::Corrupt)?;
-    if row.cells.windows(2).any(|w| w[0].0 >= w[1].0) {
+    if row.cells.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(ArkivFault::Corrupt);
     }
     for (name, cell) in &row.cells {
@@ -236,12 +224,13 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
                 system(matches!(cell.value, Value::U64(_)), CellKind::Attribute)
             }
             "$creationFlags" => system(
-                matches!(cell.value, Value::U64(n) if n <= 3),
+                matches!(cell.value, Value::U64(flags) if flags <= ALL_FLAGS),
                 CellKind::Field,
             ),
             // Users write indexed or unindexed attributes; `bytes` only unindexed.
-            n => {
-                protocol_name(n) && !(cell.is_attribute() && matches!(cell.value, Value::Bytes(_)))
+            user => {
+                protocol_name(user)
+                    && !(cell.is_attribute() && matches!(cell.value, Value::Bytes(_)))
             }
         };
         if !expected {
@@ -251,19 +240,19 @@ pub fn project(row: &Row) -> Result<ArkivEntityProjection, ArkivFault> {
     if entity_bytes(&row.cells) > MAX_ENTITY_BYTES {
         return Err(ArkivFault::Corrupt);
     }
-    let get = |n: &str| {
+    let get = |wanted: &str| {
         row.cells
             .iter()
-            .find(|(name, _)| name.as_str() == n)
-            .map(|(_, c)| &c.value)
+            .find(|(name, _)| name.as_str() == wanted)
+            .map(|(_, cell)| &cell.value)
             .ok_or(ArkivFault::Corrupt)
     };
-    let number = |n| match get(n)? {
-        Value::U64(v) => Ok(*v),
+    let number = |name| match get(name)? {
+        Value::U64(number) => Ok(*number),
         _ => Err(ArkivFault::Corrupt),
     };
-    let address = |n| match get(n)? {
-        Value::Addr(v) => Ok(*v),
+    let address = |name| match get(name)? {
+        Value::Addr(address) => Ok(*address),
         _ => Err(ArkivFault::Corrupt),
     };
     get("$key")?;
@@ -294,56 +283,69 @@ pub fn validate_proven_row(row: &Row) -> Result<(), ArkivFault> {
 
 /// SDK ABI values: fixed scalars occupy a canonical 32-byte Solidity word.
 pub fn decode_abi_value(type_id: u8, bytes: &[u8]) -> Result<Value, ArkivFault> {
-    if (type_id == 7 && bytes.len() > MAX_BYTES_LENGTH)
-        || (type_id == 8 && bytes.len() > MAX_STR_BYTES)
-    {
-        return Err(ArkivFault::Value);
-    }
-    let value = match type_id {
-        7 => Value::bytes(bytes),
-        8 => Value::str(std::str::from_utf8(bytes).map_err(|_| ArkivFault::Value)?),
-        1..=6 | 9 | 10 => {
-            let word: [u8; 32] = bytes.try_into().map_err(|_| ArkivFault::Value)?;
-            match type_id {
-                1 if word[..31] == [0; 31] && word[31] <= 1 => Value::Bool(word[31] == 1),
-                2 => {
-                    let v = i32::from_be_bytes(word[28..].try_into().expect("width"));
-                    if !word[..28].iter().all(|b| *b == if v < 0 { 255 } else { 0 }) {
-                        return Err(ArkivFault::Value);
-                    }
-                    Value::I32(v)
-                }
-                3 if word[..24] == [0; 24] => {
-                    Value::U64(u64::from_be_bytes(word[24..].try_into().expect("width")))
-                }
-                4 => Value::U256(word),
-                5 => Value::Dec(word),
-                6 => Value::Bytes32(word),
-                9 if word[..12] == [0; 12] => Value::Addr(word[12..].try_into().expect("width")),
-                10 => Value::Key(word),
-                _ => return Err(ArkivFault::Value),
-            }
+    let value = match ArkivTypeId::from_id(type_id).ok_or(ArkivFault::Value)? {
+        ArkivTypeId::Bytes if bytes.len() <= MAX_BYTES_LENGTH => Value::bytes(bytes),
+        ArkivTypeId::Str if bytes.len() <= MAX_STR_BYTES => {
+            Value::str(std::str::from_utf8(bytes).map_err(|_| ArkivFault::Value)?)
         }
-        _ => return Err(ArkivFault::Value),
+        ArkivTypeId::Bytes | ArkivTypeId::Str => return Err(ArkivFault::Value),
+        scalar => {
+            let word = bytes.try_into().map_err(|_| ArkivFault::Value)?;
+            decode_abi_word(scalar, word).ok_or(ArkivFault::Value)?
+        }
     };
     validate_value(&value)?;
     Ok(value)
+}
+
+/// The fixed scalar `word` encodes; `None` unless its padding is canonical.
+fn decode_abi_word(type_id: ArkivTypeId, word: [u8; 32]) -> Option<Value> {
+    let (padding, value) = match type_id {
+        ArkivTypeId::Bool => word.split_at(31),
+        ArkivTypeId::I32 => word.split_at(28),
+        ArkivTypeId::U64 => word.split_at(24),
+        ArkivTypeId::Addr => word.split_at(12),
+        _ => word.split_at(0),
+    };
+    let zero_padded = padding.iter().all(|byte| *byte == 0);
+    Some(match type_id {
+        ArkivTypeId::Bool if zero_padded && value[0] <= 1 => Value::Bool(value[0] == 1),
+        ArkivTypeId::I32 => {
+            let number = i32::from_be_bytes(value.try_into().expect("width"));
+            let sign = if number < 0 { 0xff } else { 0 };
+            if padding.iter().any(|byte| *byte != sign) {
+                return None;
+            }
+            Value::I32(number)
+        }
+        ArkivTypeId::U64 if zero_padded => {
+            Value::U64(u64::from_be_bytes(value.try_into().expect("width")))
+        }
+        ArkivTypeId::U256 => Value::U256(word),
+        ArkivTypeId::Dec => Value::Dec(word),
+        ArkivTypeId::Bytes32 => Value::Bytes32(word),
+        ArkivTypeId::Addr if zero_padded => Value::Addr(value.try_into().expect("width")),
+        ArkivTypeId::Key => Value::Key(word),
+        _ => return None,
+    })
 }
 
 pub fn encode_abi_value(value: &Value) -> Result<Vec<u8>, ArkivFault> {
     validate_value(value)?;
     let mut word = [0; 32];
     match value {
-        Value::Bool(v) => word[31] = u8::from(*v),
-        Value::I32(v) => {
-            word.fill(if *v < 0 { 255 } else { 0 });
-            word[28..].copy_from_slice(&v.to_be_bytes())
+        Value::Bool(flag) => word[31] = u8::from(*flag),
+        Value::I32(number) => {
+            word.fill(if *number < 0 { 0xff } else { 0 });
+            word[28..].copy_from_slice(&number.to_be_bytes())
         }
-        Value::U64(v) => word[24..].copy_from_slice(&v.to_be_bytes()),
-        Value::Addr(v) => word[12..].copy_from_slice(v),
-        Value::U256(v) | Value::Dec(v) | Value::Bytes32(v) | Value::Key(v) => word = *v,
-        Value::Str(v) => return Ok(v.as_bytes().to_vec()),
-        Value::Bytes(v) => return Ok(v.to_vec()),
+        Value::U64(number) => word[24..].copy_from_slice(&number.to_be_bytes()),
+        Value::Addr(address) => word[12..].copy_from_slice(address),
+        Value::U256(fixed) | Value::Dec(fixed) | Value::Bytes32(fixed) | Value::Key(fixed) => {
+            word = *fixed
+        }
+        Value::Str(text) => return Ok(text.as_bytes().to_vec()),
+        Value::Bytes(bytes) => return Ok(bytes.to_vec()),
         // i64 and the golem-grid scalars are not SDK types.
         _ => return Err(ArkivFault::Value),
     }
@@ -374,7 +376,7 @@ pub fn decode_protocol_triples(
     let mut previous = None;
     let mut result = Vec::new();
     for triple in triples {
-        if previous.is_some_and(|n| n >= triple.name) {
+        if previous.is_some_and(|name| name >= triple.name) {
             return Err(ArkivFault::Duplicate);
         }
         previous = Some(triple.name);

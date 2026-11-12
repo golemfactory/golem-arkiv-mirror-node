@@ -102,7 +102,7 @@ caps (`Value::INDEXED_LEN_CEILING = 512`) is at most 548 bytes.
 
 Every namespace-local operation also rewrites its namespace's catalog leaf,
 which is one of its `RootUpdate` units (the catalog row above), and a block
-adds one state-header digest. `crates/arkiv-db/tests/rehash.rs` commits every
+adds one state-header digest. `crates/arkiv-db/tests/it/rehash.rs` commits every
 block of a 20-block mixed workload to an object store, reopens it, and counts
 per map the new nodes each block hashes (one keccak256 each when the root is
 computed) and the distinct objects it stages: each map's hashed nodes stay

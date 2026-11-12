@@ -1,13 +1,14 @@
 //! A fault-injecting [`VersionedStore`] wrapper.
 
 use std::{
-    collections::VecDeque,
-    sync::{Mutex, MutexGuard, PoisonError},
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use crate::versioned::{
     CommitBatch, CommitOutcome, DatabaseId, Head, Health, ObjectId, ObjectReader, Relabel, SpaceId,
-    StorageError, StorageErrorKind, StoreStats, Table, VersionedStore,
+    StorageError, StorageErrorKind, StoreStats, Table, VersionedStore, copy_bounded,
 };
 
 /// A fault consumed by the next write: [`VersionedStore::commit`],
@@ -77,16 +78,33 @@ enum ReadTarget {
     Head,
 }
 
-/// Fails matching reads with `kind`: `remaining` more of them, or all of
-/// them until cleared if `None`.
+/// Lets `skip` matching reads through, then fails matching reads with
+/// `kind`: `remaining` more of them, or all of them until cleared if `None`.
 #[derive(Clone, Copy, Debug)]
 struct ReadFault {
     scope: ReadScope,
     kind: StorageErrorKind,
+    skip: u64,
     remaining: Option<u64>,
 }
 
-/// What a [`FaultyStore`] has injected so far.
+/// Called before every object read ([`FaultyStore::set_object_read_hook`]).
+pub type ObjectReadHook = Arc<dyn Fn(SpaceId, &ObjectId) + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct Hook(Option<ObjectReadHook>);
+
+impl fmt::Debug for Hook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Hook(set)"
+        } else {
+            "Hook(unset)"
+        })
+    }
+}
+
+/// What a [`FaultyStore`] has injected and which calls it has seen so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FaultCounters {
     /// Reads failed by an injected read fault.
@@ -97,6 +115,10 @@ pub struct FaultCounters {
     pub recoveries_failed: u64,
     /// Calls answered with a latched failure.
     pub latched_calls: u64,
+    /// `stage_objects` calls, whatever their outcome.
+    pub stage_calls: u64,
+    /// `recover` calls, whatever their outcome.
+    pub recover_calls: u64,
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +127,13 @@ struct FaultState {
     latch_corrupt: bool,
     latched: Option<StorageError>,
     commit_faults: VecDeque<CommitFault>,
+    write_skips: u64,
     read_faults: Vec<ReadFault>,
+    object_overrides: BTreeMap<(SpaceId, ObjectId), Option<Vec<u8>>>,
+    record_overrides: BTreeMap<(Table, Vec<u8>), Option<Vec<u8>>>,
+    head_override: Option<Option<Head>>,
+    object_read_hook: Hook,
+    forbid_unbounded_reads: bool,
     disk_full: Option<DiskFull>,
     recover_failures: u32,
     recover_kind: Option<StorageErrorKind>,
@@ -150,9 +178,10 @@ impl FaultState {
 
 /// A [`VersionedStore`] wrapper that injects failures.
 ///
-/// Faults are armed with the `fail_*`, `push_*` and `set_*` methods; with
-/// none armed every call is forwarded unchanged, so a wrapped store passes
-/// the behavioural [contract](crate::testing::contract).
+/// Faults are armed with the `fail_*`, `push_*` and `set_*` methods and read
+/// answers are replaced with the `override_*` methods; with none armed every
+/// call is forwarded unchanged, so a wrapped store passes the behavioural
+/// [contract](crate::testing::contract).
 ///
 /// **Latching mode** ([`FaultyStore::latching`]) follows `RedbStore`'s rule
 /// (the `error` module of crate `arkiv-db-redb`), so a caller tested against
@@ -216,6 +245,12 @@ impl<S: VersionedStore> FaultyStore<S> {
         self.lock().commit_faults.push_back(fault);
     }
 
+    /// Lets the next `count` writes through before the queued faults apply,
+    /// so a queued fault hits write number `count + 1`.
+    pub fn skip_writes(&self, count: u64) {
+        self.lock().write_skips = count;
+    }
+
     /// Fails matching reads with `kind`: the next `count` of them, or all of
     /// them until [`clear_read_faults`](Self::clear_read_faults) if `count`
     /// is `None`.
@@ -223,13 +258,66 @@ impl<S: VersionedStore> FaultyStore<S> {
         self.lock().read_faults.push(ReadFault {
             scope,
             kind,
+            skip: 0,
             remaining: count,
+        });
+    }
+
+    /// Lets the next `skip` matching reads through, then fails every
+    /// matching read with `kind` until
+    /// [`clear_read_faults`](Self::clear_read_faults).
+    pub fn fail_reads_after(&self, scope: ReadScope, skip: u64, kind: StorageErrorKind) {
+        self.lock().read_faults.push(ReadFault {
+            scope,
+            kind,
+            skip,
+            remaining: None,
         });
     }
 
     /// Removes every read fault.
     pub fn clear_read_faults(&self) {
         self.lock().read_faults.clear();
+    }
+
+    /// Answers reads of one object with `bytes` instead of the stored
+    /// value; `None` answers "absent". A bounded read still checks the
+    /// length of the replacement.
+    pub fn override_object(&self, space: SpaceId, id: ObjectId, bytes: Option<Vec<u8>>) {
+        self.lock().object_overrides.insert((space, id), bytes);
+    }
+
+    /// The record counterpart of [`override_object`](Self::override_object).
+    pub fn override_record(&self, table: Table, key: &[u8], value: Option<Vec<u8>>) {
+        self.lock()
+            .record_overrides
+            .insert((table, key.to_vec()), value);
+    }
+
+    /// Answers [`head`](VersionedStore::head) and a successful
+    /// [`recover`](VersionedStore::recover) with `head`.
+    pub fn override_head(&self, head: Option<Head>) {
+        self.lock().head_override = Some(head);
+    }
+
+    /// Removes every read override.
+    pub fn clear_overrides(&self) {
+        let mut state = self.lock();
+        state.object_overrides.clear();
+        state.record_overrides.clear();
+        state.head_override = None;
+    }
+
+    /// Calls `hook` at the start of every object read, before any fault or
+    /// override and outside the wrapper's lock, so it may block or sleep.
+    pub fn set_object_read_hook(&self, hook: Option<ObjectReadHook>) {
+        self.lock().object_read_hook = Hook(hook);
+    }
+
+    /// Makes the unbounded `read_object` and `read_record` panic, for
+    /// callers that must only read with a limit.
+    pub fn forbid_unbounded_reads(&self) {
+        self.lock().forbid_unbounded_reads = true;
     }
 
     /// Sets the disk-full condition (`None` clears it): while set, every
@@ -251,9 +339,13 @@ impl<S: VersionedStore> FaultyStore<S> {
         self.lock().latched = Some(error);
     }
 
-    /// What has been injected so far.
+    /// What has been injected and seen so far.
     pub fn injected(&self) -> FaultCounters {
         self.lock().counters
+    }
+
+    fn unbounded_reads_allowed(&self) -> bool {
+        !self.lock().forbid_unbounded_reads
     }
 
     fn gate(&self, target: ReadTarget) -> Result<(), StorageError> {
@@ -269,6 +361,10 @@ impl<S: VersionedStore> FaultyStore<S> {
             return Ok(());
         };
         let fault = &mut state.read_faults[index];
+        if fault.skip > 0 {
+            fault.skip -= 1;
+            return Ok(());
+        }
         let kind = fault.kind;
         if let Some(remaining) = fault.remaining.as_mut() {
             *remaining -= 1;
@@ -295,6 +391,10 @@ impl<S: VersionedStore> FaultyStore<S> {
                 }
                 Some(DiskFull::DuringCommit) => {
                     Some(CommitFault::IndeterminateNotApplied(StorageErrorKind::Full))
+                }
+                None if state.write_skips > 0 => {
+                    state.write_skips -= 1;
+                    None
                 }
                 None => state.commit_faults.pop_front(),
             }
@@ -339,8 +439,8 @@ impl<S: VersionedStore> FaultyStore<S> {
 
 impl<S: VersionedStore> ObjectReader for FaultyStore<S> {
     fn read_object(&self, space: SpaceId, id: &ObjectId) -> Result<Option<Vec<u8>>, StorageError> {
-        self.gate(ReadTarget::Object(space))?;
-        self.inner.read_object(space, id)
+        assert!(self.unbounded_reads_allowed(), "unbounded object read");
+        self.read_object_bounded(space, id, usize::MAX)
     }
 
     fn read_object_bounded(
@@ -349,9 +449,23 @@ impl<S: VersionedStore> ObjectReader for FaultyStore<S> {
         id: &ObjectId,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, StorageError> {
+        let hook = self.lock().object_read_hook.clone();
+        if let Some(hook) = hook.0 {
+            hook(space, id);
+        }
         self.gate(ReadTarget::Object(space))?;
+        if let Some(bytes) = self.lock().object_overrides.get(&(space, *id)) {
+            return replacement(bytes.as_deref(), max_bytes);
+        }
         self.inner.read_object_bounded(space, id, max_bytes)
     }
+}
+
+/// A read override's answer, under the bounded read's length check.
+fn replacement(bytes: Option<&[u8]>, max_bytes: usize) -> Result<Option<Vec<u8>>, StorageError> {
+    bytes
+        .map(|bytes| copy_bounded(bytes, max_bytes))
+        .transpose()
 }
 
 impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
@@ -361,12 +475,13 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
 
     fn head(&self) -> Result<Option<Head>, StorageError> {
         self.gate(ReadTarget::Head)?;
-        self.inner.head()
+        let head = self.inner.head()?;
+        Ok(self.lock().head_override.unwrap_or(head))
     }
 
     fn read_record(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.gate(ReadTarget::Record)?;
-        self.inner.read_record(table, key)
+        assert!(self.unbounded_reads_allowed(), "unbounded record read");
+        self.read_record_bounded(table, key, usize::MAX)
     }
 
     fn read_record_bounded(
@@ -376,6 +491,9 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         self.gate(ReadTarget::Record)?;
+        if let Some(value) = self.lock().record_overrides.get(&(table, key.to_vec())) {
+            return replacement(value.as_deref(), max_bytes);
+        }
         self.inner.read_record_bounded(table, key, max_bytes)
     }
 
@@ -384,6 +502,7 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
     }
 
     fn stage_objects(&self, objects: &[(SpaceId, ObjectId, Vec<u8>)]) -> CommitOutcome {
+        self.lock().counters.stage_calls += 1;
         self.write(|inner| inner.stage_objects(objects))
     }
 
@@ -401,6 +520,7 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
     fn recover(&self) -> Result<Option<Head>, StorageError> {
         {
             let mut state = self.lock();
+            state.counters.recover_calls += 1;
             if state.recover_failures > 0 {
                 state.recover_failures -= 1;
                 state.counters.recoveries_failed += 1;
@@ -413,8 +533,9 @@ impl<S: VersionedStore> VersionedStore for FaultyStore<S> {
             }
         }
         let head = self.inner.recover()?;
-        self.lock().latched = None;
-        Ok(head)
+        let mut state = self.lock();
+        state.latched = None;
+        Ok(state.head_override.unwrap_or(head))
     }
 
     fn stats(&self) -> StoreStats {

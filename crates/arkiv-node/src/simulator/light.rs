@@ -1,10 +1,11 @@
 //! Header-only durable catalog and local stateless Eq verification. No engine or bodies.
 
 use super::{
-    Error, Result,
+    Error, ErrorCode, Result,
     host::{RunConfig, identity},
     wire::*,
 };
+use crate::health::Health;
 use arkiv_db::durable::simulator::SimulatorIdentity;
 use arkiv_db::proof::{
     EqQuery, EqRequest, SnapshotRef, VerifiedContinuation, VerifiedEq, verify_eq,
@@ -38,25 +39,25 @@ pub fn resolve(
     r: &VerifiedRequest,
 ) -> Result<EqRequest> {
     if number(&r.height)? != header.height || !(1..=64).contains(&r.limit) {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let namespace =
-        NamespaceId::from_ordinal(number(&r.namespace)?).ok_or(Error("InvalidRequest"))?;
-    let attribute = CellName::new(&r.attribute).map_err(|_| Error("InvalidRequest"))?;
+        NamespaceId::from_ordinal(number(&r.namespace)?).ok_or(ErrorCode::InvalidRequest)?;
+    let attribute = CellName::new(&r.attribute).map_err(|_| ErrorCode::InvalidRequest)?;
     // `bytes` is field-only and never indexed, so it has no equality proof.
     if r.value_type == "bytes" {
-        return Err(Error("UnsupportedProof"));
+        return Err(ErrorCode::UnsupportedProof.into());
     }
     let value = crate::value_json::from_json(&r.value_type, &r.value).ok_or_else(|| {
         if arkiv_db::TypeTag::from_name(&r.value_type).is_some() {
-            Error("InvalidRequest")
+            Error::from(ErrorCode::InvalidRequest)
         } else {
-            Error("UnsupportedProof")
+            Error::from(ErrorCode::UnsupportedProof)
         }
     })?;
     // The representation ceiling; the instance limit is checked by the verifier.
     if matches!(&value, Value::Str(s) if s.len() > Value::INDEXED_LEN_CEILING) {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     if namespace == crate::arkiv::entity_namespace() {
         use arkiv_db::TypeTag;
@@ -68,7 +69,7 @@ pub fn resolve(
             name => crate::arkiv::sdk_safe_name(name),
         };
         if !valid || crate::arkiv::validate_value(&value).is_err() {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
     }
     Ok(EqRequest {
@@ -95,18 +96,18 @@ pub struct Light {
     pub durable_identity: SimulatorIdentity,
     pub head: crate::Header,
     pub paused: bool,
-    pub health: &'static str,
+    pub health: Health,
     pub observed: u64,
     continuations: VecDeque<(String, EqRequest, VerifiedContinuation)>,
 }
 
 impl Light {
     pub fn create(store: Arc<dyn VersionedStore>, id: SimulatorIdentity) -> Result<Self> {
-        let run: RunConfig = decode_exact(&id.metadata).map_err(|_| Error("InvalidRequest"))?;
+        let run: RunConfig = decode_exact(&id.metadata).map_err(|_| ErrorCode::InvalidRequest)?;
         run.validate()?;
         let head = run.genesis.header();
         if head.hash() != id.node_genesis_hash {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let mut batch = CommitBatch::new(
             None,
@@ -126,8 +127,8 @@ impl Light {
             );
         match store.commit(&batch) {
             CommitOutcome::Committed => {}
-            CommitOutcome::NotCommitted(_) => return Err(Error("StorageUnavailable")),
-            CommitOutcome::Indeterminate(_) => return Err(Error("CommitUncertain")),
+            CommitOutcome::NotCommitted(_) => return Err(ErrorCode::StorageUnavailable.into()),
+            CommitOutcome::Indeterminate(_) => return Err(ErrorCode::CommitUncertain.into()),
         }
         Ok(Self {
             identity: identity(&id, &run.genesis),
@@ -136,7 +137,7 @@ impl Light {
             store,
             head,
             paused: false,
-            health: "following",
+            health: Health::Following,
             observed: 0,
             continuations: VecDeque::new(),
         })
@@ -148,25 +149,25 @@ impl Light {
             .as_deref()
             != Some(PROFILE)
         {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if store
             .read_record_bounded(Table::Meta, CONFLICT_KEY, 1024)?
             .is_some()
         {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let bytes = store
             .read_record_bounded(Table::Meta, ID_KEY, 65536 + 256)?
-            .ok_or(Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
         let id = SimulatorIdentity::from_envelope(&bytes)?;
-        let run: RunConfig = decode_exact(&id.metadata).map_err(|_| Error("StorageCorrupt"))?;
+        let run: RunConfig = decode_exact(&id.metadata).map_err(|_| ErrorCode::StorageCorrupt)?;
         run.validate()?;
         let identity = identity(&id, &run.genesis);
         if identity != *expected || id.node_genesis_hash != run.genesis.header().hash() {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
-        let h = store.head()?.ok_or(Error("StorageCorrupt"))?;
+        let h = store.head()?.ok_or(ErrorCode::StorageCorrupt)?;
         let mut light = Self {
             head: run.genesis.header(),
             identity,
@@ -174,13 +175,13 @@ impl Light {
             durable_identity: id,
             store,
             paused: false,
-            health: "following",
+            health: Health::Following,
             observed: h.height,
             continuations: VecDeque::new(),
         };
         light.head = light.read_header(h.height)?;
         if light.head.hash().0 != h.hash {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(light)
     }
@@ -189,8 +190,8 @@ impl Light {
         let bytes = self
             .store
             .read_record_bounded(Table::Blocks, &height.to_be_bytes(), 156)?
-            .ok_or(Error("StorageCorrupt"))?;
-        let header: crate::Header = decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
+        let header: crate::Header = decode_exact(&bytes).map_err(|_| ErrorCode::StorageCorrupt)?;
         if header.height != height
             || header.chain_id != self.run.genesis.chain_id
             || self
@@ -199,23 +200,23 @@ impl Light {
                 .as_deref()
                 != Some(height.to_be_bytes().as_slice())
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(header)
     }
 
     pub fn header(&self, height: u64) -> Result<crate::Header> {
-        if self.health == "chain-conflict" || self.health == "storage-fenced" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict || self.health == Health::StorageFenced {
+            return Err(ErrorCode::ChainConflict.into());
         }
         if height > self.head.height {
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         self.read_header(height)
     }
 
     fn freeze(&mut self, header: &crate::Header) -> Result<()> {
-        self.health = "chain-conflict";
+        self.health = Health::ChainConflict;
         self.continuations.clear();
         let h = Head {
             height: self.head.height,
@@ -224,29 +225,29 @@ impl Light {
         let mut batch = CommitBatch::new(
             Some(h),
             Head {
-                height: h.height.checked_add(1).ok_or(Error("CapacityReached"))?,
+                height: h.height.checked_add(1).ok_or(ErrorCode::CapacityReached)?,
                 hash: h.hash,
             },
         );
         batch.put_record(Table::Meta, CONFLICT_KEY, encode(header));
         match self.store.commit(&batch) {
-            CommitOutcome::Committed => Err(Error("ChainConflict")),
+            CommitOutcome::Committed => Err(ErrorCode::ChainConflict.into()),
             _ => {
-                self.health = "storage-fenced";
-                Err(Error("CommitUncertain"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::CommitUncertain.into())
             }
         }
     }
 
     pub fn append(&mut self, headers: &[crate::Header], sampled: &crate::Header) -> Result<()> {
-        if self.health == "chain-conflict" || self.health == "storage-fenced" {
-            return Err(Error("ChainConflict"));
+        if self.health == Health::ChainConflict || self.health == Health::StorageFenced {
+            return Err(ErrorCode::ChainConflict.into());
         }
         if headers.len() > HEADER_BATCH {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         if sampled.chain_id != self.run.genesis.chain_id {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         self.observed = self.observed.max(sampled.height);
         if sampled.height <= self.head.height
@@ -267,9 +268,9 @@ impl Light {
                 != current
                     .height
                     .checked_add(1)
-                    .ok_or(Error("CapacityReached"))?
+                    .ok_or(ErrorCode::CapacityReached)?
             {
-                return Err(Error("BlockNotSynced"));
+                return Err(ErrorCode::BlockNotSynced.into());
             }
             crate::validate::check_successor(
                 &self.run.validate()?,
@@ -277,7 +278,7 @@ impl Light {
                 h.height,
                 h.timestamp_ms,
             )
-            .map_err(|_| Error("ChainConflict"))?;
+            .map_err(|_| ErrorCode::ChainConflict)?;
             if h.parent_hash != current.hash()
                 || h.chain_id != self.run.genesis.chain_id
                 || h.timestamp_ms
@@ -286,20 +287,20 @@ impl Light {
                         .workload
                         .timestamp(self.run.genesis.timestamp_ms, h.height)?
             {
-                return Err(Error("ChainConflict"));
+                return Err(ErrorCode::ChainConflict.into());
             }
             current = *h;
             accepted.push(*h);
         }
         if current.height > sampled.height {
             if accepted.is_empty() {
-                self.health = "stalled";
+                self.health = Health::Stalled;
                 return Ok(());
             }
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         if current.height == sampled.height && current.hash() != sampled.hash() {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         if !accepted.is_empty() {
             let mut batch = CommitBatch::new(
@@ -324,19 +325,19 @@ impl Light {
             match self.store.commit(&batch) {
                 CommitOutcome::Committed => self.head = current,
                 CommitOutcome::NotCommitted(_) => {
-                    self.health = "storage-fenced";
-                    return Err(Error("StorageUnavailable"));
+                    self.health = Health::StorageFenced;
+                    return Err(ErrorCode::StorageUnavailable.into());
                 }
                 CommitOutcome::Indeterminate(_) => {
-                    self.health = "storage-fenced";
-                    return Err(Error("CommitUncertain"));
+                    self.health = Health::StorageFenced;
+                    return Err(ErrorCode::CommitUncertain.into());
                 }
             }
         }
         self.health = if self.head.height == sampled.height {
-            "following"
+            Health::Following
         } else {
-            "stalled"
+            Health::Stalled
         };
         Ok(())
     }
@@ -351,12 +352,12 @@ impl Light {
                 .continuations
                 .iter()
                 .find(|(c, _, _)| c == cursor)
-                .ok_or(Error("CursorMismatch"))?;
+                .ok_or(ErrorCode::CursorMismatch)?;
             if prior.snapshot != request.snapshot
                 || prior.query != request.query
                 || prior.limit != request.limit
             {
-                return Err(Error("CursorMismatch"));
+                return Err(ErrorCode::CursorMismatch.into());
             }
             request.continuation = Some(token.cursor().clone());
             Some(token.clone())
@@ -397,7 +398,7 @@ impl Light {
         // Re-check the local catalog after network I/O; conflicts cannot race a badge.
         let h = self.header(request.snapshot.height)?;
         if h.hash() != request.snapshot.block_hash {
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
         let (verified, inspection) = if inspect {
             let mut caps = proof_limits();
@@ -418,35 +419,13 @@ impl Light {
             )
         };
         let page = match verified {
-            VerifiedEq::NamespaceAbsent => return Err(Error("NamespaceNotFound")),
+            VerifiedEq::NamespaceAbsent => return Err(ErrorCode::NamespaceNotFound.into()),
             VerifiedEq::Page(p) => p,
         };
         let entities = if request.query.namespace == crate::arkiv::entity_namespace() {
             page.rows
                 .iter()
-                .map(|row| {
-                    let p = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
-                    if p.created_at > h.height
-                        || p.updated_at > h.height
-                        || (p.expires_at != u64::MAX && p.expires_at <= h.height)
-                    {
-                        return Err(Error("InvalidProof"));
-                    }
-                    Ok(serde_json::json!({
-                        "key": hex(&p.key),
-                        "creator": hex(&p.creator),
-                        "owner": hex(&p.owner),
-                        "createdAt": p.created_at.to_string(),
-                        "updatedAt": p.updated_at.to_string(),
-                        "expiresAt": p.expires_at.to_string(),
-                        "creationFlags": {
-                            "raw": p.creation_flags,
-                            "readonly": p.creation_flags & 1 != 0,
-                            "permissionlessExtension": p.creation_flags & 2 != 0,
-                        },
-                        "attributes": crate::signed::rpc_reads::verified_attributes(&p)?,
-                    }))
-                })
+                .map(|row| crate::entity_json::verified(row, h.height))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -493,7 +472,7 @@ impl Light {
         response["profile"] = serde_json::json!("arkiv-entity-v3");
         response["entities"] = serde_json::json!(entities);
         if let Some(inspection) = inspection {
-            let object = response.as_object_mut().ok_or(Error("InvalidProof"))?;
+            let object = response.as_object_mut().ok_or(ErrorCode::InvalidProof)?;
             object.insert("canonicalRequest".into(), serde_json::json!(pack(request)));
             object.insert("canonicalProof".into(), serde_json::json!(hex(bytes)));
             object.insert(

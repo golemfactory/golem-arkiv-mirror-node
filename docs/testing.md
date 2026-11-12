@@ -15,9 +15,8 @@ spawn the workspace binaries on ephemeral local ports.
 
 - Heavy and opt-in tests are `#[ignore]`d and named in their attribute:
   the exhaustive torn-write sweeps
-  (`cargo test --release -p arkiv-db-redb --test atomicity -- --ignored`),
-  a range-proof scaling experiment (`RANGE_BENCH_ROWS`) and an expiry-sweep
-  timing experiment.
+  (`cargo test --release -p arkiv-db-redb --test it atomicity:: -- --ignored`),
+  and an expiry-sweep timing experiment.
 - Tests that measure storage create their files on a real disk: in
   `ARKIV_BENCH_DIR` if set, otherwise in Cargo's per-target temporary
   directory. They never use `std::env::temp_dir()`, which may be a RAM
@@ -81,11 +80,10 @@ Integration tests are in `crates/arkiv-db/tests/`.
 
 | Group | What it pins | Anchor files |
 | --- | --- | --- |
-| Raw KV facade | Ordered application of block packets, repeated keys inside a block, binary prefix scans, owned results, backend errors and retry; seeded chains against a mutation-log oracle | `kv.rs`, `model.rs` |
 | Blocks, namespaces, rollback | `begin`/`execute`/`seal`/`publish`, stale and foreign candidates, namespace ordinals, ownership and authorisation order, checkpoints and transaction rollback, admission bounds on names and raw keys | `blocks.rs`, `namespaces.rs`, `rollback.rs`, `bounds.rs` |
 | Metering | Hand-counted receipts for every operation under every budget from zero to the total, ledger order, atomic charge groups, block budgets, overflow, estimation parity and pinned pricing (model version 3) | `metering.rs`, `query_metering.rs` |
 | Generated histories | Seeded multi-block histories with rollbacks, budget failures, stale losers and pricing changes; the oracle predicts every verdict, receipt and read before looking at the engine | `history.rs`, `query_history.rs` |
-| Typed records and queries | Frozen encodings (`RecordKey` is `len ‖ bytes`, unpadded; cell names; type tags; term bytes), create/patch/delete, every query operator against the full-scan reference, the validation order of query faults, keyset pagination and cursor binding, the `terms` read, expiry sweeps, configurable cell limits, the opt-in planned evaluation | `records.rs`, `queries.rs`, `pagination.rs`, `terms.rs`, `query_planner.rs` |
+| Typed records and queries | Frozen encodings (`RecordKey` is `len ‖ bytes`, unpadded; cell names; type tags; term bytes), create/patch/delete, every query operator against the full-scan reference, the validation order of query faults, keyset pagination and cursor binding, the `terms` read, expiry sweeps, configurable cell limits, the opt-in planned evaluation | `records.rs`, `queries.rs`, `pagination.rs`, `terms.rs`, `cell_limits.rs`, `query_planner.rs` |
 | Key layout | Unpadded, prefix-free term keys with strings chosen to break variable-length encodings; range order for every indexable type; golem-db's type grid | `prefix_free_terms.rs`, `ordered_ranges.rs`, `golem_types.rs` |
 | Isolation | The discarded-branch rule above for raw records and for typed records and indexes | `isolation.rs`, `query_isolation.rs` |
 | Physical traces | A read rejected part way still reports every node it visited (regression tests for a real bug) | `trace_regression.rs` |
@@ -149,9 +147,9 @@ backends.
 | --- | --- | --- |
 | Block format | Golden bytes and digests for every block structure, and rejection of every malformed or non-canonical encoding | `block_format.rs` |
 | Validation and selection | Static validation of transactions and admin inputs; admin-first, strict FIFO selection under the count, operation, byte and budget limits; the request-identity state machine | `validation.rs`, `selection.rs`, `identity.rs` |
-| Execution and replay | Fixtures produced on a memory chain, checked against hand-derived receipts, replayed on a fresh engine to identical bytes and pinned by golden block hashes; executor failure paths; seeded block histories against an independent oracle with its own charge table and state root | `replay.rs`, `exec.rs`, `block_model.rs` |
+| Execution and replay | Fixtures produced on a memory chain, checked against hand-derived receipts, replayed on a fresh engine to identical bytes and pinned by golden block hashes; executor failure paths; seeded block histories against an oracle with its own charge table, expiry resolution and state root (it shares only `params::check_reservation` with the node) | `replay.rs`, `exec.rs`, `block_model.rs` |
 | Entities, accounts, gas | The Arkiv entity host across producer, full and light roles; native accounts; rent and gas numbers; externally signed Ethereum transaction fixtures | `arkiv_profile.rs`, `accounts.rs`, `gas_execution.rs`, `ethereum_transactions.rs` |
-| Genesis | Genesis invariants and the expiry reservation; bundle authoring, prefill, streaming build, prebuilt state and in-place adoption, through the library and the `arkiv-proposer` binary | `genesis.rs`, `genesis_prefill.rs`, `genesis_adopt.rs`, `prebuilt_genesis_cli.rs` |
+| Genesis | Genesis invariants and the expiry reservation; bundle authoring, prefill, streaming build, and prebuilt state, through the library and the `arkiv-proposer` binary; in-place adoption through the binary only | `genesis.rs`, `genesis_prefill.rs`, `genesis_adopt.rs`, `prebuilt_genesis_cli.rs` |
 | Signed proposer | Signature and preimage checks with independent keys; pool nonce ordering and capacity; execution, independent replay and publication faults; retained bodies and light headers; submission, body replication and light proof verification over real sockets; detached reads bounded in concurrency and time; the state-retention floor on every state consumer | `signed_protocol.rs`, `signed_pool.rs`, `signed_host.rs`, `signed_http.rs`, `signed_reads.rs`, `signed_retention.rs` |
 | Simulator | The durable simulator model, restart and uncertainty handling; redb write and sync cuts leaving a complete parent or candidate packet; HTTP controls, caps and replay over real sockets | `simulator.rs`, `simulator_crash.rs`, `simulator_http.rs` |
 | Demo | Authentication and wire rules of the bounded producer/full/light demo | `demo_auth.rs` |

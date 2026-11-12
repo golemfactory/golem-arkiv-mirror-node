@@ -37,9 +37,8 @@ This work builds on the Arkiv Network and Golem projects:
   query lexer and parser in `crates/arkiv-node/src/simulator/query_language/`
   are adapted from that repository (GPL-3.0-or-later; see the `README.md` and
   `LICENSE` in that directory).
-- The trie layer uses the Alloy Patricia trie core that Reth uses, vendored
-  with a small extraction of Reth's generic trie components (MIT OR
-  Apache-2.0). See [source provenance and licenses](vendor/README.md).
+- The trie layer uses the Alloy Patricia trie core, vendored under MIT OR
+  Apache-2.0. See [source provenance and licenses](vendor/README.md).
 
 ## Quickstart
 
@@ -99,18 +98,18 @@ the node's gas profile is described in [GLM gas](docs/glm-gas-v1.md).
 
 | Crate | Responsibility |
 | --- | --- |
-| `arkiv-db-storage` | Storage contracts: the raw ordered `KvStore`, and the versioned contract (immutable objects, insert-only records, a durable head with explicit commit outcomes); `FaultyStore` and the shared contract test suite (`testing`) |
-| `arkiv-db-memory` | In-memory backends: `MemoryStore` and the volatile `MemoryVersionedStore` |
-| `arkiv-db-redb` | `RedbStore`: the versioned contract over one redb 4.3.0 file; `CountingBackend` I/O instrumentation; `testing::CrashDisk` power-loss, fault and disk-full simulation |
+| `arkiv-db-storage` | The versioned storage contract (immutable objects, insert-only records, a durable head with explicit commit outcomes); `FaultyStore` and the shared contract test suite (`testing`, behind the `testing` feature) |
+| `arkiv-db-memory` | `MemoryVersionedStore`: the volatile in-memory implementation of the versioned contract |
+| `arkiv-db-redb` | `RedbStore`: the versioned contract over one redb 4.3.0 file; `CountingBackend` I/O instrumentation; `testing::CrashDisk` power-loss, fault and disk-full simulation (`testing` feature) |
 | `arkiv-db-trie` | Persistent Merkle Patricia map (`MerkleMap`) with in-memory and lazily loaded nodes, staging for commits, point and interval proofs, a strict verifier, and order-preserving key encoders |
-| `arkiv-db` | The raw facade (`Database`); the block engine (`Engine`: metering, namespaces, typed records, indexes, queries, host state, state root); proofs (`proof`); the state tree explorer (`explore`); the durable engine (`durable::DurableEngine`); the canonical codec (`codec`) |
+| `arkiv-db` | The block engine (`Engine`: metering, namespaces, typed records, indexes, queries, host state, state root); proofs (`proof`); the state tree explorer (`explore`); the durable engine (`durable::DurableEngine`); the canonical codec (`codec`) |
 | `arkiv-node` | Block format, validation, selection, execution and replay (`block`, `validate`, `select`, `exec`, `replay`); the Arkiv entity host (`arkiv`, `gas`, `accounts`, `retention`); genesis authoring, bundles and prefills (`genesis_*`); and the runtimes `signed` (`arkiv-proposer`), `simulator` (`arkiv-simulator`) and `demo` (`arkiv-demo`) |
 | `alloy-trie` (vendored) | The Alloy Merkle Patricia trie; `arkiv-db-trie` uses its node encoding, and the tests use its builders as independent oracles |
-| `reth-trie` (vendored) | Extraction of two generic Reth trie modules; no crate depends on it |
 
-Dependencies point from the public API toward storage. The storage contract
-depends on neither the engine nor a concrete backend. See the
-[architecture notes](docs/architecture.md).
+Dependencies point from the node toward storage. The storage contract
+depends on neither the engine nor a concrete backend. The
+[repository structure](docs/repository-structure.md) explains the split;
+the [architecture notes](docs/architecture.md) give the detail.
 
 ## Development
 
@@ -119,10 +118,9 @@ Commands run from the repository root; CI runs the first four.
 ```sh
 cargo fetch --locked
 cargo test --workspace --offline
-cargo clippy --offline --all-targets -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -p reth-trie -- -D warnings
-cargo fmt -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -p reth-trie -- --check
+cargo clippy --offline --all-targets -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -- -D warnings
+cargo fmt -p arkiv-db -p arkiv-db-storage -p arkiv-db-memory -p arkiv-db-redb -p arkiv-db-trie -p arkiv-node -- --check
 
-cargo run -p arkiv-db --example basic --offline      # raw key-value facade
 cargo run -p arkiv-db --example blocks --offline     # namespaces and metered blocks
 cargo run -p arkiv-db --example records --offline    # typed records, queries, expiry
 cargo run --release -p arkiv-db-redb --example redb_experiment --offline -- --quick
@@ -140,6 +138,9 @@ The [testing notes](docs/testing.md) say what each test group pins. Packages
 are unpublished, and the lockfile is checked in.
 
 ## Documentation
+
+- [Repository structure](docs/repository-structure.md): what lives where,
+  and why the code is cut that way.
 
 Engine:
 
@@ -184,6 +185,11 @@ Evidence and proposals:
 - [Testing](docs/testing.md), [benchmarking](docs/benchmarking.md) with dated
   results in [docs/benchmarks/](docs/benchmarks/), and the
   [golem-db conformance report](docs/golem-db-conformance-report.md).
-- [Proposals](docs/proposals/) and dated run records in
-  [docs/runs/](docs/runs/).
+- [Proposals](docs/proposals/), dated run records in [docs/runs/](docs/runs/),
+  and the [code-quality review of 2026-11-17](docs/reviews/2026-11-17/README.md).
 - [Changelog](CHANGELOG.md).
+
+## License
+
+GPL-3.0-or-later; see [LICENSE](LICENSE). `vendor/alloy-trie` keeps its
+upstream MIT OR Apache-2.0 license.

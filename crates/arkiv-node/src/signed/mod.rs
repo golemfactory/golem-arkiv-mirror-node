@@ -1,7 +1,7 @@
 //! Authenticated single-proposer Arkiv execution with separate retained bodies.
 //! Proposer authentication is not consensus or finality.
 
-pub use crate::simulator::{Error, Result};
+pub use crate::error::{Detail, Error, ErrorCode, Result};
 pub mod crypto;
 pub mod ethereum;
 pub mod history;

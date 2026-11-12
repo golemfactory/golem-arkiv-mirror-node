@@ -29,9 +29,8 @@
 //!   prefix-free whole: two tuples first differ inside one field, before
 //!   either field's encoding ends.
 //!
-//! [`KeyWriter`] and [`KeyReader`] compose these; `tests/encoding.rs` checks
-//! the order claims against Rust's own slice and tuple ordering on random
-//! inputs.
+//! `tests/it/encoding.rs` checks the order claims against Rust's own slice and
+//! tuple ordering on random inputs.
 
 use crate::codec::CodecError;
 
@@ -148,111 +147,6 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(successor)
 }
 
-/// Builds an order-preserving, prefix-free key from fields in order.
-///
-/// ```
-/// use arkiv_db_trie::order::KeyWriter;
-///
-/// // (name, tag, presence, value) → "color" 00 04 01 "red" 00.
-/// let mut key = KeyWriter::new();
-/// key.bytes(b"color").byte(4).byte(1).bytes(b"red");
-/// assert_eq!(key.finish().len(), 12);
-/// ```
-#[derive(Clone, Debug, Default)]
-pub struct KeyWriter {
-    bytes: Vec<u8>,
-}
-
-impl KeyWriter {
-    /// Starts an empty key.
-    pub const fn new() -> Self {
-        Self { bytes: Vec::new() }
-    }
-
-    /// Appends a self-delimiting byte string; see [`encode_bytes`].
-    pub fn bytes(&mut self, value: &[u8]) -> &mut Self {
-        encode_bytes(value, &mut self.bytes);
-        self
-    }
-
-    /// Appends one byte.
-    pub fn byte(&mut self, value: u8) -> &mut Self {
-        self.bytes.push(value);
-        self
-    }
-
-    /// Appends a big-endian `u64`.
-    pub fn u64(&mut self, value: u64) -> &mut Self {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
-        self
-    }
-
-    /// Appends bytes whose width is fixed by the key type.
-    pub fn fixed(&mut self, bytes: &[u8]) -> &mut Self {
-        self.bytes.extend_from_slice(bytes);
-        self
-    }
-
-    /// Returns the key bytes.
-    pub fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.bytes)
-    }
-}
-
-/// Reads the fields of a key built by [`KeyWriter`], in the same order.
-#[derive(Clone, Debug)]
-pub struct KeyReader<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> KeyReader<'a> {
-    /// Starts reading `bytes`.
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { rest: bytes }
-    }
-
-    fn take(&mut self, width: usize) -> Result<&'a [u8], CodecError> {
-        if self.rest.len() < width {
-            return Err(CodecError::new("key is too short"));
-        }
-        let (field, rest) = self.rest.split_at(width);
-        self.rest = rest;
-        Ok(field)
-    }
-
-    /// Reads a self-delimiting byte string of at most `max_len` bytes.
-    pub fn bytes(&mut self, max_len: usize) -> Result<Vec<u8>, CodecError> {
-        let (value, rest) = decode_bytes(self.rest, max_len)?;
-        self.rest = rest;
-        Ok(value)
-    }
-
-    /// Reads one byte.
-    pub fn byte(&mut self) -> Result<u8, CodecError> {
-        Ok(self.take(1)?[0])
-    }
-
-    /// Reads a big-endian `u64`.
-    pub fn u64(&mut self) -> Result<u64, CodecError> {
-        let bytes = self.take(8)?.try_into().expect("take returned 8 bytes");
-        Ok(u64::from_be_bytes(bytes))
-    }
-
-    /// Reads `width` fixed bytes.
-    pub fn fixed(&mut self, width: usize) -> Result<&'a [u8], CodecError> {
-        self.take(width)
-    }
-
-    /// Succeeds only if every byte was read.
-    pub fn finish(self) -> Result<(), CodecError> {
-        if self.rest.is_empty() {
-            Ok(())
-        } else {
-            Err(CodecError::new("trailing bytes after the last key field"))
-        }
-    }
-}
-
 /// A bounded byte-string key of at most `MAX` bytes, the empty string
 /// included, keyed by [`encode_bytes`] (`MAX_LEN = 2·MAX + 1`).
 ///
@@ -286,7 +180,7 @@ impl<const MAX: usize> crate::TrieKey for ByteKey<MAX> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyReader, KeyWriter, decode_bytes, encode_bytes, escape_bytes, prefix_successor};
+    use super::{decode_bytes, encode_bytes, escape_bytes, prefix_successor};
 
     fn enc(value: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -385,30 +279,5 @@ mod tests {
         assert_eq!(prefix_successor(b"a"), Some(b"b".to_vec()));
         assert_eq!(prefix_successor(&[0x61, 0xff]), Some(vec![0x62]));
         assert_eq!(prefix_successor(&[0x00, 0x00]), Some(vec![0x00, 0x01]));
-    }
-
-    #[test]
-    fn writer_and_reader_round_trip() {
-        let mut writer = KeyWriter::new();
-        writer
-            .bytes(b"name")
-            .byte(7)
-            .u64(0x0102_0304_0506_0708)
-            .fixed(&[9, 9]);
-        let key = writer.finish();
-        assert_eq!(key.len(), 5 + 1 + 8 + 2);
-        let mut reader = KeyReader::new(&key);
-        assert_eq!(reader.bytes(20).unwrap(), b"name");
-        assert_eq!(reader.byte().unwrap(), 7);
-        assert_eq!(reader.u64().unwrap(), 0x0102_0304_0506_0708);
-        assert_eq!(reader.fixed(2).unwrap(), [9, 9]);
-        reader.finish().unwrap();
-        let mut short = KeyReader::new(&key[..4]);
-        assert!(short.bytes(20).is_err());
-        let mut long = KeyReader::new(&key);
-        assert!(long.bytes(3).is_err());
-        let mut trailing = KeyReader::new(&key);
-        trailing.bytes(20).unwrap();
-        assert!(trailing.finish().is_err());
     }
 }

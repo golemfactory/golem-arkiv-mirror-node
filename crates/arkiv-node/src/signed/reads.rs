@@ -47,16 +47,13 @@
 //!   interruptible budget) stops at the next charge and releases its
 //!   permit.
 
-use super::{Error, Result};
+use super::{ErrorCode, Result};
 use arkiv_db::Interrupt;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-/// The error of a detached read that ran past its deadline.
-pub const DEADLINE_EXCEEDED: &str = "ReadDeadlineExceeded";
 
 /// Bounds of detached reads, set by `--read-concurrency`,
 /// `--read-deadline-secs`, `--read-max-groups` and `--read-max-literals`.
@@ -105,7 +102,7 @@ impl ReadLimits {
                 .max_literals
                 .is_some_and(|literals| !(1..=Self::MAX_LITERALS).contains(&literals))
         {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         Ok(())
     }
@@ -151,7 +148,7 @@ impl Reads {
             .permits
             .clone()
             .try_acquire_owned()
-            .map_err(|_| Error("ServerBusy"))?;
+            .map_err(|_| ErrorCode::ServerBusy)?;
         Ok(Admitted {
             permit,
             deadline: self.limits.deadline,
@@ -199,14 +196,14 @@ impl Admitted {
                     "signed node: {label} read interrupted after {} ms",
                     started.elapsed().as_millis()
                 );
-                return Err(Error(DEADLINE_EXCEEDED));
+                return Err(ErrorCode::ReadDeadlineExceeded.into());
             }
             result
         });
         match tokio::time::timeout(self.deadline, worker).await {
-            Ok(joined) => joined.unwrap_or(Err(Error("StorageUnavailable"))),
+            Ok(joined) => joined.unwrap_or(Err(ErrorCode::StorageUnavailable.into())),
             // `_raise` stops the abandoned job; its permit returns when it does.
-            Err(_) => Err(Error(DEADLINE_EXCEEDED)),
+            Err(_) => Err(ErrorCode::ReadDeadlineExceeded.into()),
         }
     }
 }

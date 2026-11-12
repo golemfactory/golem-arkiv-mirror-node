@@ -418,6 +418,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "alloy-primitives",
  "arkiv-db",
+ "arkiv-db-redb",
  "arkiv-db-storage",
  "redb",
 ]
@@ -2504,14 +2505,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webpki-roots",
-]
-
-[[package]]
-name = "reth-trie"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-trie",
 ]
 
 [[package]]

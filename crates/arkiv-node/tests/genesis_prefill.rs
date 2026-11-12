@@ -1,3 +1,5 @@
+mod signed_support;
+
 use alloy_primitives::U256;
 use arkiv_db::{
     Budget, Cell, CellName, Projection, RecordKey, SnapshotId, Value, decode_exact,
@@ -10,18 +12,14 @@ use arkiv_node::{
     arkiv::{self, ArkivOperation},
     genesis_bundle::*,
     signed::{
-        crypto::Signer,
         history::History,
-        host::Host,
+        host::{Host, Prefill},
         light::{Light, verify_account},
         protocol::*,
     },
 };
+use signed_support::{arkiv_ops, launch, sign_tx, signer};
 use std::sync::Arc;
-
-fn signer(n: u8) -> Signer {
-    Signer::from_bytes([n; 32]).unwrap()
-}
 
 /// The unprefilled base, validated by `build_genesis` once the prefill is
 /// attached. The proposer intentionally has no allocation: a prefill chain
@@ -81,15 +79,12 @@ fn host(
     state: Arc<MemoryVersionedStore>,
     history: Arc<MemoryVersionedStore>,
 ) -> Host {
-    Host::create_with_prefill(
+    let launch = launch(g, signer(1), [3; 16], history, producer);
+    Host::create(
         state,
-        History::create(history, g.hash()).unwrap(),
-        g.clone(),
-        [3; 16],
-        SignedHeader::sign(g, g.header(), &signer(1)).unwrap(),
-        producer.then(|| signer(1)),
         Options::default(),
-        Some(stream.to_vec()),
+        launch,
+        Prefill::Stream(stream.to_vec()),
     )
     .unwrap()
 }
@@ -232,10 +227,10 @@ fn invalid_nonces_system_cells_capacity_and_sponsor_fail() {
     let seven = encode_stream(&full(7)).unwrap();
     assert!(seven.len() as u64 <= MAX_CANONICAL_BYTES);
     assert_eq!(decode_stream(&seven).unwrap().len(), 7);
-    let error = encode_stream(&full(9)).unwrap_err();
+    let error = encode_stream(&full(9)).unwrap_err().to_string();
     assert!(error.contains("exceeds 1 MiB"), "{error}");
     let error = decode_stream(&vec![0; MAX_CANONICAL_BYTES as usize + 1]).unwrap_err();
-    assert!(error.contains("exceeds 1 MiB"), "{error}");
+    assert!(error.to_string().contains("exceeds 1 MiB"), "{error}");
     // Row codec 1 and the `$payload` / `$contentType` system names are
     // refused.
     let mut old = encode_stream(&rows).unwrap();
@@ -507,23 +502,11 @@ fn build_permanent(rows: &[PrefillEntity]) -> SignedGenesis {
 }
 
 fn entity_tx(g: &SignedGenesis, nonce: u64, operation: ArkivOperation) -> SignedTx {
-    SignedTx::sign(
-        g,
-        nonce,
-        TxEnvelope {
-            chain_id: g.genesis.chain_id,
-            actor: signer(2).address(),
-            request_id: [100 + nonce as u8; 32],
-            // Enough for a permanent create's one-year rent; six fit a block.
-            tx_budget: 12_000_000,
-            ops: vec![TxOp::Arkiv {
-                namespace: arkiv::entity_namespace(),
-                operation,
-            }],
-        },
-        &signer(2),
-    )
-    .unwrap()
+    // Enough for a permanent create's one-year rent; six fit a block.
+    let budget = 12_000_000;
+    let request_id = [100 + nonce as u8; 32];
+    let ops = arkiv_ops(vec![operation]);
+    sign_tx(g, &signer(2), nonce, request_id, budget, ops)
 }
 
 #[test]
@@ -608,14 +591,7 @@ fn streaming_permanent_genesis_installs_staged_state_and_behaves_the_same() {
     use arkiv_node::genesis_streaming::{self as streaming, VerifiedStream};
     let rows = permanent_chain_rows();
     let small = build_permanent(&rows);
-    let mut bytes = b"ARKPFL02".to_vec();
-    bytes.extend_from_slice(&arkiv_node::genesis_bundle::ROW_CODEC.to_be_bytes());
-    bytes.extend_from_slice(&(rows.len() as u64).to_be_bytes());
-    for row in &rows {
-        let frame = encode(row);
-        bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-        bytes.extend(frame);
-    }
+    let bytes = streaming::write_stream(rows.iter());
     let mut g = small.clone();
     let mut launch = g.prefill.take().unwrap();
     launch.version = 4;
@@ -643,16 +619,15 @@ fn streaming_permanent_genesis_installs_staged_state_and_behaves_the_same() {
             Options::default(),
         )
         .unwrap();
-        Host::create_from_staged(
+        let history = Arc::new(MemoryVersionedStore::new());
+        Host::create(
             Arc::new(MemoryVersionedStore::new()),
-            History::create(Arc::new(MemoryVersionedStore::new()), g.hash()).unwrap(),
-            g.clone(),
-            [3; 16],
-            SignedHeader::sign(&g, g.header(), &signer(1)).unwrap(),
-            producer.then(|| signer(1)),
             Options::default(),
-            &staged,
-            path.clone(),
+            signed_support::launch(&g, signer(1), [3; 16], history, producer),
+            Prefill::Staged {
+                engine: &staged,
+                stream_file: path.clone(),
+            },
         )
         .unwrap()
     };

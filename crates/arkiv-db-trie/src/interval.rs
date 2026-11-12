@@ -14,8 +14,8 @@ use std::ops::Bound;
 use alloy_primitives::keccak256;
 
 use crate::{
-    EMPTY_ROOT_HASH, Link, NodeLoader, ObjectId, PathChild, PathNode, PathSource, Probe,
-    ProofError, TrieValue,
+    EMPTY_ROOT_HASH, Link, NodeLoader, ObjectId, PathNode, PathSource, Probe, ProofError,
+    TrieValue,
     map::{Role, check_inner_end, check_leaf_end, resolve},
     nibbles,
     node::{Node, RawChild, RawNode, decode_raw},
@@ -91,10 +91,7 @@ impl KeyRange {
             Bound::Included(bytes) => Bound::Included(nibbles::unpack(bytes)),
             Bound::Excluded(bytes) => Bound::Excluded(nibbles::unpack(bytes)),
         };
-        Nibbled {
-            lower: unpack(&self.lower),
-            upper: unpack(&self.upper),
-        }
+        Nibbled(Self::new(unpack(&self.lower), unpack(&self.upper)))
     }
 
     /// Whether a subtree whose keys all start with the nibble path `prefix`
@@ -112,14 +109,11 @@ impl KeyRange {
 }
 
 /// A [`KeyRange`] with nibble endpoints.
-struct Nibbled {
-    lower: Bound<Vec<u8>>,
-    upper: Bound<Vec<u8>>,
-}
+struct Nibbled(KeyRange);
 
 impl Nibbled {
     fn may_hold(&self, prefix: &[u8]) -> bool {
-        let above_lower = match &self.lower {
+        let above_lower = match &self.0.lower {
             Bound::Unbounded => true,
             Bound::Included(lower) | Bound::Excluded(lower) => {
                 let shared = prefix.len().min(lower.len());
@@ -127,7 +121,7 @@ impl Nibbled {
             }
         };
         above_lower
-            && match &self.upper {
+            && match &self.0.upper {
                 Bound::Unbounded => true,
                 Bound::Included(upper) => smallest_completion(prefix).cmp(upper.iter()).is_le(),
                 Bound::Excluded(upper) => smallest_completion(prefix).cmp(upper.iter()).is_lt(),
@@ -136,15 +130,7 @@ impl Nibbled {
 
     /// Whether the whole key (as nibbles, an even count) is in the interval.
     fn contains(&self, key: &[u8]) -> bool {
-        (match &self.lower {
-            Bound::Unbounded => true,
-            Bound::Included(lower) => key >= lower.as_slice(),
-            Bound::Excluded(lower) => key > lower.as_slice(),
-        }) && (match &self.upper {
-            Bound::Unbounded => true,
-            Bound::Included(upper) => key <= upper.as_slice(),
-            Bound::Excluded(upper) => key < upper.as_slice(),
-        })
+        self.0.contains(key)
     }
 }
 
@@ -356,6 +342,17 @@ struct PendingNode<'a> {
     supplied_ancestor: usize,
 }
 
+/// Records whether the walk opens the child at `slot` of the node traced last.
+fn record_decision(trace: Option<&mut VerifiedInterval>, slot: usize, open: bool) {
+    if let Some(node) = trace.and_then(|trace| trace.nodes.last_mut()) {
+        node.child_decisions[slot] = if open {
+            IntervalDecision::Open
+        } else {
+            IntervalDecision::Outside
+        };
+    }
+}
+
 fn walk_interval_inner<N: AsRef<[u8]>>(
     root: ObjectId,
     range: &KeyRange,
@@ -441,37 +438,10 @@ fn walk_interval_inner<N: AsRef<[u8]>>(
             if trace.nodes.len() == MAX_INTERVAL_TRACE_NODES {
                 return Err(ProofError::EntryLimitExceeded);
             }
-            let (kind, path, children, value_bytes) = match &raw {
-                RawNode::Leaf { path, value } => {
-                    (crate::NodeKind::Leaf, path.clone(), Vec::new(), value.len())
-                }
-                RawNode::Extension { path, child } => (
-                    crate::NodeKind::Extension,
-                    path.clone(),
-                    vec![(*child).into()],
-                    0,
-                ),
-                RawNode::Branch { children } => (
-                    crate::NodeKind::Branch,
-                    Vec::new(),
-                    children.iter().copied().map(PathChild::from).collect(),
-                    0,
-                ),
-            };
+            let path_node = PathNode::from_raw(&raw, bytes, proof_index, prefix.len(), source);
             trace.nodes.push(IntervalNode {
-                child_decisions: vec![IntervalDecision::Empty; children.len()],
-                path_node: PathNode {
-                    proof_index,
-                    depth: prefix.len(),
-                    source,
-                    hash: keccak256(bytes),
-                    rlp: bytes.to_vec(),
-                    kind,
-                    compressed_path: path,
-                    selected_nibble: None,
-                    children,
-                    value_bytes,
-                },
+                child_decisions: vec![IntervalDecision::Empty; path_node.children.len()],
+                path_node,
                 parent_index,
                 parent_slot: slot,
                 prefix: prefix.clone(),
@@ -512,16 +482,7 @@ fn walk_interval_inner<N: AsRef<[u8]>>(
                 }
                 prefix.extend_from_slice(&path);
                 let open = range.may_hold(&prefix);
-                if let Some(node) = trace
-                    .as_deref_mut()
-                    .and_then(|trace| trace.nodes.last_mut())
-                {
-                    node.child_decisions[0] = if open {
-                        IntervalDecision::Open
-                    } else {
-                        IntervalDecision::Outside
-                    };
-                }
+                record_decision(trace.as_deref_mut(), 0, open);
                 if open {
                     pending.push(PendingNode {
                         child,
@@ -543,16 +504,7 @@ fn walk_interval_inner<N: AsRef<[u8]>>(
                     }
                     prefix.push(slot as u8);
                     let open = range.may_hold(&prefix);
-                    if let Some(node) = trace
-                        .as_deref_mut()
-                        .and_then(|trace| trace.nodes.last_mut())
-                    {
-                        node.child_decisions[slot] = if open {
-                            IntervalDecision::Open
-                        } else {
-                            IntervalDecision::Outside
-                        };
-                    }
+                    record_decision(trace.as_deref_mut(), slot, open);
                     if open {
                         pending.push(PendingNode {
                             child,

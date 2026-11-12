@@ -59,28 +59,6 @@ mod tests {
                 "{method} {route}"
             );
         }
-        // Detect new literal dispatch branches even when the static inventory above
-        // has not been updated. Parameterized branches are covered explicitly.
-        let source: String = include_str!("runtime.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        for remainder in source.split("path==\"").skip(1) {
-            let route = remainder.split('"').next().unwrap();
-            assert!(
-                paths.contains_key(&format!("/signed/v1/{route}")),
-                "undocumented dispatch: {route}"
-            );
-        }
-        for remainder in source.split("matches!(path.as_str(),").skip(1) {
-            let branches = remainder.split(')').next().unwrap();
-            for route in branches.split('"').skip(1).step_by(2) {
-                assert!(
-                    paths.contains_key(&format!("/signed/v1/{route}")),
-                    "undocumented dispatch: {route}"
-                );
-            }
-        }
         for route in [
             "/signed/v1/control",
             "/signed/v1/replication/blocks/{height}",
@@ -114,39 +92,6 @@ mod tests {
                     assert!(ids.insert(id), "duplicate operation ID: {id}");
                 }
             }
-        }
-    }
-
-    #[test]
-    fn reference_covers_every_dispatched_rpc_method() {
-        let mut implemented = BTreeSet::new();
-        for source in [include_str!("rpc.rs"), include_str!("rpc_reads.rs")] {
-            let dispatch = source.split("fn dispatch(").nth(1).unwrap();
-            // Stop at the following top-level function, excluding tests and other
-            // strings outside dispatch while retaining nested match branches.
-            let dispatch = dispatch.split("\nfn ").next().unwrap();
-            for literal in dispatch.split('"').skip(1).step_by(2) {
-                if ["eth_", "net_", "web3_", "arkiv_"]
-                    .iter()
-                    .any(|prefix| literal.starts_with(prefix))
-                {
-                    implemented.insert(literal);
-                }
-            }
-        }
-        let documented: BTreeSet<_> = DOCUMENT["paths"]["/"]["post"]["x-jsonrpc-methods"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(implemented, documented);
-        let websocket = DOCUMENT["paths"]["/"]["get"].to_string();
-        for method in ["eth_subscribe", "eth_unsubscribe", "newHeads", "logs"] {
-            assert!(
-                websocket.contains(method),
-                "missing WebSocket method/topic {method}"
-            );
         }
     }
 

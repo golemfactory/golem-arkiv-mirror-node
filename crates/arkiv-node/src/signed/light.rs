@@ -2,9 +2,10 @@
 //! This follower never executes transaction bodies and makes no finality claim.
 
 use super::{
-    Error, Result,
+    ErrorCode, Result,
     protocol::{SignedGenesis, SignedHeader},
 };
+use crate::health::Health;
 use arkiv_db::proof::{EqRequest, VerifiedContinuation, VerifiedEq, verify_eq};
 use arkiv_db::{B256, decode_exact, digest, encode};
 use arkiv_db_storage::versioned::{CommitBatch, CommitOutcome, Head, Table, VersionedStore};
@@ -22,7 +23,7 @@ pub struct Light {
     store: Arc<dyn VersionedStore>,
     pub genesis: SignedGenesis,
     pub head: crate::Header,
-    pub health: &'static str,
+    pub health: Health,
     pub observed: u64,
     sequence: Head,
 }
@@ -36,11 +37,11 @@ impl Light {
         genesis.spec()?;
         authenticate(&genesis, &certificate)?;
         if certificate.header != genesis.header() {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let bytes = encode(&genesis);
         if bytes.len() > GENESIS_CAP {
-            return Err(Error("CapacityReached"));
+            return Err(ErrorCode::CapacityReached.into());
         }
         let head = certificate.header;
         let sequence = catalog_head(genesis.hash(), 0, &head, 0);
@@ -58,14 +59,14 @@ impl Light {
             );
         match store.commit(&batch) {
             CommitOutcome::Committed => {}
-            CommitOutcome::NotCommitted(_) => return Err(Error("StorageUnavailable")),
-            CommitOutcome::Indeterminate(_) => return Err(Error("CommitUncertain")),
+            CommitOutcome::NotCommitted(_) => return Err(ErrorCode::StorageUnavailable.into()),
+            CommitOutcome::Indeterminate(_) => return Err(ErrorCode::CommitUncertain.into()),
         }
         Ok(Self {
             store,
             genesis,
             head,
-            health: "following",
+            health: Health::Following,
             observed: 0,
             sequence,
         })
@@ -78,56 +79,57 @@ impl Light {
             .as_deref()
             != Some(PROFILE)
         {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         let bytes = store
             .read_record_bounded(Table::Meta, GENESIS_KEY, GENESIS_CAP)?
-            .ok_or(Error("StorageCorrupt"))?;
-        let genesis: SignedGenesis = decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
+        let genesis: SignedGenesis =
+            decode_exact(&bytes).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
         if genesis != *expected {
-            return Err(Error("IdentityMismatch"));
+            return Err(ErrorCode::IdentityMismatch.into());
         }
         if let Some(evidence) =
             store.read_record_bounded(Table::Meta, CONFLICT_KEY, 2 * CERTIFICATE_LEN)?
         {
             let (first, second): (SignedHeader, SignedHeader) =
-                decode_exact(&evidence).map_err(|_| Error("StorageCorrupt"))?;
-            authenticate(&genesis, &first).map_err(|_| Error("StorageCorrupt"))?;
-            authenticate(&genesis, &second).map_err(|_| Error("StorageCorrupt"))?;
+                decode_exact(&evidence).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
+            authenticate(&genesis, &first).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
+            authenticate(&genesis, &second).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
             if first.header.height != second.header.height
                 || first.header.hash() == second.header.hash()
             {
-                return Err(Error("StorageCorrupt"));
+                return Err(ErrorCode::StorageCorrupt.into());
             }
-            return Err(Error("ChainConflict"));
+            return Err(ErrorCode::ChainConflict.into());
         }
-        let stored = store.head()?.ok_or(Error("StorageCorrupt"))?;
+        let stored = store.head()?.ok_or(ErrorCode::StorageCorrupt)?;
         let manifest = store
             .read_record_bounded(Table::Manifests, &stored.height.to_be_bytes(), 164)?
-            .ok_or(Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
         let (head, observed): (crate::Header, u64) =
-            decode_exact(&manifest).map_err(|_| Error("StorageCorrupt"))?;
+            decode_exact(&manifest).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
         if catalog_head(genesis.hash(), stored.height, &head, observed) != stored
             || observed < head.height
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         let mut light = Self {
             head: genesis.header(),
             genesis,
             store,
-            health: "following",
+            health: Health::Following,
             observed,
             sequence: stored,
         };
         let certificate = light.read_header(head.height)?;
         if certificate.header != head {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         // Bounded continuity validation: the accepted head and its immediate
         // predecessor, plus the genesis certificate. No historical scan.
         if light.read_header(0)?.header != light.genesis.header() {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         if head.height > 0 {
             let parent = light.read_header(head.height - 1)?;
@@ -136,7 +138,7 @@ impl Light {
                 &parent.header,
                 &certificate.header,
             )
-            .map_err(|_| Error("StorageCorrupt"))?;
+            .map_err(|_| ErrorCode::StorageCorrupt)?;
         }
         light.head = certificate.header;
         Ok(light)
@@ -144,8 +146,8 @@ impl Light {
 
     fn available(&self) -> Result<()> {
         match self.health {
-            "chain-conflict" => Err(Error("ChainConflict")),
-            "storage-fenced" => Err(Error("CommitUncertain")),
+            Health::ChainConflict => Err(ErrorCode::ChainConflict.into()),
+            Health::StorageFenced => Err(ErrorCode::CommitUncertain.into()),
             _ => Ok(()),
         }
     }
@@ -154,10 +156,11 @@ impl Light {
         let bytes = self
             .store
             .read_record_bounded(Table::Blocks, &height.to_be_bytes(), CERTIFICATE_LEN)?
-            .ok_or(Error("StorageCorrupt"))?;
+            .ok_or(ErrorCode::StorageCorrupt)?;
         let certificate: SignedHeader =
-            decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
-        authenticate(&self.genesis, &certificate).map_err(|_| Error("StorageCorrupt"))?;
+            decode_exact(&bytes).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
+        authenticate(&self.genesis, &certificate)
+            .map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
         if certificate.header.height != height
             || self
                 .read_observation(height)?
@@ -168,7 +171,7 @@ impl Light {
                 .as_deref()
                 != Some(height.to_be_bytes().as_slice())
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         Ok(certificate)
     }
@@ -178,10 +181,11 @@ impl Light {
             .read_record_bounded(Table::Inclusions, &height.to_be_bytes(), CERTIFICATE_LEN)?
             .map(|bytes| {
                 let certificate: SignedHeader =
-                    decode_exact(&bytes).map_err(|_| Error("StorageCorrupt"))?;
-                authenticate(&self.genesis, &certificate).map_err(|_| Error("StorageCorrupt"))?;
+                    decode_exact(&bytes).map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
+                authenticate(&self.genesis, &certificate)
+                    .map_err(|e| ErrorCode::StorageCorrupt.caused_by(e))?;
                 if certificate.header.height != height {
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 Ok(certificate)
             })
@@ -191,7 +195,7 @@ impl Light {
     pub fn header(&self, height: u64) -> Result<SignedHeader> {
         self.available()?;
         if height > self.head.height {
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         self.read_header(height)
     }
@@ -204,9 +208,9 @@ impl Light {
         if first.header.height != second.header.height
             || first.header.hash() == second.header.hash()
         {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
-        self.health = "chain-conflict";
+        self.health = Health::ChainConflict;
         self.commit_catalog(
             self.head,
             self.observed.max(first.header.height),
@@ -214,13 +218,13 @@ impl Light {
             &[],
             Some(encode(&(first.clone(), second.clone()))),
         )?;
-        Err(Error("ChainConflict"))
+        Err(ErrorCode::ChainConflict.into())
     }
 
     pub fn append(&mut self, headers: &[SignedHeader], sampled: &SignedHeader) -> Result<()> {
         self.available()?;
         if headers.len() > HEADER_BATCH {
-            return Err(Error("InvalidRequest"));
+            return Err(ErrorCode::InvalidRequest.into());
         }
         authenticate(&self.genesis, sampled)?;
         for certificate in headers {
@@ -262,9 +266,9 @@ impl Light {
             self.commit_catalog(current, observed, &accepted, &observations, None)?;
         }
         self.health = if self.head.height == sampled.header.height {
-            "following"
+            Health::Following
         } else {
-            "stalled"
+            Health::Stalled
         };
         Ok(())
     }
@@ -282,7 +286,7 @@ impl Light {
             if h.height <= self.head.height {
                 let known = self.read_header(h.height)?;
                 if known.header.hash() != h.hash() {
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 continue;
             }
@@ -291,15 +295,15 @@ impl Light {
                 .find(|known| known.header.height == h.height)
             {
                 if known.header.hash() != h.hash() {
-                    return Err(Error("StorageCorrupt"));
+                    return Err(ErrorCode::StorageCorrupt.into());
                 }
                 continue;
             }
             if current.height.checked_add(1) != Some(h.height) {
-                return Err(Error("BlockNotSynced"));
+                return Err(ErrorCode::BlockNotSynced.into());
             }
             crate::validate::check_header(&spec, &current, h)
-                .map_err(|_| Error("InvalidHeader"))?;
+                .map_err(|_| ErrorCode::InvalidHeader)?;
             current = *h;
             accepted.push(certificate.clone());
         }
@@ -308,13 +312,13 @@ impl Light {
             .find(|known| known.header.height == sampled.header.height)
             && known.header.hash() != sampled.header.hash()
         {
-            return Err(Error("StorageCorrupt"));
+            return Err(ErrorCode::StorageCorrupt.into());
         }
         if current.height > sampled.header.height {
             if accepted.is_empty() {
                 return Ok((self.head, accepted));
             }
-            return Err(Error("BlockNotSynced"));
+            return Err(ErrorCode::BlockNotSynced.into());
         }
         Ok((current, accepted))
     }
@@ -331,7 +335,7 @@ impl Light {
             .sequence
             .height
             .checked_add(1)
-            .ok_or(Error("CapacityReached"))?;
+            .ok_or(ErrorCode::CapacityReached)?;
         let next = catalog_head(self.genesis.hash(), number, &head, observed);
         let mut batch = CommitBatch::new(Some(self.sequence), next);
         batch.put_record(
@@ -367,12 +371,12 @@ impl Light {
                 Ok(())
             }
             CommitOutcome::NotCommitted(_) => {
-                self.health = "storage-fenced";
-                Err(Error("StorageUnavailable"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::StorageUnavailable.into())
             }
             CommitOutcome::Indeterminate(_) => {
-                self.health = "storage-fenced";
-                Err(Error("CommitUncertain"))
+                self.health = Health::StorageFenced;
+                Err(ErrorCode::CommitUncertain.into())
             }
         }
     }
@@ -413,7 +417,7 @@ pub fn verify_eq_at(
         || request.snapshot.block_hash != h.hash()
         || request.snapshot.state_root != h.state_root
     {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let verified = verify_eq(
         request,
@@ -426,13 +430,13 @@ pub fn verify_eq_at(
         && let VerifiedEq::Page(page) = &verified
     {
         for row in &page.rows {
-            crate::arkiv::validate_proven_row(row).map_err(|_| Error("InvalidProof"))?;
-            let entity = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
+            crate::arkiv::validate_proven_row(row).map_err(|_| ErrorCode::InvalidProof)?;
+            let entity = crate::arkiv::project(row).map_err(|_| ErrorCode::InvalidProof)?;
             if entity.created_at > h.height
                 || entity.updated_at > h.height
                 || (entity.expires_at != u64::MAX && entity.expires_at <= h.height)
             {
-                return Err(Error("InvalidProof"));
+                return Err(ErrorCode::InvalidProof.into());
             }
         }
     }
@@ -450,7 +454,7 @@ pub fn verify_range_at(
         || request.snapshot.block_hash != h.hash()
         || request.snapshot.state_root != h.state_root
     {
-        return Err(Error("InvalidRequest"));
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let verified = arkiv_db::proof::verify_range(
         request,
@@ -462,13 +466,13 @@ pub fn verify_range_at(
         && let arkiv_db::proof::VerifiedRange::Complete(result) = &verified
     {
         for row in &result.rows {
-            crate::arkiv::validate_proven_row(row).map_err(|_| Error("InvalidProof"))?;
-            let entity = crate::arkiv::project(row).map_err(|_| Error("InvalidProof"))?;
+            crate::arkiv::validate_proven_row(row).map_err(|_| ErrorCode::InvalidProof)?;
+            let entity = crate::arkiv::project(row).map_err(|_| ErrorCode::InvalidProof)?;
             if entity.created_at > h.height
                 || entity.updated_at > h.height
                 || (entity.expires_at != u64::MAX && entity.expires_at <= h.height)
             {
-                return Err(Error("InvalidProof"));
+                return Err(ErrorCode::InvalidProof.into());
             }
         }
     }
@@ -489,7 +493,7 @@ fn authenticate(genesis: &SignedGenesis, certificate: &SignedHeader) -> Result<(
     certificate.authenticate(genesis)?;
     let h = certificate.header;
     if h.chain_id != genesis.genesis.chain_id || h.timestamp_ms != genesis.timestamp(h.height)? {
-        return Err(Error("InvalidHeader"));
+        return Err(ErrorCode::InvalidHeader.into());
     }
     Ok(())
 }
@@ -518,9 +522,11 @@ pub fn verify_account(
         &crate::accounts::BURN_KEY,
         supply_proof,
     )?)?;
-    let initial = config.initial_supply().map_err(|_| Error("InvalidProof"))?;
+    let initial = config
+        .initial_supply()
+        .map_err(|_| ErrorCode::InvalidProof)?;
     if burned > initial || account.balance > initial - burned {
-        return Err(Error("InvalidProof"));
+        return Err(ErrorCode::InvalidProof.into());
     }
     Ok((account, burned, initial))
 }

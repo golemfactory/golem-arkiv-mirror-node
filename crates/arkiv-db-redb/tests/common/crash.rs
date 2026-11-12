@@ -11,40 +11,28 @@ use arkiv_db_storage::versioned::{
     VersionedStore, reconcile,
 };
 
-use super::{assert_absent, assert_applied, block, commit, crash_store};
+use super::{
+    Chain, assert_absent, assert_applied, block, commit, config, crash_store, durable_image,
+};
 
 /// Torn-subset seeds per granularity in the default runs.
 pub const SEEDS: u64 = 8;
 /// The same in the `#[ignore]`d heavy runs.
 pub const HEAVY_SEEDS: u64 = 64;
 
-pub fn config(quick_repair: bool) -> RedbConfig {
-    RedbConfig {
-        cache_size: 1 << 20,
-        quick_repair,
-    }
-}
-
 /// The parent chain: three blocks over the catalog, host and two namespaces.
 pub fn parents() -> Vec<CommitBatch> {
-    let mut batches = Vec::new();
-    let mut parent = None;
-    for height in 0..3 {
-        let batch = block(
-            parent,
-            height,
-            1,
-            &[
+    let mut chain = Chain::default();
+    (0..3)
+        .map(|_| {
+            chain.next(&[
                 (SpaceId::Catalog, 3, 120),
                 (SpaceId::Host, 2, 64),
                 (SpaceId::Namespace(1), 40, 180),
                 (SpaceId::Namespace(2), 25, 900),
-            ],
-        );
-        parent = Some(batch.new_head);
-        batches.push(batch);
-    }
-    batches
+            ])
+        })
+        .collect()
 }
 
 /// A parent chain of twelve blocks for the steady-state runs: every block
@@ -52,25 +40,18 @@ pub fn parents() -> Vec<CommitBatch> {
 /// frees the pages of the paths it rewrites) and to one of three more
 /// namespaces.
 pub fn steady_parents() -> Vec<CommitBatch> {
-    let mut batches = Vec::new();
-    let mut parent = None;
-    for height in 0..12 {
-        let batch = block(
-            parent,
-            height,
-            1,
-            &[
+    let mut chain = Chain::default();
+    (0..12)
+        .map(|height| {
+            chain.next(&[
                 (SpaceId::Catalog, 2, 120),
                 (SpaceId::Host, 1, 64),
                 (SpaceId::Namespace(1), 15, 180),
                 (SpaceId::Namespace(2), 5, 900),
                 (SpaceId::Namespace(5 + height % 3), 3, 250),
-            ],
-        );
-        parent = Some(batch.new_head);
-        batches.push(batch);
-    }
-    batches
+            ])
+        })
+        .collect()
 }
 
 /// The candidate: ten tables in one transaction, including a new namespace
@@ -93,16 +74,10 @@ pub fn candidate(parent: Head) -> CommitBatch {
     batch
 }
 
-/// The durable image after committing the parents (every commit synced;
-/// the store is then cut off, so no clean close runs).
+/// The parents and the durable image after committing them.
 pub fn parent_image(config: RedbConfig) -> (Vec<u8>, Vec<CommitBatch>) {
-    let disk = CrashDisk::new();
-    let store = crash_store(&disk, config);
     let parents = parents();
-    for batch in &parents {
-        commit(&store, batch.clone());
-    }
-    (disk.crash(store, CrashMode::DurableOnly), parents)
+    (durable_image(config, &parents), parents)
 }
 
 /// Counts of one crash-point run.
@@ -213,7 +188,7 @@ pub fn check_image(
         Reconciliation::Committed => assert!(holds_candidate, "{context}"),
         Reconciliation::NotCommitted => {
             assert!(!holds_candidate, "{context}");
-            commit(&store, candidate.clone());
+            commit(&store, candidate);
             assert_applied(&store, candidate);
             assert!(matches!(
                 store.commit(candidate),
@@ -224,7 +199,7 @@ pub fn check_image(
     }
 
     let next = follow_up(candidate.new_head);
-    commit(&store, next.clone());
+    commit(&store, &next);
     let everything: Vec<&CommitBatch> = parents.iter().chain([candidate, &next]).collect();
     for batch in &everything {
         assert_applied(&store, batch);
@@ -242,6 +217,18 @@ pub fn check_image(
 
 /// Chooses crash points: `(k, trace of the complete commit's mutating calls)`.
 pub type Select<'a> = &'a dyn Fn(u64, &[DiskOp]) -> bool;
+
+/// Sampled crash points of a long commit: every sync and length change and
+/// the calls around them, the first 16 and last 32 calls, and every
+/// `stride`-th call.
+pub fn sampled(stride: u64) -> impl Fn(u64, &[DiskOp]) -> bool {
+    move |k, trace| {
+        let calls = trace.len() as u64;
+        let near_barrier =
+            (k.saturating_sub(1)..=k + 1).any(|i| i < calls && trace[i as usize] != DiskOp::Write);
+        k < 16 || k + 32 >= calls || k.is_multiple_of(stride) || near_barrier
+    }
+}
 
 /// Where a crash-point run starts: the device and the live store the
 /// candidate is committed through, holding the parents.
@@ -267,7 +254,7 @@ impl Start<'_> {
                 let disk = CrashDisk::new();
                 let store = crash_store(&disk, config);
                 for batch in parents {
-                    commit(&store, batch.clone());
+                    commit(&store, batch);
                 }
                 (disk, store)
             }
@@ -288,7 +275,7 @@ pub fn run_crash_points(
     // A complete commit's mutating calls.
     let (disk, store) = start.open(config, parents);
     let first = disk.mutating_trace().len();
-    commit(&store, candidate.clone());
+    commit(&store, candidate);
     let trace = disk.mutating_trace()[first..].to_vec();
     drop(store);
     let calls = trace.len() as u64;
