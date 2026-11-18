@@ -1,5 +1,19 @@
 # Arkiv state DB experiment
 
+> [!WARNING]
+> **This is an R&D experiment, not the official Arkiv implementation.**
+> It is a playground for exploring database and node designs. It is not
+> supported, not audited and not meant for production, and it may depart
+> from the Arkiv specifications or change without notice.
+>
+> For the official implementation, use the Arkiv Network repositories:
+>
+> - [Arkiv-Network/arkiv](https://github.com/Arkiv-Network/arkiv): the Arkiv
+>   database chain
+> - [Arkiv-Network/golemdb](https://github.com/Arkiv-Network/golemdb): Golem DB
+> - [Arkiv-Network/arkiv-sdk-js](https://github.com/Arkiv-Network/arkiv-sdk-js):
+>   the Arkiv SDK
+
 A state database and a single-proposer node for the Arkiv entity model,
 written in Rust. The target is Arkiv's blockchain workload: many ordered
 operations per block, one committed state per block, and historical queries
